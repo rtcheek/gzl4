@@ -1,0 +1,16 @@
+Pretend you are the best programmer in the world, and write a linux gzip like program called gzstd that uses nvCOMP version 5.1.0.21 Gstd compression running on all available Nvidia GPUs in the system to compress an arbitrary file in linux. Meticulously check for errors in the code and at runtime, handling them gracefully with well commented output about the error.  The GPUs could be in a workstation or on a headless server.  The program should detect the Nvidia GPUs available, and run on anything that supports Nvidia CUDA. For instancea GTX 1080, RTX4090, H100, and B300.  The program should implement the same or as close to the commandline options as gzip in linux. It should be able to decompress using the same technology as well.  It should carefully check that the GPUs have enough memory to run the parallelized chunks.  Maximize GPU streams for greatest parrallel performance.  The output should be quiet by default, but also allow -v, -vv, and -vvv for higher levels of verbosity, reporting more details about the program working.  There should be a -h and --help command line that displays a help screen, explaining command line syntax.  At the -vvv verbosity level, very intense debugging informaiotn is provided.  Make the code tight and efficient, but with lots of comments in the code explaining what's going on so that humans can easly read it.  The Nvidia CUDA toolkit being used is version 12.8.  cmake vesion 3.22.1 should be used for the build.   This is being build in a conda environment with the nvcomp include directory = "$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/libnvcomp/include" and the library directory = "$CONDA_PREFIX/lib".  Take plenty of time to think about it, and the length of the code is not important, accuracy is paramount.  Take as much file space as you need for the code to meet the given parameters. 
+
+Use check sizes like this: 
+level -1 compression: chunk size 16KiB
+level -2 compression: chunk size 32KiB
+level -3 compression: chunk size 64KiB
+level -4 compression: chunk size 128KiB
+level -5 compression: chunk size 256KiB
+level -6 compression: chunk size 512KiB
+level -7 compression: chunk size 1MiB
+level -8 compression: chnnk size 8MiB
+level -9 compression: chunk size 16MiB
+
+Dynamically use batch compression by asyncroniously sending enough chucks to fill half of the available VRAN on each available GPU.  Right now you have the batch size statically set to 1 chunk.  That's not how Nvidia recommends you use the nvcompBatchedLZ4DecompressAsync function.  
+
+Make the output files compatible with the lz4 command line .lz4 file format. 
