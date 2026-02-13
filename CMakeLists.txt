@@ -6,8 +6,6 @@ project(gzl4 LANGUAGES CXX CUDA)
 # -------------------------------
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
@@ -17,13 +15,13 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 # Prefer system CUDA toolkit (/usr or /usr/local/cuda) instead of conda's runtime stubs
 option(GZL4_PREFER_SYSTEM_CUDA "Prefer system CUDA Toolkit over conda packages" ON)
 
-# Treat nvCOMP discovery as strict (error) or soft (warning). Turn OFF for configure-only.
-option(GZL4_STRICT "Fail hard if nvCOMP is not found" ON)
+# Treat dependency discovery as strict (error) or soft (warning).
+option(GZL4_STRICT "Fail hard if nvCOMP/LZ4 are not found" ON)
 
 # Skip embedding RPATH into the final binary (prevents conda/system libcudart conflicts)
 option(GZL4_SKIP_RPATH "Do not embed RPATH in binaries (prevents conda/runtime conflicts)" OFF)
 
-# Let the user override the CUDA architectures (e.g., 80;86;89;90 or native)
+# Let the user override CUDA architectures (e.g., 80;86;89;90 or native)
 set(GZL4_CUDA_ARCHS "" CACHE STRING
     "CUDA architectures to compile for (e.g., 80;86;89;90 or native). Empty => default set")
 
@@ -53,21 +51,20 @@ endif()
 # Probe CUDA Toolkit (headers+libs)
 find_package(CUDAToolkit REQUIRED)
 
-# Pthreads for std::thread / POSIX symbols
+# Threads for std::thread / POSIX
 find_package(Threads REQUIRED)
 
 # -------------------------------
 # nvCOMP discovery
 # -------------------------------
-# Support nvCOMP from:
+# We support nvCOMP from:
 #   - Conda env (common)
 #   - System prefixes (/usr, /usr/local)
 #   - Custom user-provided paths (NVCOMP_INCLUDE_DIR / NVCOMP_LIBRARY)
 set(_nvcomp_hint_paths "")
 if(HAVE_CONDA)
   list(APPEND _nvcomp_hint_paths
-    "${CONDA_PREFIX}"
-    "${CONDA_PREFIX}/include"
+    "${CONDA_PREFIX}" "${CONDA_PREFIX}/include"
     "${CONDA_PREFIX}/lib" "${CONDA_PREFIX}/lib64"
     # Common wheel layout
     "${CONDA_PREFIX}/lib/python*/site-packages/nvidia/libnvcomp"
@@ -87,7 +84,6 @@ if(NOT NVCOMP_INCLUDE_DIR)
     PATH_SUFFIXES include include/nvcomp
   )
 endif()
-
 if(NOT NVCOMP_LIBRARY)
   find_library(NVCOMP_LIBRARY
     NAMES nvcomp
@@ -96,6 +92,15 @@ if(NOT NVCOMP_LIBRARY)
   )
 endif()
 
+# -------------------------------
+# LZ4 discovery (needed by CPU backend in v3.7.x)
+# -------------------------------
+find_path(LZ4_INCLUDE_DIR NAMES lz4.h
+  HINTS "${CONDA_PREFIX}/include" /usr/include /usr/local/include)
+find_library(LZ4_LIBRARY NAMES lz4
+  HINTS "${CONDA_PREFIX}/lib" "${CONDA_PREFIX}/lib64" /usr/lib /usr/lib64 /usr/local/lib)
+
+# Strictness gates
 if(GZL4_STRICT)
   if(NOT NVCOMP_INCLUDE_DIR OR NOT NVCOMP_LIBRARY)
     message(FATAL_ERROR
@@ -103,11 +108,22 @@ if(GZL4_STRICT)
       "Provide -DNVCOMP_INCLUDE_DIR=/path/to/include -DNVCOMP_LIBRARY=/path/to/libnvcomp.so\n"
       "Or install nvCOMP headers+library under /usr or via conda.")
   endif()
+  if(NOT LZ4_INCLUDE_DIR OR NOT LZ4_LIBRARY)
+    message(FATAL_ERROR
+      "LZ4 not found.\n"
+      "Install liblz4-dev (system) or conda-forge::lz4, or pass "
+      "-DLZ4_INCLUDE_DIR=/path -DLZ4_LIBRARY=/path/liblz4.so")
+  endif()
 else()
   if(NOT NVCOMP_INCLUDE_DIR OR NOT NVCOMP_LIBRARY)
     message(WARNING
       "nvCOMP not found. You can provide "
       "-DNVCOMP_INCLUDE_DIR=/path/to/include -DNVCOMP_LIBRARY=/path/to/libnvcomp.so")
+  endif()
+  if(NOT LZ4_INCLUDE_DIR OR NOT LZ4_LIBRARY)
+    message(WARNING
+      "LZ4 not found. You can provide "
+      "-DLZ4_INCLUDE_DIR=/path -DLZ4_LIBRARY=/path/liblz4.so")
   endif()
 endif()
 
@@ -120,12 +136,15 @@ add_executable(gzl4 gzl4.cpp)
 if(GZL4_CUDA_ARCHS)
   set_property(TARGET gzl4 PROPERTY CUDA_ARCHITECTURES "${GZL4_CUDA_ARCHS}")
 else()
-  set_property(TARGET gzl4 PROPERTY CUDA_ARCHITECTURES "75;80;86;89;90")
+  set_property(TARGET gzl4 PROPERTY CUDA_ARCHITECTURES "60;70;75;80;86;89;90;120")
 endif()
 
-# Include dirs: nvCOMP (if found) + CUDA
+# Include dirs: nvCOMP (if found) + LZ4 (if found) + CUDA
 if(NVCOMP_INCLUDE_DIR)
   target_include_directories(gzl4 PRIVATE "${NVCOMP_INCLUDE_DIR}")
+endif()
+if(LZ4_INCLUDE_DIR)
+  target_include_directories(gzl4 PRIVATE "${LZ4_INCLUDE_DIR}")
 endif()
 target_include_directories(gzl4 PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 
@@ -143,23 +162,24 @@ if(_need_usr_include AND EXISTS "/usr/include/crt/host_defines.h")
   target_compile_options(gzl4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-I/usr/include>)
 endif()
 
-# Linkage: nvCOMP (if found) + CUDA runtime/driver + Threads
+# Link libs: nvCOMP + LZ4 + CUDA + Threads
 if(NVCOMP_LIBRARY)
   target_link_libraries(gzl4 PRIVATE "${NVCOMP_LIBRARY}")
 endif()
+if(LZ4_LIBRARY)
+  target_link_libraries(gzl4 PRIVATE "${LZ4_LIBRARY}")
+endif()
 target_link_libraries(gzl4 PRIVATE CUDA::cudart CUDA::cuda_driver Threads::Threads)
 
-# Compile & target properties
+# Compile flags / properties
 target_compile_options(gzl4 PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -O3>
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-)
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 set_target_properties(gzl4 PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
-  CUDA_RESOLVE_DEVICE_SYMBOLS ON
-)
+  CUDA_RESOLVE_DEVICE_SYMBOLS   ON)
 
-# RPATH handling (avoid pulling in conda's libcudart at runtime unless desired)
+# RPATH handling
 if(GZL4_SKIP_RPATH)
   set(CMAKE_SKIP_RPATH ON)
 else()
@@ -181,6 +201,8 @@ if(HAVE_CONDA)
 endif()
 message(STATUS "nvCOMP Include Dir   : ${NVCOMP_INCLUDE_DIR}")
 message(STATUS "nvCOMP Library       : ${NVCOMP_LIBRARY}")
+message(STATUS "LZ4 Include Dir      : ${LZ4_INCLUDE_DIR}")
+message(STATUS "LZ4 Library          : ${LZ4_LIBRARY}")
 get_property(_arch TARGET gzl4 PROPERTY CUDA_ARCHITECTURES)
 message(STATUS "CUDA Architectures   : ${_arch}")
 message(STATUS "Prefer system CUDA   : ${GZL4_PREFER_SYSTEM_CUDA}")
