@@ -17,6 +17,7 @@
 #include <nvcomp/lz4.h>
 #include <nvcomp.hpp>
 #include <lz4.h>
+#include <lz4hc.h>
 
 #include <iostream>
 #include <fstream>
@@ -26,6 +27,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <numeric>
+#include <cstdint>
 #include <iomanip>
 #include <chrono>
 #include <thread>
@@ -40,7 +43,7 @@
 #include <getopt.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.8.0";
+constexpr const char* VERSION = "3.12.1";
 
 // Compression backend modes
 enum class BackendMode {
@@ -51,7 +54,7 @@ enum class BackendMode {
 
 constexpr size_t MIN_CHUNK_SIZE = 16 * 1024;            // 16KB minimum
 constexpr size_t MAX_CHUNK_SIZE = 4 * 1024 * 1024;      // 4MB maximum (LZ4 frame limit)
-constexpr int STREAMS_PER_GPU = 128;                     // CUDA streams per GPU (dynamic scaling starts here)
+// Pipeline depth per GPU is computed from cudaDeviceProp.asyncEngineCount at runtime.
 constexpr double GPU_MEM_SAFETY_FACTOR = 0.5;           // Use 50% of available memory for batches
 constexpr size_t CPU_THREADS_AUTO = 0;                   // Auto-detect CPU thread count
 
@@ -478,13 +481,15 @@ struct GPUDevice {
     size_t availableMemory;
     size_t totalMemory;
     std::vector<cudaStream_t> streams;
-    
-    GPUDevice(int id) : deviceId(id) {}
-    
-    ~GPUDevice() {
-        // Don't try to destroy streams in destructor
-        // CUDA automatically cleans up when the program exits
-    }
+
+    // Derived from hardware at init time
+    int    pipelineDepth;   // asyncEngineCount + 1: H2D + compute + D2H concurrency
+    size_t optimalBatch;    // chunks/slot that keeps SMs busy (recomputed dynamically)
+    size_t smCount;         // multiProcessorCount
+
+    GPUDevice(int id) : deviceId(id), pipelineDepth(3), optimalBatch(64), smCount(1) {}
+
+    ~GPUDevice() {}
 };
 
 /*
@@ -502,6 +507,223 @@ struct BatchCompressState {
     nvcompStatus_t* d_statuses;               // Status array (device)
     std::vector<size_t> max_output_sizes;
     std::vector<size_t> input_sizes;
+    // Pinned host staging buffers - must outlive async copies
+    void* h_input_ptrs_pinned  = nullptr;     // pinned host copy of d_input_ptrs array
+    void* h_input_sizes_pinned = nullptr;     // pinned host copy of d_input_sizes array
+    void* h_output_ptrs_pinned = nullptr;     // pinned host copy of d_output_ptrs array
+};
+
+// ── Pre-allocated GPU compression slot ──────────────────────────────────────
+// All device and pinned-host memory is allocated once at startup.
+// Zero cudaMalloc / cudaFree calls during compression hot path.
+
+/*
+ * PinnedInputPool  pre-allocated pool of pinned host memory slots.
+ *
+ * One big cudaHostAlloc is divided into N equal slots.  The reader acquires
+ * slots and reads directly into them; the GPU's copy engine then transfers
+ * from pinned memory to device via DMA without CPU involvement.  Slots are
+ * released back to the pool as soon as the GPU worker no longer needs the
+ * original data, allowing the reader to run non-stop without any artificial
+ * queue cap.
+ */
+class PinnedInputPool {
+public:
+    // Reference-counted handle to one pool slot.
+    // Destructor automatically releases the slot back to the pool.
+    struct Handle {
+        uint8_t*        data     = nullptr;  // pinned pointer into pool base
+        size_t          size     = 0;        // valid bytes for this chunk
+        size_t          chunkIdx = 0;
+        int             slotId   = -1;
+        PinnedInputPool* pool    = nullptr;
+
+        Handle()  = default;
+        ~Handle() { release(); }
+
+        Handle(Handle&& o) noexcept
+            : data(o.data), size(o.size), chunkIdx(o.chunkIdx),
+              slotId(o.slotId), pool(o.pool)
+        { o.slotId = -1; o.pool = nullptr; }
+
+        Handle& operator=(Handle&& o) noexcept {
+            release();
+            data=o.data; size=o.size; chunkIdx=o.chunkIdx;
+            slotId=o.slotId; pool=o.pool;
+            o.slotId=-1; o.pool=nullptr;
+            return *this;
+        }
+
+        Handle(const Handle&)            = delete;
+        Handle& operator=(const Handle&) = delete;
+
+        bool valid() const { return pool != nullptr && slotId >= 0; }
+
+        void release() {
+            if (pool && slotId >= 0) {
+                pool->releaseSlot(slotId);
+                slotId = -1; pool = nullptr;
+            }
+        }
+    };
+
+private:
+    uint8_t*              base_     = nullptr;
+    size_t                slotSz_   = 0;
+    size_t                nSlots_   = 0;
+    std::vector<int>      freeList_;
+    std::mutex            mu_;
+    std::condition_variable cv_;
+    std::atomic<bool>     shutdown_{false};
+
+    void releaseSlot(int id) {
+        { std::lock_guard<std::mutex> lk(mu_); freeList_.push_back(id); }
+        cv_.notify_one();
+    }
+    friend struct Handle;
+
+public:
+    ~PinnedInputPool() { destroy(); }
+
+    bool init(size_t nSlots, size_t slotSize) {
+        slotSz_  = slotSize;
+        nSlots_  = nSlots;
+        cudaError_t err = cudaHostAlloc(&base_, nSlots * slotSize, cudaHostAllocDefault);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "PinnedInputPool: cudaHostAlloc(%zu × %zu MB) failed: %s\n",
+                    nSlots, slotSize>>20, cudaGetErrorString(err));
+            return false;
+        }
+        freeList_.resize(nSlots);
+        std::iota(freeList_.begin(), freeList_.end(), 0);
+        VLOG(DEBUG, "PinnedInputPool: %zu × %.1f MB = %.1f GB pinned\n",
+             nSlots, slotSize/(1024.0*1024.0),
+             (nSlots*slotSize)/(1024.0*1024.0*1024.0));
+        return true;
+    }
+
+    void destroy() {
+        if (base_) { cudaFreeHost(base_); base_ = nullptr; }
+    }
+
+    void shutdown() {
+        shutdown_.store(true);
+        cv_.notify_all();
+    }
+
+    // Acquire a free slot  blocks until one is available or shutdown
+    Handle acquire() {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this]{ return !freeList_.empty() || shutdown_.load(); });
+        if (freeList_.empty()) return {};   // shutdown
+        int id = freeList_.back(); freeList_.pop_back();
+        Handle h;
+        h.data   = base_ + id * slotSz_;
+        h.size   = slotSz_;
+        h.slotId = id;
+        h.pool   = this;
+        return h;
+    }
+
+    size_t slotSize()  const { return slotSz_; }
+    size_t numSlots()  const { return nSlots_;  }
+    size_t numFree()   const {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(mu_));
+        return freeList_.size();
+    }
+};
+
+/*
+ * Asynchronous Reader with Advanced I/O
+ * Reads file chunks in background thread while GPUs initialize and compress.
+ *
+ * When a PinnedInputPool is provided (via startPooled), the reader acquires
+ * pinned slots and reads directly into them  zero extra copies, and the GPU
+ * can DMA from pinned memory without CPU involvement.  The reader only blocks
+ * when all pool slots are in use (natural backpressure from GPU throughput),
+ * never from an arbitrary queue cap.
+ *
+ * Without a pool (start()), falls back to heap-allocated vectors as before.
+ */
+
+struct PreallocSlot {
+    int      deviceId    = -1;
+    size_t   capacity    = 0;        // max chunks per batch
+    size_t   chunkStride = 0;        // bytes per input slot  (= chunkSize)
+    size_t   outStride   = 0;        // max output bytes per chunk (LZ4 bound)
+    size_t   tempBytes   = 0;        // nvCOMP scratch size
+
+    // Contiguous device pools (allocated once)
+    uint8_t*        d_input  = nullptr;   // capacity * chunkStride
+    uint8_t*        d_output = nullptr;   // capacity * outStride
+    void*           d_temp   = nullptr;
+
+    // Pre-filled device pointer arrays  point into d_input / d_output
+    // and NEVER change after init, so we never copy them again.
+    const void**    d_iPtrs  = nullptr;   // [capacity] -> d_input[i]
+    void**          d_oPtrs  = nullptr;   // [capacity] -> d_output[i]
+
+    // Per-batch device metadata (small, written each batch)
+    size_t*         d_iSizes = nullptr;
+    size_t*         d_oSizes = nullptr;
+    nvcompStatus_t* d_stats  = nullptr;
+
+    // Pinned host buffers
+    size_t*         h_iSizes = nullptr;   // H→D staging for input sizes
+    size_t*         h_oSizes = nullptr;   // D→H result sizes
+    nvcompStatus_t* h_stats  = nullptr;   // D→H result statuses
+    uint8_t*        h_output = nullptr;   // D→H output data (capacity * outStride)
+
+    cudaStream_t    stream   = 0;
+    bool            ready    = false;
+
+    // Per-batch state (set by worker thread each iteration)
+    size_t                            batchSize  = 0;
+    bool                              hasPending = false;
+    std::vector<size_t>               indices;
+    std::vector<size_t>               origSizes;
+    // Input data: held until after D→H completes, then released back to pool
+    std::vector<PinnedInputPool::Handle> origHandles;  // pooled path
+    std::vector<std::vector<uint8_t>>    origData;     // fallback path
+
+    void release() {
+        if (!ready) return;
+        if (deviceId >= 0) cudaSetDevice(deviceId);
+        cudaFree(d_input);  cudaFree(d_output); cudaFree(d_temp);
+        cudaFree(d_iPtrs);  cudaFree(d_oPtrs);
+        cudaFree(d_iSizes); cudaFree(d_oSizes); cudaFree(d_stats);
+        cudaFreeHost(h_iSizes); cudaFreeHost(h_oSizes);
+        cudaFreeHost(h_stats);  cudaFreeHost(h_output);
+        if (stream) { cudaStreamDestroy(stream); stream = 0; }
+        *this = PreallocSlot{};
+    }
+};
+
+// Thread-safe queue used to pass completed batches from GPU worker threads
+// to the main thread / AsyncWriter.
+template<typename T>
+class TsQueue {
+    std::queue<T>           q_;
+    mutable std::mutex      m_;
+    std::condition_variable cv_;
+    std::atomic<bool>       closed_{false};
+public:
+    void push(T&& item) {
+        { std::lock_guard<std::mutex> lk(m_); q_.push(std::move(item)); }
+        cv_.notify_one();
+    }
+    // Returns false when closed and empty (or on timeout)
+    bool pop(T& out, int timeoutMs = 50) {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                     [&]{ return !q_.empty() || closed_.load(); });
+        if (q_.empty()) return false;
+        out = std::move(q_.front()); q_.pop();
+        return true;
+    }
+    void close()         { closed_.store(true); cv_.notify_all(); }
+    bool isClosed() const{ return closed_.load(); }
+    size_t size()  const { std::lock_guard<std::mutex> lk(m_); return q_.size(); }
 };
 
 /*
@@ -521,201 +743,249 @@ struct BatchDecompressState {
     std::vector<size_t> uncompressed_sizes;
 };
 
-/*
- * Asynchronous Reader with Advanced I/O
- * Reads chunks in background thread while GPUs initialize and compress
- */
 
-/*
- * Asynchronous Reader with Advanced I/O
- * Reads file chunks in background thread while GPUs initialize and compress
- */
 class AsyncReader {
 public:
     struct ReadChunk {
-        size_t chunkIndex;
-        std::vector<uint8_t> data;
-        size_t size;
+        size_t chunkIndex = 0;
+        size_t size       = 0;
+
+        // Storage: either a pinned pool handle OR a heap vector.
+        // GPU worker uses data() regardless.
+        PinnedInputPool::Handle poolHandle;   // valid when using pool
+        std::vector<uint8_t>    heapData;     // used in fallback mode
+
+        uint8_t*       data()       { return poolHandle.valid() ? poolHandle.data : heapData.data(); }
+        const uint8_t* data() const { return poolHandle.valid() ? poolHandle.data : heapData.data(); }
     };
-    
+
 private:
-    std::thread readerThread;
-    std::queue<ReadChunk> readQueue;
-    std::mutex queueMutex;
-    std::condition_variable queueCV;
-    std::atomic<bool> shouldStop{false};
-    std::atomic<bool> finished{false};
+    std::thread  readerThread;
+
+    // Ready-to-process queue (small  just coordination, not storage)
+    std::queue<ReadChunk>    readQueue;
+    std::mutex               queueMutex;
+    std::condition_variable  queueCV;
+
+    std::atomic<bool>   shouldStop{false};
+    std::atomic<bool>   finished{false};
     std::atomic<size_t> bytesRead{0};
-    std::atomic<double> totalReadTime{0.0};  // Track reading time
-    
-    int inputFd = -1;
+    std::atomic<double> totalReadTime{0.0};
+
+    int    inputFd  = -1;
     size_t fileSize = 0;
     size_t chunkSize = 0;
-    size_t maxQueuedChunks = 0;  // Limit RAM usage
-    
-    // Reader thread main loop
+
+    // Pool mode: non-null when using pinned memory
+    PinnedInputPool* pool_        = nullptr;
+    // Fallback mode: limit queue depth to bound RAM
+    size_t           maxQueuedChunks = 0;
+
     void readerLoop() {
-        VLOG(DEBUG, "Reader thread started\n");
-        
         size_t chunkIndex = 0;
-        size_t totalRead = 0;
-        auto threadStartTime = std::chrono::high_resolution_clock::now();
-        
-        while (totalRead < fileSize) {
-            // Check queue depth - don't overflow RAM
-            {
-                std::unique_lock<std::mutex> lock(queueMutex);
-                queueCV.wait(lock, [this] {
-                    return readQueue.size() < maxQueuedChunks || shouldStop.load();
-                });
-                
-                if (shouldStop.load()) break;
-            }
-            
-            // Read next chunk
+        size_t totalRead  = 0;
+        auto   t0         = std::chrono::high_resolution_clock::now();
+
+        while (totalRead < fileSize && !shouldStop.load()) {
             size_t toRead = std::min(chunkSize, fileSize - totalRead);
             ReadChunk chunk;
             chunk.chunkIndex = chunkIndex;
-            chunk.data.resize(toRead);
-            chunk.size = toRead;
-            
-            auto readStart = std::chrono::high_resolution_clock::now();
-            ssize_t bytesReadNow = ::read(inputFd, chunk.data.data(), toRead);
-            auto readEnd = std::chrono::high_resolution_clock::now();
-            
-            if (bytesReadNow != (ssize_t)toRead) {
-                fprintf(stderr, "Reader thread: Read error at chunk %zu: %s\n",
-                        chunkIndex, strerror(errno));
-                break;
+            chunk.size       = toRead;
+
+            if (pool_) {
+                // ── Pooled path: acquire pinned slot, read directly into it ──
+                // Blocks only if all slots are in use (GPU-paced backpressure).
+                chunk.poolHandle = pool_->acquire();
+                if (!chunk.poolHandle.valid()) break;  // shutdown
+                chunk.poolHandle.size     = toRead;
+                chunk.poolHandle.chunkIdx = chunkIndex;
+
+                auto rs = std::chrono::high_resolution_clock::now();
+                ssize_t n = ::read(inputFd, chunk.poolHandle.data, toRead);
+                auto re = std::chrono::high_resolution_clock::now();
+                if (n != (ssize_t)toRead) {
+                    fprintf(stderr, "Reader: read error chunk %zu: %s\n",
+                            chunkIndex, strerror(errno));
+                    break;
+                }
+                totalReadTime = totalReadTime.load() +
+                    std::chrono::duration<double>(re - rs).count();
+            } else {
+                // ── Fallback: heap allocation with queue-depth cap ────────────
+                {
+                    std::unique_lock<std::mutex> lk(queueMutex);
+                    queueCV.wait(lk, [this]{
+                        return readQueue.size() < maxQueuedChunks || shouldStop.load();
+                    });
+                    if (shouldStop.load()) break;
+                }
+                chunk.heapData.resize(toRead);
+
+                auto rs = std::chrono::high_resolution_clock::now();
+                ssize_t n = ::read(inputFd, chunk.heapData.data(), toRead);
+                auto re = std::chrono::high_resolution_clock::now();
+                if (n != (ssize_t)toRead) {
+                    fprintf(stderr, "Reader: read error chunk %zu: %s\n",
+                            chunkIndex, strerror(errno));
+                    break;
+                }
+                totalReadTime = totalReadTime.load() +
+                    std::chrono::duration<double>(re - rs).count();
             }
-            
-            totalRead += toRead;
-            bytesRead += toRead;
-            
-            // Accumulate read time
-            double readTime = std::chrono::duration<double>(readEnd - readStart).count();
-            totalReadTime = totalReadTime.load() + readTime;
-            
-            // Enqueue chunk
-            {
-                std::lock_guard<std::mutex> lock(queueMutex);
-                readQueue.push(std::move(chunk));
-            }
-            queueCV.notify_one();
-            
+
+            totalRead  += toRead;
+            bytesRead  += toRead;
             chunkIndex++;
-            
-            VLOG(DEBUG, "Reader: Read chunk %zu (%zu bytes in %.3fs), queue depth: %zu\n",
-                 chunkIndex - 1, toRead, readTime, getQueueDepth());
+
+            { std::lock_guard<std::mutex> lk(queueMutex); readQueue.push(std::move(chunk)); }
+            queueCV.notify_one();
         }
-        
-        auto threadEndTime = std::chrono::high_resolution_clock::now();
-        double totalThreadTime = std::chrono::duration<double>(threadEndTime - threadStartTime).count();
-        
+
+        auto t1 = std::chrono::high_resolution_clock::now();
         finished.store(true);
         queueCV.notify_all();
-        VLOG(VERBOSE, "Reader thread finished: read %zu bytes in %.2fs (%.2fs actual I/O, %.2fs waiting)\n", 
-             bytesRead.load(), totalThreadTime, totalReadTime.load(), 
-             totalThreadTime - totalReadTime.load());
+        VLOG(VERBOSE, "Reader thread finished: read %zu bytes in %.2fs"
+             " (%.2fs actual I/O, %.2fs waiting)\n",
+             bytesRead.load(),
+             std::chrono::duration<double>(t1-t0).count(),
+             totalReadTime.load(),
+             std::chrono::duration<double>(t1-t0).count() - totalReadTime.load());
     }
-    
+
 public:
-    AsyncReader() = default;
-    
-    ~AsyncReader() {
-        stop();
+    AsyncReader()  = default;
+    ~AsyncReader() { stop(); }
+
+    // ── Pooled start: reader uses pre-allocated pinned slots ─────────────────
+    bool startPooled(const std::string& filename, size_t chunk_size,
+                     PinnedInputPool* pool) {
+        pool_      = pool;
+        chunkSize  = chunk_size;
+        return openAndLaunch(filename);
     }
-    
-    bool start(const std::string& filename, size_t chunk_size, size_t max_queued = 128) {
-        chunkSize = chunk_size;
+
+    // ── Fallback start: heap allocation with queue cap ────────────────────────
+    bool start(const std::string& filename, size_t chunk_size,
+               size_t max_queued = 128) {
+        pool_           = nullptr;
+        chunkSize       = chunk_size;
         maxQueuedChunks = max_queued;
-        
-        // Open file with O_RDONLY for sequential reads
-        inputFd = open(filename.c_str(), O_RDONLY);
-        if (inputFd < 0) {
-            fprintf(stderr, "Error opening input file %s: %s\n",
-                    filename.c_str(), strerror(errno));
-            return false;
+        return openAndLaunch(filename);
+    }
+
+private:
+    bool openAndLaunch(const std::string& filename) {
+        if (filename == "-") {
+            // Stdin pipe  file size unknown, can't pre-advise
+            inputFd  = STDIN_FILENO;
+            fileSize = 0;
+            VLOG(VERBOSE, "AsyncReader: reading from stdin (pipe)\n");
+        } else {
+            inputFd = open(filename.c_str(), O_RDONLY);
+            if (inputFd < 0) {
+                fprintf(stderr, "Error opening %s: %s\n", filename.c_str(), strerror(errno));
+                return false;
+            }
+            struct stat st;
+            fstat(inputFd, &st);
+            fileSize = st.st_size;
+            posix_fadvise(inputFd, 0, fileSize, POSIX_FADV_SEQUENTIAL);
+            posix_fadvise(inputFd, 0, fileSize, POSIX_FADV_WILLNEED);
+            VLOG(VERBOSE, "AsyncReader: opened %s (%.2f MB) for reading\n",
+                 filename.c_str(), fileSize/(1024.0*1024.0));
         }
-        
-        // Get file size
-        struct stat st;
-        if (fstat(inputFd, &st) != 0) {
-            fprintf(stderr, "Error getting file size: %s\n", strerror(errno));
-            close(inputFd);
-            return false;
-        }
-        fileSize = st.st_size;
-        
-        // Hint to kernel that we'll be reading sequentially
-        posix_fadvise(inputFd, 0, fileSize, POSIX_FADV_SEQUENTIAL);
-        posix_fadvise(inputFd, 0, fileSize, POSIX_FADV_WILLNEED);  // Start readahead
-        
-        VLOG(VERBOSE, "AsyncReader: opened %s (%.2f MB) for reading\n",
-             filename.c_str(), fileSize / (1024.0 * 1024.0));
-        
         shouldStop.store(false);
         finished.store(false);
         readerThread = std::thread(&AsyncReader::readerLoop, this);
-        
         return true;
     }
-    
+
+public:
     bool getChunk(ReadChunk& chunk) {
-        std::unique_lock<std::mutex> lock(queueMutex);
-        
-        // Wait for data or finish
-        queueCV.wait(lock, [this] {
-            return !readQueue.empty() || finished.load();
-        });
-        
-        if (readQueue.empty()) {
-            return false;  // No more chunks
-        }
-        
+        std::unique_lock<std::mutex> lk(queueMutex);
+        queueCV.wait(lk, [this]{ return !readQueue.empty() || finished.load(); });
+        if (readQueue.empty()) return false;
         chunk = std::move(readQueue.front());
         readQueue.pop();
-        
-        // Notify reader it can read more (if queue was full)
         queueCV.notify_one();
-        
         return true;
     }
-    
+
     void stop() {
         shouldStop.store(true);
+        if (pool_) pool_->shutdown();
         queueCV.notify_all();
-        
-        if (readerThread.joinable()) {
-            readerThread.join();
-        }
-        
-        if (inputFd >= 0) {
-            close(inputFd);
-            inputFd = -1;
-        }
+        if (readerThread.joinable()) readerThread.join();
+        if (inputFd >= 0) { close(inputFd); inputFd = -1; }
     }
-    
-    bool isFinished() const {
-        return finished.load() && getQueueDepth() == 0;
-    }
-    
+
+    bool   isFinished()    const { return finished.load() && getQueueDepth() == 0; }
+    bool   isPooled()      const { return pool_ != nullptr; }
     size_t getQueueDepth() const {
-        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(queueMutex));
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(queueMutex));
         return readQueue.size();
     }
-    
-    size_t getFileSize() const { return fileSize; }
+    size_t getFileSize()  const { return fileSize; }
     size_t getBytesRead() const { return bytesRead.load(); }
-    double getReadTime() const { return totalReadTime.load(); }
+    double getReadTime()  const { return totalReadTime.load(); }
 };
 
 /*
  * Asynchronous Writer with Advanced I/O
- * Writes completed batches in background thread while GPUs continue working
+ * Writes completed batches in background thread while GPUs continue working.
+ *
+ * Key design: all formatted block data (header + payload) is accumulated into
+ * a large staging buffer before being flushed to disk in one big write() call.
+ * This collapses thousands of small 2-syscall-per-chunk writes into a handful
+ * of large sequential writes, saturating the NVMe write path.
  */
 class AsyncWriter {
 private:
+    // ── Staging write buffer ──────────────────────────────────────────────────
+    // 256 MB is large enough to hold ~65 chunks at 4 MB each and keeps the
+    // number of write() syscalls under 40 for an 8 GB file.
+    static constexpr size_t WRITE_BUF_SIZE = 256ULL * 1024 * 1024;
+
+    std::vector<uint8_t> writeBuf;   // allocated once at start()
+    size_t               writeBufUsed = 0;
+
+    // Append bytes to staging buffer, flushing when full
+    void bufAppend(const void* data, size_t len) {
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(data);
+        while (len > 0) {
+            size_t space = WRITE_BUF_SIZE - writeBufUsed;
+            size_t copy  = std::min(len, space);
+            memcpy(writeBuf.data() + writeBufUsed, src, copy);
+            writeBufUsed += copy;
+            src          += copy;
+            len          -= copy;
+            if (writeBufUsed == WRITE_BUF_SIZE) bufFlush();
+        }
+    }
+
+    void bufFlushU32(uint32_t v) {
+        uint8_t buf[4] = { uint8_t(v), uint8_t(v>>8), uint8_t(v>>16), uint8_t(v>>24) };
+        bufAppend(buf, 4);
+    }
+
+    void bufFlush() {
+        if (writeBufUsed == 0) return;
+        auto writeStart = std::chrono::high_resolution_clock::now();
+        ssize_t written = ::write(outputFd, writeBuf.data(), writeBufUsed);
+        auto writeEnd   = std::chrono::high_resolution_clock::now();
+        if (written != (ssize_t)writeBufUsed)
+            fprintf(stderr, "Write error: %s\n", strerror(errno));
+        // Tell kernel to drop these pages  we'll never re-read the output
+        off_t pos = lseek(outputFd, 0, SEEK_CUR);
+        if (pos >= (off_t)writeBufUsed)
+            posix_fadvise(outputFd, pos - writeBufUsed, writeBufUsed, POSIX_FADV_DONTNEED);
+        bytesWritten += writeBufUsed;
+        totalWriteTime = totalWriteTime.load() +
+            std::chrono::duration<double>(writeEnd - writeStart).count();
+        writeBufUsed = 0;
+    }
+
+    // ── Per-chunk write task ──────────────────────────────────────────────────
     struct WriteTask {
         size_t chunkIndex;
         std::vector<std::vector<uint8_t>> compressedChunks;
@@ -723,136 +993,96 @@ private:
         std::vector<size_t> chunkIndices;
         std::vector<size_t> originalSizes;
     };
-    
+
     std::thread writerThread;
-    std::map<size_t, WriteTask> pendingWrites;  // Out-of-order buffer, indexed by first chunk
+    std::map<size_t, WriteTask> pendingWrites;
     std::mutex queueMutex;
     std::condition_variable queueCV;
-    std::atomic<bool> shouldStop{false};
+    std::atomic<bool>   shouldStop{false};
     std::atomic<size_t> bytesWritten{0};
-    std::atomic<double> totalWriteTime{0.0};  // Track writing time
-    std::atomic<size_t> nextChunkToWrite{0};  // Next expected chunk index
-    
-    int outputFd = -1;
+    std::atomic<double> totalWriteTime{0.0};
+    std::atomic<size_t> nextChunkToWrite{0};
+    std::atomic<bool>   writerDone{false};
+    std::atomic<size_t> totalExpectedChunks{SIZE_MAX};  // set before workers launch
+
+    int         outputFd   = -1;
     std::string outputFile;
-    XXH::State* xxhState = nullptr;
-    
-    // Writer thread main loop
+    XXH::State* xxhState   = nullptr;
+
     void writerLoop() {
         VLOG(DEBUG, "Writer thread started\n");
-        auto threadStartTime = std::chrono::high_resolution_clock::now();
-        
+        auto threadStart = std::chrono::high_resolution_clock::now();
+
         while (true) {
             WriteTask task;
             bool hasTask = false;
-            
+
             {
                 std::unique_lock<std::mutex> lock(queueMutex);
-                
-                // Wait for either: next sequential chunk available OR stop signal
-                queueCV.wait(lock, [this] { 
-                    return pendingWrites.count(nextChunkToWrite.load()) > 0 || shouldStop.load(); 
+                queueCV.wait(lock, [this] {
+                    return pendingWrites.count(nextChunkToWrite.load()) > 0
+                           || shouldStop.load();
                 });
-                
-                if (pendingWrites.empty() && shouldStop.load()) {
-                    break;  // Done
-                }
-                
-                // Check if next sequential chunk is available
-                if (pendingWrites.count(nextChunkToWrite.load()) > 0) {
-                    task = std::move(pendingWrites[nextChunkToWrite.load()]);
-                    pendingWrites.erase(nextChunkToWrite.load());
+                // Exit when: explicit stop() OR we've written every expected chunk
+                bool allDone = nextChunkToWrite.load() >= totalExpectedChunks.load();
+                if (pendingWrites.empty() && (shouldStop.load() || allDone)) break;
+                auto it = pendingWrites.find(nextChunkToWrite.load());
+                if (it != pendingWrites.end()) {
+                    task    = std::move(it->second);
+                    pendingWrites.erase(it);
                     hasTask = true;
-                    
-                    VLOG(DEBUG, "Writer: got sequential chunk %zu (buffer: %zu pending)\n",
-                         nextChunkToWrite.load(), pendingWrites.size());
                 }
             }
-            
-            if (hasTask) {
-                // Write this task (outside lock for parallelism)
-                auto writeStart = std::chrono::high_resolution_clock::now();
+
+            while (hasTask) {
                 writeTask(task);
-                auto writeEnd = std::chrono::high_resolution_clock::now();
-                
-                double writeTime = std::chrono::duration<double>(writeEnd - writeStart).count();
-                totalWriteTime = totalWriteTime.load() + writeTime;
-                
-                // Update next expected chunk
                 nextChunkToWrite += task.chunkIndices.size();
-                queueCV.notify_all();  // Notify in case we were blocking something
+
+                // Greedily drain any already-available consecutive chunks
+                // without releasing/re-acquiring the lock between each one.
+                // This avoids condvar overhead when the map is pre-populated.
+                std::unique_lock<std::mutex> lock(queueMutex);
+                auto it = pendingWrites.find(nextChunkToWrite.load());
+                if (it != pendingWrites.end()) {
+                    task = std::move(it->second);
+                    pendingWrites.erase(it);
+                    // hasTask stays true  continue draining
+                } else {
+                    hasTask = false;
+                    lock.unlock();
+                    queueCV.notify_all();
+                }
             }
         }
-        
-        auto threadEndTime = std::chrono::high_resolution_clock::now();
-        double totalThreadTime = std::chrono::duration<double>(threadEndTime - threadStartTime).count();
-        
+
+        bufFlush();   // flush any remaining data
+        writerDone.store(true);
+
+        auto threadEnd = std::chrono::high_resolution_clock::now();
+        double total   = std::chrono::duration<double>(threadEnd - threadStart).count();
         VLOG(VERBOSE, "Writer thread finished: wrote %zu bytes in %.2fs (%.2fs actual I/O, %.2fs waiting)\n",
-             bytesWritten.load(), totalThreadTime, totalWriteTime.load(),
-             totalThreadTime - totalWriteTime.load());
+             bytesWritten.load(), total, totalWriteTime.load(),
+             total - totalWriteTime.load());
     }
-    
+
     void writeTask(const WriteTask& task) {
         for (size_t i = 0; i < task.originalChunks.size(); i++) {
             size_t origSize = task.originalSizes[i];
-            
-            // Update checksum
-            if (xxhState) {
+            if (xxhState)
                 xxhState->update(task.originalChunks[i].data(), origSize);
-            }
-            
-            // Write block
-            if (i < task.compressedChunks.size() && !task.compressedChunks[i].empty()) {
-                // Compressed chunk
-                uint32_t compSize = task.compressedChunks[i].size();
-                
-                if (compSize >= origSize) {
-                    // Doesn't compress - write uncompressed
-                    writeUncompressedBlock(task.originalChunks[i].data(), origSize);
-                } else {
-                    // Write compressed
-                    writeCompressedBlock(task.compressedChunks[i].data(), compSize);
-                }
+
+            bool hasCompressed = i < task.compressedChunks.size()
+                                 && !task.compressedChunks[i].empty();
+            if (hasCompressed && task.compressedChunks[i].size() < origSize) {
+                uint32_t compSz = (uint32_t)task.compressedChunks[i].size();
+                bufFlushU32(compSz);
+                bufAppend(task.compressedChunks[i].data(), compSz);
             } else {
-                // Pre-marked as uncompressed
-                writeUncompressedBlock(task.originalChunks[i].data(), origSize);
+                uint32_t blockHdr = (uint32_t)origSize | 0x80000000u;
+                bufFlushU32(blockHdr);
+                bufAppend(task.originalChunks[i].data(), origSize);
             }
         }
-    }
-    
-    void writeU32(uint32_t value) {
-        uint8_t buf[4];
-        buf[0] = value & 0xFF;
-        buf[1] = (value >> 8) & 0xFF;
-        buf[2] = (value >> 16) & 0xFF;
-        buf[3] = (value >> 24) & 0xFF;
-        
-        ssize_t written = ::write(outputFd, buf, 4);
-        if (written != 4) {
-            fprintf(stderr, "Error writing to file: %s\n", strerror(errno));
-        }
-        bytesWritten += 4;
-    }
-    
-    void writeUncompressedBlock(const void* data, size_t size) {
-        uint32_t blockSize = size | 0x80000000;  // Set high bit
-        writeU32(blockSize);
-        
-        ssize_t written = ::write(outputFd, data, size);
-        if (written != (ssize_t)size) {
-            fprintf(stderr, "Error writing uncompressed block: %s\n", strerror(errno));
-        }
-        bytesWritten += size;
-    }
-    
-    void writeCompressedBlock(const void* data, size_t size) {
-        writeU32(size);
-        
-        ssize_t written = ::write(outputFd, data, size);
-        if (written != (ssize_t)size) {
-            fprintf(stderr, "Error writing compressed block: %s\n", strerror(errno));
-        }
-        bytesWritten += size;
     }
     
 public:
@@ -875,6 +1105,10 @@ public:
             return false;
         }
         
+        // Allocate write staging buffer once
+        writeBuf.resize(WRITE_BUF_SIZE);
+        writeBufUsed = 0;
+
         // Hint to kernel that we'll be writing sequentially
         posix_fadvise(outputFd, 0, 0, POSIX_FADV_SEQUENTIAL);
         
@@ -886,27 +1120,43 @@ public:
         return true;
     }
     
-    void enqueue(size_t chunkIndex, 
+    void enqueue(size_t chunkIndex,
                  std::vector<std::vector<uint8_t>> compressedChunks,
                  std::vector<std::vector<uint8_t>> originalChunks,
                  std::vector<size_t> chunkIndices,
                  std::vector<size_t> originalSizes) {
-        
         WriteTask task;
-        task.chunkIndex = chunkIndex;
+        task.chunkIndex       = chunkIndex;
         task.compressedChunks = std::move(compressedChunks);
-        task.originalChunks = std::move(originalChunks);
-        task.chunkIndices = std::move(chunkIndices);
-        task.originalSizes = std::move(originalSizes);
-        
+        task.originalChunks   = std::move(originalChunks);
+        task.chunkIndices     = std::move(chunkIndices);
+        task.originalSizes    = std::move(originalSizes);
         {
             std::lock_guard<std::mutex> lock(queueMutex);
             pendingWrites[chunkIndex] = std::move(task);
-            
-            VLOG(DEBUG, "Enqueued batch starting at chunk %zu (writer has %zu pending batches)\n",
-                 chunkIndex, pendingWrites.size());
         }
-        queueCV.notify_all();  // Wake up writer if it's waiting for this chunk
+        queueCV.notify_one();
+    }
+
+    // Batch-insert all per-chunk tasks from one GPU batch under a single lock
+    // acquisition.  Reduces mutex contention from O(batchSize) to O(1) per batch.
+    void enqueueBatch(std::vector<std::vector<uint8_t>>& compressedChunks,
+                      std::vector<std::vector<uint8_t>>& originalChunks,
+                      const std::vector<size_t>&         chunkIndices,
+                      const std::vector<size_t>&         originalSizes) {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            for (size_t i = 0; i < chunkIndices.size(); i++) {
+                WriteTask task;
+                task.chunkIndex = chunkIndices[i];
+                task.chunkIndices  = { chunkIndices[i] };
+                task.originalSizes = { originalSizes[i] };
+                task.compressedChunks.push_back(std::move(compressedChunks[i]));
+                task.originalChunks  .push_back(std::move(originalChunks[i]));
+                pendingWrites[chunkIndices[i]] = std::move(task);
+            }
+        }
+        queueCV.notify_all();
     }
     
     void stop() {
@@ -933,10 +1183,10 @@ public:
         return totalWriteTime.load();
     }
     
-    size_t getNextChunkToWrite() const {
-        return nextChunkToWrite.load();
-    }
-    
+    size_t getNextChunkToWrite() const { return nextChunkToWrite.load(); }
+    bool   isDone()             const { return writerDone.load(); }
+    void   setTotalChunks(size_t n)  { totalExpectedChunks.store(n); }
+
     size_t getQueueDepth() const {
         std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(queueMutex));
         return pendingWrites.size();
@@ -962,6 +1212,8 @@ private:
         size_t chunkIndex;
         std::vector<uint8_t> inputData;
         size_t maxOutputSize;
+        int    hcLevel      = 0;      // 0=fast, 1-12=HC
+        bool   forceCompress = false; // write compressed even if larger
     };
     
     std::vector<std::thread> workers;
@@ -1007,18 +1259,25 @@ private:
             result.originalData = job.inputData;  // Always keep original
             result.compressedData.resize(job.maxOutputSize);
             
-            int compSize = LZ4_compress_default(
-                reinterpret_cast<const char*>(job.inputData.data()),
-                reinterpret_cast<char*>(result.compressedData.data()),
-                job.inputData.size(),
-                job.maxOutputSize
-            );
-            
-            if (compSize > 0 && (size_t)compSize < job.inputData.size()) {
+            // HC level > 0: use LZ4_compress_HC for levels -10 to -12
+            int compSize = (job.hcLevel > 0)
+                ? LZ4_compress_HC(
+                    reinterpret_cast<const char*>(job.inputData.data()),
+                    reinterpret_cast<char*>(result.compressedData.data()),
+                    job.inputData.size(),
+                    job.maxOutputSize,
+                    job.hcLevel)
+                : LZ4_compress_default(
+                    reinterpret_cast<const char*>(job.inputData.data()),
+                    reinterpret_cast<char*>(result.compressedData.data()),
+                    job.inputData.size(),
+                    job.maxOutputSize);
+
+            if (compSize > 0 && (job.forceCompress || (size_t)compSize < job.inputData.size())) {
                 result.compressedData.resize(compSize);
                 result.success = true;
             } else {
-                // Didn't compress - clear compressed buffer, original is in originalData
+                // Didn't compress (or forceCompress not set) - use original
                 result.compressedData.clear();
                 result.success = false;
             }
@@ -1059,12 +1318,15 @@ public:
         stop();
     }
     
-    void submitJob(size_t chunkIndex, std::vector<uint8_t> data) {
+    void submitJob(size_t chunkIndex, std::vector<uint8_t> data,
+                   int hcLevel = 0, bool forceCompress = false) {
         CompressJob job;
-        job.chunkIndex = chunkIndex;
-        job.inputData = std::move(data);
+        job.chunkIndex    = chunkIndex;
+        job.inputData     = std::move(data);
         job.maxOutputSize = LZ4_compressBound(job.inputData.size());
-        
+        job.hcLevel       = hcLevel;
+        job.forceCompress = forceCompress;
+
         {
             std::lock_guard<std::mutex> lock(jobMutex);
             jobQueue.push(std::move(job));
@@ -1159,12 +1421,23 @@ private:
     bool decompress;
     bool keepOriginal;
     bool forceOverwrite;
+    bool forceCompress;     // -z: always write compressed output even if larger
     bool stdoutMode;
     bool testMode;
+    int  hcLevel;           // 0=fast LZ4, 1-12=HC level (for -10 to -12)
     BackendMode backendMode;
     size_t cpuThreads;
     std::string inputFile;
     std::string outputFile;
+
+    // Tunable GPU parameters (set via command line)
+    size_t slotCapacity;      // chunks per GPU slot (--slot-capacity)
+    size_t pipelineDepth;     // slots per GPU (--pipeline-depth)
+    bool   disableEarlyRead;  // skip early reader (--no-early-read)
+
+    // Started before GPU init so reads overlap with CUDA context creation
+    AsyncReader      earlyReader;
+    PinnedInputPool  inputPool;    // pinned slots shared between reader + GPU workers
     
 public:
     GZL4Compressor() 
@@ -1174,10 +1447,15 @@ public:
         , decompress(false)
         , keepOriginal(false)
         , forceOverwrite(false)
+        , forceCompress(false)
         , stdoutMode(false)
         , testMode(false)
+        , hcLevel(0)
         , backendMode(BackendMode::HYBRID)  // Default to hybrid mode
         , cpuThreads(CPU_THREADS_AUTO)      // Auto-detect
+        , slotCapacity(8)                   // "batch size" or "chunks per batch" in UI
+        , pipelineDepth(1)                  // "streams per GPU" or "slots per GPU" in UI
+        , disableEarlyRead(false)
     {}
     
     ~GZL4Compressor() {}
@@ -1243,40 +1521,43 @@ public:
             
             gpu.availableMemory = static_cast<size_t>(freeMem * GPU_MEM_SAFETY_FACTOR);
             gpu.totalMemory = totalMem;
-            
-            VLOG(VERBOSE, "GPU %d: %s\n", i, gpu.properties.name);
-            VLOG(VERY_VERBOSE, "  Compute Capability: %d.%d\n", 
-                 gpu.properties.major, gpu.properties.minor);
-            VLOG(VERY_VERBOSE, "  Total Memory: %.2f GB\n", 
-                 totalMem / (1024.0 * 1024.0 * 1024.0));
-            VLOG(VERY_VERBOSE, "  Available Memory: %.2f GB\n", 
-                 gpu.availableMemory / (1024.0 * 1024.0 * 1024.0));
-            
-            // Try to create CUDA streams - skip GPU if this fails
-            gpu.streams.resize(STREAMS_PER_GPU);
+            gpu.smCount     = gpu.properties.multiProcessorCount;
+
+            // asyncEngineCount = number of DMA copy engines (typically 2 on server GPUs:
+            // Pipeline depth: user override, or default to 1 (empirically optimal).
+            // Fewer slots = less concurrent disorder = less writer sequential waiting.
+            // Old auto-detect: asyncEngineCount+1 clamped to [2,6], but testing showed
+            // depth=1 gives best throughput (601 MB/s vs 558 MB/s at depth=4).
+            gpu.pipelineDepth = (pipelineDepth > 0) ? pipelineDepth : 1;
+
+            VLOG(VERBOSE, "GPU%d: %s  %.1f GB VRAM  %d SMs  %d copy engine%s  pipeline=%d\n",
+                 i, gpu.properties.name,
+                 totalMem / (1024.0*1024.0*1024.0),
+                 (int)gpu.smCount,
+                 gpu.properties.asyncEngineCount,
+                 gpu.properties.asyncEngineCount == 1 ? "" : "s",
+                 gpu.pipelineDepth);
+
+            // Try to create exactly pipelineDepth CUDA streams
+            gpu.streams.resize(gpu.pipelineDepth);
             bool streamsOk = true;
-            for (int s = 0; s < STREAMS_PER_GPU; s++) {
+            for (int s = 0; s < gpu.pipelineDepth; s++) {
                 err = cudaStreamCreate(&gpu.streams[s]);
                 if (err != cudaSuccess) {
                     VLOG(VERBOSE, "  Failed to create stream %d: %s\n",
                          s, cudaGetErrorString(err));
-                    // Clean up any streams we did create
-                    for (int cleanup = 0; cleanup < s; cleanup++) {
+                    for (int cleanup = 0; cleanup < s; cleanup++)
                         cudaStreamDestroy(gpu.streams[cleanup]);
-                    }
-                    cudaGetLastError(); // Clear error
+                    cudaGetLastError();
                     streamsOk = false;
                     break;
                 }
             }
-            
             if (!streamsOk) {
-                VLOG(VERBOSE, "Skipping GPU %d (%s) - insufficient memory for streams\n",
-                     i, gpu.properties.name);
+                VLOG(VERBOSE, "Skipping GPU%d - stream creation failed\n", i);
                 continue;
             }
-            
-            VLOG(DEBUG, "  Created %d CUDA streams\n", STREAMS_PER_GPU);
+            VLOG(DEBUG, "  Created %d pipeline streams\n", gpu.pipelineDepth);
             
             gpus.push_back(std::move(gpu));
         }
@@ -1294,21 +1575,35 @@ public:
      * Calculate optimal chunk size based on compression level
      */
     void setChunkSizeFromLevel() {
-        switch (compressionLevel) {
-            case 1: chunkSize = CHUNK_SIZE_LEVEL_1; break;
-            case 2: chunkSize = CHUNK_SIZE_LEVEL_2; break;
-            case 3: chunkSize = CHUNK_SIZE_LEVEL_3; break;
-            case 4: chunkSize = CHUNK_SIZE_LEVEL_4; break;
-            case 5: chunkSize = CHUNK_SIZE_LEVEL_5; break;
-            case 6: chunkSize = CHUNK_SIZE_LEVEL_6; break;
-            case 7: chunkSize = CHUNK_SIZE_LEVEL_7; break;
-            case 8: chunkSize = CHUNK_SIZE_LEVEL_8; break;
-            case 9: 
-            default: chunkSize = CHUNK_SIZE_LEVEL_9; break;
+        // Map -1..-9 to chunk sizes; -10..-12 are HC levels using 4MB chunks
+        // HC levels:  -10 = HC level 4, -11 = HC level 8, -12 = HC level 12
+        if (compressionLevel >= 10) {
+            chunkSize = CHUNK_SIZE_LEVEL_9;  // 4MB max for HC
+            static const int hcMap[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 8, 12};
+            hcLevel = hcMap[std::min(compressionLevel, 12)];
+        } else {
+            hcLevel = 0;  // fast LZ4
+            switch (compressionLevel) {
+                case 1: chunkSize = CHUNK_SIZE_LEVEL_1; break;
+                case 2: chunkSize = CHUNK_SIZE_LEVEL_2; break;
+                case 3: chunkSize = CHUNK_SIZE_LEVEL_3; break;
+                case 4: chunkSize = CHUNK_SIZE_LEVEL_4; break;
+                case 5: chunkSize = CHUNK_SIZE_LEVEL_5; break;
+                case 6: chunkSize = CHUNK_SIZE_LEVEL_6; break;
+                case 7: chunkSize = CHUNK_SIZE_LEVEL_7; break;
+                case 8: chunkSize = CHUNK_SIZE_LEVEL_8; break;
+                case 9:
+                default: chunkSize = CHUNK_SIZE_LEVEL_9; break;
+            }
         }
-        
-        VLOG(VERBOSE, "Compression level %d: chunk size %.2f KB\n",
-             compressionLevel, chunkSize / 1024.0);
+
+        if (hcLevel > 0) {
+            VLOG(VERBOSE, "Compression level %d: LZ4 HC level %d, chunk size %.2f KB\n",
+                 compressionLevel, hcLevel, chunkSize / 1024.0);
+        } else {
+            VLOG(VERBOSE, "Compression level %d: LZ4 fast, chunk size %.2f KB\n",
+                 compressionLevel, chunkSize / 1024.0);
+        }
     }
     
     /*
@@ -1317,69 +1612,72 @@ public:
      * With 4MB chunks (LZ4 limit), we can fit more chunks per batch
      */
     size_t calculateBatchSize(size_t gpuMemory) {
-        // Account for compression overhead (~2x worst case) + temp buffers
-        size_t memoryPerChunk = chunkSize * 4; // Conservative estimate
-        size_t availableForBatch = static_cast<size_t>(gpuMemory * GPU_MEM_SAFETY_FACTOR);
-        size_t batchSize = availableForBatch / memoryPerChunk;
-        
-        // With smaller chunks (4MB vs 16MB), we can process more per batch
-        // Minimum of 16, maximum of 2048 (increased from 256)
-        batchSize = std::max(size_t(16), std::min(size_t(2048), batchSize));
-        
-        VLOG(DEBUG, "Calculated batch size: %zu chunks (%.2f MB per batch)\n",
-             batchSize, (batchSize * chunkSize) / (1024.0 * 1024.0));
-        
+        // Conservative init-time estimate (used for startup message only;
+        // refreshGPUMemoryAndBatchSize() does the real calculation at runtime).
+        size_t memPerChunk = chunkSize * 5;
+        size_t usable      = static_cast<size_t>(gpuMemory * 0.90);
+        size_t batchSize   = usable / memPerChunk;
+        batchSize = std::max(size_t(4), std::min(size_t(8192), batchSize));
+        VLOG(DEBUG, "Init-time batch estimate: %zu chunks/slot (%.1f GB/slot)\n",
+             batchSize, (batchSize * memPerChunk) / (1024.0*1024.0*1024.0));
         return batchSize;
     }
     
     /*
-     * Refresh GPU memory status and calculate current batch size
-     * Returns 0 if GPU doesn't have enough memory
+     * Dynamically compute how many chunks to pack into one pipeline slot.
+     *
+     * Goals:
+     *   1. Fill enough work that the GPU SMs stay busy for >>1ms per batch
+     *      (avoids kernel launch overhead dominating).
+     *   2. Leave room for the other (pipelineDepth-1) concurrent slots.
+     *   3. Never exceed available VRAM.
+     *
+     * nvCOMP batched LZ4 memory per chunk (empirical + conservative):
+     *   input  1× chunkSize   (pinned H→D copy)
+     *   output 1.1× chunkSize (LZ4 worst-case expand)
+     *   temp   2×  chunkSize  (nvCOMP internal scratch)
+     *   total ≈ 4.2×; we use 5× for safety.
      */
     size_t refreshGPUMemoryAndBatchSize(GPUDevice& gpu) {
         cudaSetDevice(gpu.deviceId);
-        
+
         size_t freeMem, totalMem;
-        cudaError_t err = cudaMemGetInfo(&freeMem, &totalMem);
-        if (err != cudaSuccess) {
-            VLOG(DEBUG, "GPU %d: Failed to get memory info: %s\n", 
-                 gpu.deviceId, cudaGetErrorString(err));
-            return 0;
-        }
-        
+        if (cudaMemGetInfo(&freeMem, &totalMem) != cudaSuccess) return 0;
         gpu.availableMemory = freeMem;
-        
-        // Conservative memory estimate per chunk
-        // nvCOMP needs: input buffer + output buffer (~2x) + temp buffers
-        // Use 5x multiplier (reduced from 6x for larger batches)
-        size_t memoryPerChunk = chunkSize * 5;
-        
-        // Use 90% of free memory for compression (increased from 80% for better utilization)
-        size_t usableMemory = static_cast<size_t>(freeMem * 0.9);
-        
-        // Need at least enough for 16 chunks minimum
-        size_t minRequired = memoryPerChunk * 16;
-        
-        if (usableMemory < minRequired) {
-            VLOG(DEBUG, "GPU %d: Insufficient memory (%.2f GB free, need %.2f GB minimum)\n",
-                 gpu.deviceId, 
-                 freeMem / (1024.0 * 1024.0 * 1024.0),
-                 minRequired / (1024.0 * 1024.0 * 1024.0));
+
+        const size_t memPerChunk    = chunkSize * 5;
+        const int    slots          = std::max(1, gpu.pipelineDepth);
+
+        // Divide VRAM across pipeline slots so all can be in-flight at once.
+        // Keep 10% headroom for CUDA runtime bookkeeping.
+        size_t perSlotMem = static_cast<size_t>(freeMem * 0.90) / slots;
+
+        if (perSlotMem < memPerChunk) {
+            VLOG(DEBUG, "GPU%d: %.1f GB free / %d slots -> only %.0f MB/slot, need %.0f MB\n",
+                 gpu.deviceId, freeMem/(1024.0*1024.0*1024.0), slots,
+                 perSlotMem/(1024.0*1024.0), memPerChunk/(1024.0*1024.0));
             return 0;
         }
-        
-        // Calculate how many chunks we can process
-        size_t batchSize = usableMemory / memoryPerChunk;
-        // Reduced max from 2048 to 256 for better pipeline overlap
-        // Smaller batches = more batches = better async I/O parallelism
-        batchSize = std::max(size_t(16), std::min(size_t(256), batchSize));
-        
-        VLOG(DEBUG, "GPU %d: %.2f GB free, batch size %zu chunks\n",
-             gpu.deviceId,
-             freeMem / (1024.0 * 1024.0 * 1024.0),
-             batchSize);
-        
-        return batchSize;
+
+        // VRAM-based ceiling
+        size_t vramBatch = perSlotMem / memPerChunk;
+
+        // SM-based floor: target at least 4 chunks per SM so the GPU has
+        // enough independent work to fill its wavefronts.
+        size_t smFloor = gpu.smCount * 4;
+
+        // Final batch size: at least smFloor, at most vramBatch, hard cap 8192.
+        size_t batch = std::max(smFloor, std::min(vramBatch, size_t(8192)));
+
+        // Store for monitoring
+        gpu.optimalBatch = batch;
+
+        VLOG(DEBUG, "GPU%d: %.1f GB free / %d slots -> %zu chunks/slot "
+             "(VRAM ceiling %zu, SM floor %zu, %zu SMs)\n",
+             gpu.deviceId, freeMem/(1024.0*1024.0*1024.0),
+             slots, batch, vramBatch, smFloor, gpu.smCount);
+
+        return batch;
     }
     
     /*
@@ -1394,136 +1692,134 @@ public:
             fprintf(stderr, "Error: Cannot compress empty batch\n");
             return false;
         }
-        
+
         state.batch_size = inputs.size();
         state.input_sizes.resize(state.batch_size);
         state.max_output_sizes.resize(state.batch_size);
-        
-        VLOG(DEBUG, "Launching async batch compression of %zu chunks on GPU %d\n",
-             state.batch_size, gpu.deviceId);
-        
+
+        VLOG(DEBUG, "Launching async batch compression of %zu chunks on GPU %d stream %p\n",
+             state.batch_size, gpu.deviceId, (void*)stream);
+
         cudaError_t err = cudaSetDevice(gpu.deviceId);
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA error: Failed to set device %d - %s\n",
                     gpu.deviceId, cudaGetErrorString(err));
             return false;
         }
-        
+
         cudaGetLastError(); // Clear any pending errors
-        
-        // Allocate and copy input buffers
+
+        // ── 1. Allocate pinned host staging buffers + device input buffers ──
+        // Use cudaMemcpyAsync so H→D copies are queued into the stream
+        // and never block the CPU.
         state.d_inputs.resize(state.batch_size);
         std::vector<const void*> h_input_ptrs(state.batch_size);
-        std::vector<size_t> h_input_sizes(state.batch_size);
-        
+        std::vector<size_t>      h_input_sizes(state.batch_size);
+
+        size_t max_chunk_size   = 0;
+        size_t total_input_size = 0;
+
         for (size_t i = 0; i < state.batch_size; i++) {
             size_t size = inputs[i].size();
             state.input_sizes[i] = size;
-            h_input_sizes[i] = size;
-            
+            h_input_sizes[i]     = size;
+            max_chunk_size   = std::max(max_chunk_size, size);
+            total_input_size += size;
+
             CUDA_CHECK_MSG(cudaMalloc(&state.d_inputs[i], size),
-                          "Failed to allocate input buffer");
-            CUDA_CHECK_MSG(cudaMemcpy(state.d_inputs[i], inputs[i].data(), size,
-                                     cudaMemcpyHostToDevice),
-                          "Failed to copy input to device");
-            
+                           "Failed to allocate input buffer");
+            // Async copy - queued into stream, returns immediately
+            CUDA_CHECK_MSG(cudaMemcpyAsync(state.d_inputs[i], inputs[i].data(), size,
+                                           cudaMemcpyHostToDevice, stream),
+                           "Failed to async copy input to device");
             h_input_ptrs[i] = state.d_inputs[i];
         }
-        
-        // Allocate and initialize device arrays
-        CUDA_CHECK_MSG(cudaMalloc(&state.d_input_ptrs, state.batch_size * sizeof(void*)),
-                      "Failed to allocate input pointers array");
-        CUDA_CHECK_MSG(cudaMalloc(&state.d_input_sizes, state.batch_size * sizeof(size_t)),
-                      "Failed to allocate input sizes array");
-        
-        CUDA_CHECK_MSG(cudaMemcpy(state.d_input_ptrs, h_input_ptrs.data(),
-                                 state.batch_size * sizeof(void*), cudaMemcpyHostToDevice),
-                      "Failed to copy input pointers");
-        CUDA_CHECK_MSG(cudaMemcpy(state.d_input_sizes, h_input_sizes.data(),
-                                 state.batch_size * sizeof(size_t), cudaMemcpyHostToDevice),
-                      "Failed to copy input sizes");
-        
-        // Get max chunk size
-        size_t max_chunk_size = 0;
-        for (size_t size : state.input_sizes) {
-            max_chunk_size = std::max(max_chunk_size, size);
-        }
-        
-        // Calculate total input size
-        size_t total_input_size = 0;
-        for (size_t size : state.input_sizes) {
-            total_input_size += size;
-        }
-        
-        // Configure LZ4 compression
+
+        // ── 2. Device pointer/size arrays (via pinned host staging) ──────────
+        // Use cudaHostAlloc (pinned) so cudaMemcpyAsync source stays valid
+        // until the stream completes - stack vectors would be freed too early.
+        size_t ptr_bytes  = state.batch_size * sizeof(void*);
+        size_t size_bytes = state.batch_size * sizeof(size_t);
+
+        CUDA_CHECK_MSG(cudaHostAlloc(&state.h_input_ptrs_pinned,  ptr_bytes,  cudaHostAllocDefault),
+                       "Failed to alloc pinned input ptrs");
+        CUDA_CHECK_MSG(cudaHostAlloc(&state.h_input_sizes_pinned, size_bytes, cudaHostAllocDefault),
+                       "Failed to alloc pinned input sizes");
+
+        memcpy(state.h_input_ptrs_pinned,  h_input_ptrs.data(),  ptr_bytes);
+        memcpy(state.h_input_sizes_pinned, h_input_sizes.data(), size_bytes);
+
+        CUDA_CHECK_MSG(cudaMalloc(&state.d_input_ptrs,  ptr_bytes),
+                       "Failed to allocate input pointers array");
+        CUDA_CHECK_MSG(cudaMalloc(&state.d_input_sizes, size_bytes),
+                       "Failed to allocate input sizes array");
+
+        CUDA_CHECK_MSG(cudaMemcpyAsync(state.d_input_ptrs,  state.h_input_ptrs_pinned,  ptr_bytes,
+                                       cudaMemcpyHostToDevice, stream),
+                       "Failed to async copy input pointers");
+        CUDA_CHECK_MSG(cudaMemcpyAsync(state.d_input_sizes, state.h_input_sizes_pinned, size_bytes,
+                                       cudaMemcpyHostToDevice, stream),
+                       "Failed to async copy input sizes");
+
+        // ── 3. Temp buffer (sync query, async is fine for the alloc itself) ─
         nvcompBatchedLZ4CompressOpts_t opts = nvcompBatchedLZ4CompressDefaultOpts;
-        
-        // Get temp buffer size
         size_t temp_bytes = 0;
         NVCOMP_CHECK(nvcompBatchedLZ4CompressGetTempSizeSync(
-            state.d_input_ptrs,
-            state.d_input_sizes,
-            state.batch_size,
-            max_chunk_size,
-            opts,
-            &temp_bytes,
-            total_input_size,
-            stream
-        ));
-        
-        VLOG(DEBUG, "  Temp buffer size: %.2f MB\n", temp_bytes / (1024.0 * 1024.0));
-        
-        // Allocate temp buffer
+            state.d_input_ptrs, state.d_input_sizes,
+            state.batch_size, max_chunk_size, opts,
+            &temp_bytes, total_input_size, stream));
+
+        VLOG(DEBUG, "  Temp buffer size: %.2f MB\n", temp_bytes / (1024.0*1024.0));
         CUDA_CHECK_MSG(cudaMalloc(&state.d_temp, temp_bytes),
-                      "Failed to allocate temp buffer");
-        
-        // Get output sizes and allocate output buffers
+                       "Failed to allocate temp buffer");
+
+        // ── 4. Output buffers ─────────────────────────────────────────────
         state.d_outputs.resize(state.batch_size);
         std::vector<void*> h_output_ptrs(state.batch_size);
-        
+
         for (size_t i = 0; i < state.batch_size; i++) {
             size_t max_output_size = 0;
             NVCOMP_CHECK(nvcompBatchedLZ4CompressGetMaxOutputChunkSize(
-                state.input_sizes[i],
-                opts,
-                &max_output_size
-            ));
-            
+                state.input_sizes[i], opts, &max_output_size));
             state.max_output_sizes[i] = max_output_size;
-            
             CUDA_CHECK_MSG(cudaMalloc(&state.d_outputs[i], max_output_size),
-                          "Failed to allocate output buffer");
+                           "Failed to allocate output buffer");
             h_output_ptrs[i] = state.d_outputs[i];
         }
-        
-        // Allocate device arrays for outputs
-        CUDA_CHECK_MSG(cudaMalloc(&state.d_output_ptrs, state.batch_size * sizeof(void*)),
-                      "Failed to allocate output pointers array");
+
+        CUDA_CHECK_MSG(cudaMalloc(&state.d_output_ptrs,  state.batch_size * sizeof(void*)),
+                       "Failed to allocate output pointers array");
         CUDA_CHECK_MSG(cudaMalloc(&state.d_output_sizes, state.batch_size * sizeof(size_t)),
-                      "Failed to allocate output sizes array");
-        CUDA_CHECK_MSG(cudaMalloc(&state.d_statuses, state.batch_size * sizeof(nvcompStatus_t)),
-                      "Failed to allocate statuses array");
-        
-        CUDA_CHECK_MSG(cudaMemcpy(state.d_output_ptrs, h_output_ptrs.data(),
-                                 state.batch_size * sizeof(void*), cudaMemcpyHostToDevice),
-                      "Failed to copy output pointers");
-        
-        // Launch compression
-        VLOG(DEBUG, "  Launching compression with batch_size=%zu\n", state.batch_size);
+                       "Failed to allocate output sizes array");
+        CUDA_CHECK_MSG(cudaMalloc(&state.d_statuses,     state.batch_size * sizeof(nvcompStatus_t)),
+                       "Failed to allocate statuses array");
+
+        CUDA_CHECK_MSG(cudaHostAlloc(&state.h_output_ptrs_pinned, state.batch_size * sizeof(void*),
+                                     cudaHostAllocDefault),
+                       "Failed to alloc pinned output ptrs");
+        memcpy(state.h_output_ptrs_pinned, h_output_ptrs.data(), state.batch_size * sizeof(void*));
+
+        CUDA_CHECK_MSG(cudaMemcpyAsync(state.d_output_ptrs, state.h_output_ptrs_pinned,
+                                       state.batch_size * sizeof(void*),
+                                       cudaMemcpyHostToDevice, stream),
+                       "Failed to async copy output pointers");
+
+        // ── 5. Launch compression kernel ──────────────────────────────────
+        // All prior async copies are ordered before this in the same stream.
+        VLOG(DEBUG, "  Launching nvcompBatchedLZ4CompressAsync batch_size=%zu\n", state.batch_size);
         NVCOMP_CHECK(nvcompBatchedLZ4CompressAsync(
             state.d_input_ptrs,
             state.d_input_sizes,
             max_chunk_size,
-            state.batch_size,  // THIS IS THE KEY - now using actual batch size!
+            state.batch_size,
             state.d_temp,
             temp_bytes,
             state.d_output_ptrs,
             state.d_output_sizes,
             opts,
             state.d_statuses,
-            stream
-        ));
-        
+            stream));
+
         return true;
     }
     
@@ -1532,65 +1828,65 @@ public:
      */
     bool getBatchCompressResults(BatchCompressState& state,
                                 std::vector<std::vector<uint8_t>>& outputs,
-                                GPUDevice& gpu) {
-        
+                                GPUDevice& gpu,
+                                cudaStream_t stream = 0) {
+
         cudaSetDevice(gpu.deviceId);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        
+        // Sync only this stream, not the whole device
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
         // Check statuses
         std::vector<nvcompStatus_t> statuses(state.batch_size);
         CUDA_CHECK_MSG(cudaMemcpy(statuses.data(), state.d_statuses,
-                                 state.batch_size * sizeof(nvcompStatus_t),
-                                 cudaMemcpyDeviceToHost),
-                      "Failed to copy statuses");
-        
+                                  state.batch_size * sizeof(nvcompStatus_t),
+                                  cudaMemcpyDeviceToHost),
+                       "Failed to copy statuses");
+
+        auto cleanup = [&]() {
+            for (auto ptr : state.d_inputs)  cudaFree(ptr);
+            for (auto ptr : state.d_outputs) cudaFree(ptr);
+            cudaFree(state.d_input_ptrs);
+            cudaFree(state.d_input_sizes);
+            cudaFree(state.d_temp);
+            cudaFree(state.d_output_ptrs);
+            cudaFree(state.d_output_sizes);
+            cudaFree(state.d_statuses);
+            if (state.h_input_ptrs_pinned)  cudaFreeHost(state.h_input_ptrs_pinned);
+            if (state.h_input_sizes_pinned) cudaFreeHost(state.h_input_sizes_pinned);
+            if (state.h_output_ptrs_pinned) cudaFreeHost(state.h_output_ptrs_pinned);
+            state.h_input_ptrs_pinned = state.h_input_sizes_pinned =
+                state.h_output_ptrs_pinned = nullptr;
+        };
+
         for (size_t i = 0; i < state.batch_size; i++) {
             if (statuses[i] != nvcompSuccess) {
                 fprintf(stderr, "Compression failed for chunk %zu with status %d\n",
                         i, static_cast<int>(statuses[i]));
-                // Cleanup and return false
-                for (auto ptr : state.d_inputs) cudaFree(ptr);
-                for (auto ptr : state.d_outputs) cudaFree(ptr);
-                cudaFree(state.d_input_ptrs);
-                cudaFree(state.d_input_sizes);
-                cudaFree(state.d_temp);
-                cudaFree(state.d_output_ptrs);
-                cudaFree(state.d_output_sizes);
-                cudaFree(state.d_statuses);
+                cleanup();
                 return false;
             }
         }
-        
+
         // Get output sizes
         std::vector<size_t> output_sizes(state.batch_size);
         CUDA_CHECK_MSG(cudaMemcpy(output_sizes.data(), state.d_output_sizes,
-                                 state.batch_size * sizeof(size_t),
-                                 cudaMemcpyDeviceToHost),
-                      "Failed to copy output sizes");
-        
-        // Copy output data
+                                  state.batch_size * sizeof(size_t),
+                                  cudaMemcpyDeviceToHost),
+                       "Failed to copy output sizes");
+
+        // Copy output data D→H
         outputs.resize(state.batch_size);
         for (size_t i = 0; i < state.batch_size; i++) {
             outputs[i].resize(output_sizes[i]);
             CUDA_CHECK_MSG(cudaMemcpy(outputs[i].data(), state.d_outputs[i],
-                                     output_sizes[i], cudaMemcpyDeviceToHost),
-                          "Failed to copy output data");
-            
-            VLOG(DEBUG, "  Chunk %zu: %zu -> %zu bytes (%.2f%%)\n",
+                                      output_sizes[i], cudaMemcpyDeviceToHost),
+                           "Failed to copy output data");
+            VLOG(DEBUG, "  Chunk %zu: %zu -> %zu bytes (%.1f%%)\n",
                  i, state.input_sizes[i], output_sizes[i],
                  100.0 * output_sizes[i] / state.input_sizes[i]);
         }
-        
-        // Cleanup
-        for (auto ptr : state.d_inputs) cudaFree(ptr);
-        for (auto ptr : state.d_outputs) cudaFree(ptr);
-        cudaFree(state.d_input_ptrs);
-        cudaFree(state.d_input_sizes);
-        cudaFree(state.d_temp);
-        cudaFree(state.d_output_ptrs);
-        cudaFree(state.d_output_sizes);
-        cudaFree(state.d_statuses);
-        
+
+        cleanup();
         return true;
     }
     
@@ -1806,41 +2102,32 @@ public:
     void optimizeStreamCount() {
         static auto lastCheck = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
-        
-        // Only check every 2 seconds to avoid overhead
-        if (std::chrono::duration<double>(now - lastCheck).count() < 2.0) {
-            return;
-        }
+        if (std::chrono::duration<double>(now - lastCheck).count() < 2.0) return;
         lastCheck = now;
-        
+
         for (auto& gpu : gpus) {
             cudaSetDevice(gpu.deviceId);
-            
-            // Count busy streams (approximates GPU utilization)
-            int busyStreams = 0;
-            for (auto& stream : gpu.streams) {
-                cudaError_t status = cudaStreamQuery(stream);
-                if (status == cudaErrorNotReady) {
-                    busyStreams++;
-                }
-            }
-            
-            float utilization = gpu.streams.empty() ? 0.0f : (float)busyStreams / gpu.streams.size();
-            
-            // If underutilized and room for more streams, add them
-            // Max 1024 streams, add 32 at a time
-            if (utilization < 0.9f && gpu.streams.size() < 1024) {
-                size_t streamsToAdd = std::min(size_t(32), size_t(1024 - gpu.streams.size()));
-                
-                VLOG(VERBOSE, "GPU %d utilization %.1f%% (%d/%zu busy) - adding %zu streams\n",
-                     gpu.deviceId, utilization * 100, busyStreams, gpu.streams.size(),
-                     streamsToAdd);
-                
-                for (size_t i = 0; i < streamsToAdd; i++) {
-                    cudaStream_t newStream;
-                    if (cudaStreamCreate(&newStream) == cudaSuccess) {
-                        gpu.streams.push_back(newStream);
-                    }
+
+            size_t busySlots = 0;
+            for (auto& stream : gpu.streams)
+                if (cudaStreamQuery(stream) == cudaErrorNotReady) busySlots++;
+
+            float util = gpu.streams.empty() ? 0.0f :
+                         (float)busySlots / gpu.streams.size();
+
+            VLOG(VERBOSE, "GPU%d: %zu/%zu slots active (%.0f%%)  optBatch=%zu\n",
+                 gpu.deviceId, busySlots, gpu.streams.size(),
+                 util * 100, gpu.optimalBatch);
+
+            // If all slots are busy and we haven't reached the hardware-detected
+            // pipeline depth cap (2× pipelineDepth for extra double-buffering), add one.
+            size_t maxSlots = static_cast<size_t>(gpu.pipelineDepth) * 2;
+            if (util >= 1.0f && gpu.streams.size() < maxSlots) {
+                cudaStream_t s;
+                if (cudaStreamCreate(&s) == cudaSuccess) {
+                    gpu.streams.push_back(s);
+                    VLOG(VERBOSE, "GPU%d: saturated - grew to %zu slots (hw pipeline=%d)\n",
+                         gpu.deviceId, gpu.streams.size(), gpu.pipelineDepth);
                 }
             }
         }
@@ -1943,7 +2230,7 @@ public:
             AsyncReader::ReadChunk chunk;
             while (chunksSubmitted < numChunks && asyncReader.getChunk(chunk)) {
                 // Submit to CPU pool
-                cpuPool.submitJob(chunk.chunkIndex, std::move(chunk.data));
+                cpuPool.submitJob(chunk.chunkIndex, std::move(chunk.heapData), hcLevel, forceCompress);
                 chunksSubmitted++;
                 
                 VLOG(DEBUG, "Submitted chunk %zu to CPU pool (queue: %zu)\n",
@@ -2060,7 +2347,7 @@ public:
         fprintf(stderr, "Compression complete (CPU-only): %.2f MB -> %.2f MB (%.2f%%) in %.2f s\n",
                 fileSize / (1024.0*1024.0), totalBytesWritten / (1024.0*1024.0),
                 ratio, duration.count() / 1000.0);
-        fprintf(stderr, "Throughput: %.2f MB/s\n", throughputMBps);
+        VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
         VLOG(VERBOSE, "  Read:    %.2f s  |  CPU compress (%zu threads): %.2f s  |  Write: %.2f s\n",
              cpuReadTime, effectiveThreads, timeCompressing, cpuWriteTime);
         VLOG(VERBOSE, "  Uncompressed blocks: %zu / %zu (%.1f%%)\n",
@@ -2081,13 +2368,14 @@ public:
      * Compress a file using GPU acceleration (original implementation)
      */
     bool compressFileGPU() {
+        // Print per-GPU hardware summary
+        for (auto& g : gpus)
+            VLOG(VERBOSE, "  GPU%d: %s  %.1f GB  %zu SMs  %d pipeline slots\n",
+                 g.deviceId, g.properties.name,
+                 g.totalMemory/(1024.0*1024.0*1024.0), g.smCount, g.pipelineDepth);
         fprintf(stderr, "Compressing (GPU-only, %zu GPU%s): %s -> %s\n",
                 gpus.size(), gpus.size()==1?"":"s",
                 inputFile.c_str(), outputFile.c_str());
-        
-        // Timing instrumentation
-        double timeReading = 0, timeLaunching = 0, timeWaiting = 0, timeWriting = 0;
-        size_t totalBatchesLaunched = 0;
         
         // Get file size
         struct stat st;
@@ -2102,19 +2390,146 @@ public:
         
         // Calculate chunks
         size_t numChunks = (fileSize + chunkSize - 1) / chunkSize;
-        VLOG(VERBOSE, "Processing %zu chunk(s) of size %.2f MB\n", 
+        VLOG(VERBOSE, "Processing %zu chunk(s) of size %.2f MB\n",
              numChunks, chunkSize / (1024.0 * 1024.0));
-        
-        // Start async reader (reads while GPUs initialize)
-        AsyncReader asyncReader;
-        size_t maxReadQueue = std::min(size_t(64), numChunks);  // Buffer up to 64 chunks
-        if (!asyncReader.start(inputFile, chunkSize, maxReadQueue)) {
-            fprintf(stderr, "Error: Failed to start async reader\n");
-            return false;
+
+        // ── Async reader setup ────────────────────────────────────────────────
+        // Prefer the pre-warmed reader started before GPU init in run().
+        // Fall back to starting fresh here (CPU-only fallback, test mode, etc.)
+        size_t totalPipelineSlots = 0;
+        for (auto& g : gpus) totalPipelineSlots += g.pipelineDepth;
+        size_t estBatch    = gpus.empty() ? 64 :
+            std::max(size_t(64), static_cast<size_t>(
+                gpus[0].availableMemory * 0.90 / gpus[0].pipelineDepth / (chunkSize * 5)));
+        size_t maxReadQueue = std::min(numChunks, std::max(size_t(256), totalPipelineSlots * estBatch));
+
+        AsyncReader localReader;
+        AsyncReader* asyncReaderPtr = nullptr;
+
+        if (earlyReader.getFileSize() > 0) {
+            // Use the pre-warmed reader as-is (heap mode)  never restart it.
+            // Restarting would re-read from byte 0 while old chunks are still
+            // queued, causing duplicate chunk indices and writer deadlock.
+            asyncReaderPtr = &earlyReader;
+            VLOG(VERBOSE, "Pre-warmed reader: %.2f MB buffered so far\n",
+                 earlyReader.getBytesRead() / (1024.0*1024.0));
+        } else {
+            // Fresh start  use pool mode for zero-copy DMA transfers
+            bool started = inputPool.numSlots()
+                ? localReader.startPooled(inputFile, chunkSize, &inputPool)
+                : localReader.start(inputFile, chunkSize, maxReadQueue);
+            if (!started) {
+                fprintf(stderr, "Error: Failed to start async reader\n");
+                return false;
+            }
+            asyncReaderPtr = &localReader;
         }
-        VLOG(VERBOSE, "AsyncReader started (max queue: %zu chunks = %.2f GB RAM)\n",
-             maxReadQueue, (maxReadQueue * chunkSize) / (1024.0 * 1024.0 * 1024.0));
-        
+        AsyncReader& asyncReader = *asyncReaderPtr;
+
+        VLOG(VERBOSE, "Reader queue: %zu chunks (%.2f GB RAM) to feed %zu pipeline slot%s\n",
+             maxReadQueue, (maxReadQueue * chunkSize) / (1024.0*1024.0*1024.0),
+             totalPipelineSlots, totalPipelineSlots == 1 ? "" : "s");
+
+        // ── Slot capacity tuning ──────────────────────────────────────────────
+        // Larger batches = fewer total batches = fewer sequential ordering gaps
+        // where the writer waits for "the next chunk" to arrive. With 7 GPUs
+        // racing through batches, 32 chunks/slot gives ~63 total batches vs
+        // 252 at capacity=8, cutting writer gap-wait time by ~3-4 seconds.
+        // 28 slots × 32 chunks = 896 chunks in-flight (3.5 GB across 7 GPUs).
+        const size_t SLOT_CAPACITY = slotCapacity;  // from --slot-capacity flag
+
+        // ── Init pinned input pool (only if no early reader) ──────────────────
+        // Skip pool if early reader is active (heap mode)  the pool would sit
+        // unused while taking 2-3s to cudaHostAlloc 7GB of pinned memory.
+        // Pool is only beneficial for fresh readers (decompression, batch mode).
+        if (!inputPool.numSlots() && earlyReader.getFileSize() == 0) {
+            size_t poolSlots = std::min(numChunks,
+                std::max(size_t(64), 2 * totalPipelineSlots * slotCapacity));
+            if (!inputPool.init(poolSlots, chunkSize)) {
+                fprintf(stderr, "Warning: pinned pool alloc failed, using heap\n");
+            } else {
+                VLOG(VERBOSE, "PinnedInputPool: %zu slots × %.0f MB = %.1f GB\n",
+                     poolSlots, chunkSize/1024.0/1024.0,
+                     poolSlots*chunkSize/1024.0/1024.0/1024.0);
+            }
+        }
+        nvcompBatchedLZ4CompressOpts_t nvOpts = nvcompBatchedLZ4CompressDefaultOpts;
+        size_t maxOutPerChunk = 0;
+        nvcompBatchedLZ4CompressGetMaxOutputChunkSize(chunkSize, nvOpts, &maxOutPerChunk);
+
+        // Compute sharedTempBytes once on GPU0
+        size_t sharedTempBytes = 0;
+        {
+            cudaSetDevice(gpus[0].deviceId);
+            const void** qiPtrs = nullptr; size_t* qiSizes = nullptr;
+            cudaMalloc(&qiPtrs,  SLOT_CAPACITY * sizeof(void*));
+            cudaMalloc(&qiSizes, SLOT_CAPACITY * sizeof(size_t));
+            std::vector<const void*> hip(SLOT_CAPACITY, nullptr);
+            std::vector<size_t>      hisz(SLOT_CAPACITY, chunkSize);
+            cudaMemcpy(qiPtrs, hip.data(),  SLOT_CAPACITY*sizeof(void*),  cudaMemcpyHostToDevice);
+            cudaMemcpy(qiSizes,hisz.data(), SLOT_CAPACITY*sizeof(size_t), cudaMemcpyHostToDevice);
+            nvcompBatchedLZ4CompressGetTempSizeSync(
+                qiPtrs, qiSizes, SLOT_CAPACITY, chunkSize, nvOpts,
+                &sharedTempBytes, SLOT_CAPACITY*chunkSize, 0);
+            cudaFree(qiPtrs); cudaFree(qiSizes);
+        }
+
+        // ── Start slot init as background threads NOW ─────────────────────────
+        // These run concurrently with header write + asyncWriter.start() below,
+        // hiding as much of the 3+ second cudaHostAlloc wall as possible.
+        std::vector<std::vector<PreallocSlot>> gpuSlots(gpus.size());
+        std::vector<bool> gpuInitOk(gpus.size(), true);
+
+        auto freeAllSlots = [&]() {
+            for (auto& gSlots : gpuSlots)
+                for (auto& s : gSlots) s.release();
+        };
+
+        auto initSlotT0 = std::chrono::high_resolution_clock::now();
+        std::vector<std::thread> slotInitThreads;
+        for (size_t g = 0; g < gpus.size(); g++) {
+            slotInitThreads.emplace_back([&, g]() {
+                cudaSetDevice(gpus[g].deviceId);
+                int depth = gpus[g].pipelineDepth;
+                gpuSlots[g].resize(depth);
+                std::vector<const void*> hip(SLOT_CAPACITY);
+                std::vector<void*>       hop(SLOT_CAPACITY);
+                for (int si = 0; si < depth; si++) {
+                    PreallocSlot& sl = gpuSlots[g][si];
+                    sl.deviceId    = gpus[g].deviceId;
+                    sl.capacity    = SLOT_CAPACITY;
+                    sl.chunkStride = chunkSize;
+                    sl.outStride   = maxOutPerChunk;
+                    sl.tempBytes   = sharedTempBytes;
+                    bool ok = true;
+                    ok = ok && cudaMalloc(&sl.d_input,  SLOT_CAPACITY*chunkSize)      == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_output, SLOT_CAPACITY*maxOutPerChunk) == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_iPtrs,  SLOT_CAPACITY*sizeof(void*))  == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_oPtrs,  SLOT_CAPACITY*sizeof(void*))  == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_iSizes, SLOT_CAPACITY*sizeof(size_t))         == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_oSizes, SLOT_CAPACITY*sizeof(size_t))         == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_stats,  SLOT_CAPACITY*sizeof(nvcompStatus_t)) == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_temp,   sharedTempBytes)                      == cudaSuccess;
+                    if (ok) {
+                        for (size_t k = 0; k < SLOT_CAPACITY; k++) {
+                            hip[k] = sl.d_input  + k*chunkSize;
+                            hop[k] = sl.d_output + k*maxOutPerChunk;
+                        }
+                        cudaMemcpy(sl.d_iPtrs, hip.data(), SLOT_CAPACITY*sizeof(void*), cudaMemcpyHostToDevice);
+                        cudaMemcpy(sl.d_oPtrs, hop.data(), SLOT_CAPACITY*sizeof(void*), cudaMemcpyHostToDevice);
+                    }
+                    ok = ok && cudaHostAlloc(&sl.h_iSizes, SLOT_CAPACITY*sizeof(size_t),         cudaHostAllocDefault) == cudaSuccess;
+                    ok = ok && cudaHostAlloc(&sl.h_oSizes, SLOT_CAPACITY*sizeof(size_t),         cudaHostAllocDefault) == cudaSuccess;
+                    ok = ok && cudaHostAlloc(&sl.h_stats,  SLOT_CAPACITY*sizeof(nvcompStatus_t), cudaHostAllocDefault) == cudaSuccess;
+                    ok = ok && cudaHostAlloc(&sl.h_output, SLOT_CAPACITY*maxOutPerChunk,         cudaHostAllocDefault) == cudaSuccess;
+                    ok = ok && cudaStreamCreate(&sl.stream) == cudaSuccess;
+                    if (ok) { sl.ready = true; }
+                    else    { fprintf(stderr, "GPU%d: failed to init slot %d\n", gpus[g].deviceId, si);
+                              gpuInitOk[g] = false; break; }
+                }
+            });
+        }
+
         // Write LZ4 frame header to temporary buffer
         std::vector<uint8_t> headerBuffer;
         {
@@ -2145,235 +2560,249 @@ public:
         // Initialize content checksum with streaming state
         XXH::State xxhState(XXH32_SEED);
         
-        // Start async writer
+        // ── Join slot init threads (started before header write above) ─────────
+        for (auto& t : slotInitThreads) t.join();
+
+        bool slotsOk = true;
+        for (bool ok : gpuInitOk) if (!ok) { slotsOk = false; break; }
+
+        double initMs = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - initSlotT0).count();
+        VLOG(VERBOSE, "Slot init: %.2f s (parallel, overlapped with file setup)\n",
+             initMs / 1000.0);
+
+        // Start async writer NOW  after slots are ready so writer thread
+        // doesn't sit idle waiting for the first chunk during slot init.
         AsyncWriter asyncWriter;
         if (!asyncWriter.start(outputFile, &xxhState)) {
             fprintf(stderr, "Error: Failed to start async writer\n");
-            return false;
+            freeAllSlots(); asyncReader.stop(); return false;
         }
-        
-        // Storage for GPU batch operations
-        struct GPUBatch {
-            std::vector<std::vector<uint8_t>> chunks;
-            std::vector<size_t> chunkIndices;
-            std::vector<size_t> originalSizes;
-            BatchCompressState state;
-            bool inProgress;
-            GPUDevice* gpu;
-            cudaStream_t stream;  // Track which stream this batch is using
-        };
-        
-        // Storage for completed batches (allows out-of-order completion)
-        struct CompletedBatch {
-            std::vector<std::vector<uint8_t>> compressedChunks;
-            std::vector<std::vector<uint8_t>> originalChunks;
-            std::vector<size_t> chunkIndices;
-            std::vector<size_t> originalSizes;
-        };
-        
-        std::vector<GPUBatch> gpuBatches(gpus.size());
-        for (size_t i = 0; i < gpus.size(); i++) {
-            gpuBatches[i].gpu = &gpus[i];
-            gpuBatches[i].inProgress = false;
-            gpuBatches[i].stream = 0;  // Will be assigned when batch launches
-        }
-        
-        // Map to store completed batches by their starting chunk index
-        // This allows GPUs to finish out-of-order without blocking
-        std::map<size_t, CompletedBatch> completedBatches;
-        
-        size_t nextChunkToRead = 0;
-        size_t totalCompressed = 0;
-        
-        auto startTime = std::chrono::high_resolution_clock::now();
-        
-        // Main loop: continue until writer has written everything
-        while (asyncWriter.getNextChunkToWrite() < numChunks || !asyncReader.isFinished() || 
-               !completedBatches.empty() ||
-               std::any_of(gpuBatches.begin(), gpuBatches.end(), [](const GPUBatch& b) { return b.inProgress; })) {
-            
-            // Dynamically adjust stream count based on GPU utilization
-            optimizeStreamCount();
-            
-            // PHASE 1: Fill batches for GPUs that are idle by pulling from async reader
-            for (size_t gpuIdx = 0; gpuIdx < gpus.size() && !asyncReader.isFinished(); gpuIdx++) {
-                GPUBatch& batch = gpuBatches[gpuIdx];
-                
-                if (batch.inProgress) continue;
-                
-                // Check current GPU memory and get adjusted batch size
-                size_t currentBatchSize = refreshGPUMemoryAndBatchSize(*batch.gpu);
-                if (currentBatchSize == 0) {
-                    VLOG(DEBUG, "GPU %zu: Skipping due to insufficient memory\n", gpuIdx);
-                    continue;  // Skip this GPU if not enough memory
-                }
-                
-                auto readStart = std::chrono::high_resolution_clock::now();
-                
-                // Pull chunks from async reader
-                batch.chunks.clear();
-                batch.chunkIndices.clear();
-                batch.originalSizes.clear();
-                
-                AsyncReader::ReadChunk readChunk;
-                while (batch.chunks.size() < currentBatchSize && asyncReader.getChunk(readChunk)) {
-                    // Got a chunk from async reader
-                    batch.chunks.push_back(std::move(readChunk.data));
-                    batch.chunkIndices.push_back(readChunk.chunkIndex);
-                    batch.originalSizes.push_back(readChunk.size);
-                    nextChunkToRead++;
-                }
-                
-                auto readEnd = std::chrono::high_resolution_clock::now();
-                timeReading += std::chrono::duration<double>(readEnd - readStart).count();
-                
-                VLOG(DEBUG, "GPU %zu: Pulled %zu chunks from reader (queue depth: %zu)\n",
-                     gpuIdx, batch.chunks.size(), asyncReader.getQueueDepth());
-                
-                // Launch batch if we have chunks
-                if (!batch.chunks.empty()) {
-                    auto launchStart = std::chrono::high_resolution_clock::now();
-                    
-                    VLOG(DEBUG, "Launching batch of %zu chunks (indices %zu-%zu) on GPU %zu\n",
-                         batch.chunks.size(), batch.chunkIndices.front(), 
-                         batch.chunkIndices.back(), gpuIdx);
-                    
-                    // Select stream for this batch (round-robin across available streams)
-                    static size_t streamCounter = 0;
-                    size_t streamIdx = streamCounter % batch.gpu->streams.size();
-                    batch.stream = batch.gpu->streams[streamIdx];
-                    streamCounter++;
-                    
-                    if (!compressBatchAsync(batch.chunks, batch.state, *batch.gpu, batch.stream)) {
-                        // Allocation failed - can't use this GPU
-                        // We already pulled chunks from reader, so we need to process them later
-                        // Buffer them for retry on another GPU
-                        VLOG(VERBOSE, "GPU %zu failed to allocate memory, buffering %zu chunks for retry\n", 
-                             gpuIdx, batch.chunks.size());
-                        
-                        // Store chunks in completed batches as "pending compression"
-                        for (size_t i = 0; i < batch.chunks.size(); i++) {
-                            CompletedBatch pending;
-                            pending.compressedChunks.resize(1);  // Will be filled later or written uncompressed
-                            pending.originalChunks.push_back(std::move(batch.chunks[i]));
-                            pending.chunkIndices.push_back(batch.chunkIndices[i]);
-                            pending.originalSizes.push_back(batch.originalSizes[i]);
-                            // Note: These will be picked up by next available GPU or written uncompressed
+
+        if (!slotsOk) { freeAllSlots(); asyncWriter.stop(); asyncReader.stop(); return false; }
+
+        size_t totalSlots = 0;
+        for (auto& gSlots : gpuSlots) totalSlots += gSlots.size();
+        VLOG(VERBOSE, "GPU pipeline ready: %zu GPUs x %d slots = %zu total  cap=%zu chunks/slot\n",
+             gpus.size(), gpus[0].pipelineDepth, totalSlots, SLOT_CAPACITY);
+
+        std::atomic<size_t> batchesLaunched{0};
+        std::atomic<bool>   workerAbort{false};
+
+        // ── Per-GPU worker thread function ────────────────────────────────────
+        // Each thread owns its GPU's slots, competes with other threads for
+        // chunks from the shared AsyncReader, and submits results DIRECTLY to
+        // asyncWriter (which is thread-safe).  No intermediate TsQueue needed.
+        std::atomic<size_t> chunksSubmitted{0};
+
+        auto gpuWorker = [&](size_t gpuIdx) {
+            GPUDevice& gpu = gpus[gpuIdx];
+            cudaSetDevice(gpu.deviceId);
+            std::vector<PreallocSlot>& slots = gpuSlots[gpuIdx];
+            const int nSlots = (int)slots.size();
+
+            size_t sIdx      = 0;
+            bool   firstRound = true;
+
+            while (!workerAbort.load()) {
+                PreallocSlot& slot = slots[sIdx];
+                sIdx = (sIdx + 1) % nSlots;
+
+                // ── Sync: wait for this slot's stream ────────────────────────
+                cudaStreamSynchronize(slot.stream);
+
+                // ── Collect + submit: results from previous use of this slot ─
+                if (!firstRound && slot.hasPending) {
+                    std::vector<std::vector<uint8_t>> cChunks, oChunks;
+                    cChunks.reserve(slot.batchSize);
+                    oChunks.reserve(slot.batchSize);
+                    for (size_t i = 0; i < slot.batchSize; i++) {
+                        size_t outSz  = slot.h_oSizes[i];
+                        size_t origSz = slot.origSizes[i];
+
+                        // Get pointer to original data (pooled or heap)
+                        const uint8_t* origPtr = slot.origHandles.size() > i
+                            ? slot.origHandles[i].data
+                            : slot.origData[i].data();
+
+                        if (forceCompress || outSz < origSz) {
+                            // Compressed path (or force-compress regardless of size)
+                            std::vector<uint8_t> buf(outSz);
+                            memcpy(buf.data(), slot.h_output + i * slot.outStride, outSz);
+                            cChunks.push_back(std::move(buf));
+                        } else {
+                            cChunks.push_back({});   // store as uncompressed (better)
                         }
-                        
-                        continue;  // Skip to next GPU
+                        // Always copy original  releases pool slot immediately
+                        oChunks.emplace_back(origPtr, origPtr + origSz);
                     }
-                    batch.inProgress = true;
-                    totalBatchesLaunched++;
-                    
-                    auto launchEnd = std::chrono::high_resolution_clock::now();
-                    timeLaunching += std::chrono::duration<double>(launchEnd - launchStart).count();
+                    // Release pool handles now  reader can refill those slots
+                    slot.origHandles.clear();
+                    slot.origData.clear();
+
+                    asyncWriter.enqueueBatch(cChunks, oChunks,
+                                             slot.indices, slot.origSizes);
+                    chunksSubmitted += slot.batchSize;
+                    slot.hasPending = false;
                 }
+
+                // ── Fill: pull chunks from shared reader into this slot ───────
+                slot.indices.clear();
+                slot.origSizes.clear();
+                slot.origData.clear();
+                slot.origHandles.clear();
+                slot.batchSize = 0;
+
+                while (slot.batchSize < slot.capacity) {
+                    AsyncReader::ReadChunk chunk;
+                    if (!asyncReader.getChunk(chunk)) break;
+                    // H→D: DMA from pinned slot (or memcpy from heap in fallback)
+                    cudaMemcpyAsync(
+                        slot.d_input + slot.batchSize * slot.chunkStride,
+                        chunk.data(), chunk.size,
+                        cudaMemcpyHostToDevice, slot.stream);
+                    slot.h_iSizes[slot.batchSize] = chunk.size;
+                    slot.indices.push_back(chunk.chunkIndex);
+                    slot.origSizes.push_back(chunk.size);
+                    // Hold the input data until after cudaStreamSynchronize
+                    if (chunk.poolHandle.valid())
+                        slot.origHandles.push_back(std::move(chunk.poolHandle));
+                    else
+                        slot.origData.push_back(std::move(chunk.heapData));
+                    slot.batchSize++;
+                }
+
+                if (slot.batchSize == 0) break;   // this GPU is done
+
+                // H→D: input sizes (tiny  just sizeof(size_t)*batchSize bytes)
+                cudaMemcpyAsync(slot.d_iSizes, slot.h_iSizes,
+                                slot.batchSize * sizeof(size_t),
+                                cudaMemcpyHostToDevice, slot.stream);
+
+                // ── Launch: nvCOMP compression (after all H→D copies in stream) ─
+                nvcompStatus_t nErr = nvcompBatchedLZ4CompressAsync(
+                    slot.d_iPtrs, slot.d_iSizes, slot.chunkStride,
+                    slot.batchSize, slot.d_temp, slot.tempBytes,
+                    slot.d_oPtrs, slot.d_oSizes, nvOpts, slot.d_stats, slot.stream);
+                if (nErr != nvcompSuccess) {
+                    fprintf(stderr, "GPU%d slot: nvcomp error %d\n", gpu.deviceId, (int)nErr);
+                    workerAbort.store(true); break;
+                }
+                batchesLaunched++;
+
+                // ── D→H: queue result copies (execute after kernel, before next sync) ─
+                // One big contiguous D→H for all output data
+                cudaMemcpyAsync(slot.h_output, slot.d_output,
+                                slot.batchSize * slot.outStride,
+                                cudaMemcpyDeviceToHost, slot.stream);
+                cudaMemcpyAsync(slot.h_oSizes, slot.d_oSizes,
+                                slot.batchSize * sizeof(size_t),
+                                cudaMemcpyDeviceToHost, slot.stream);
+                cudaMemcpyAsync(slot.h_stats, slot.d_stats,
+                                slot.batchSize * sizeof(nvcompStatus_t),
+                                cudaMemcpyDeviceToHost, slot.stream);
+
+                slot.hasPending = true;
+                firstRound = false;
+                // Loop back  move to next slot while this one runs async
             }
-            
-            // PHASE 2: Collect completed batches (any order) and buffer them
-            for (size_t gpuIdx = 0; gpuIdx < gpus.size(); gpuIdx++) {
-                GPUBatch& batch = gpuBatches[gpuIdx];
-                
-                if (!batch.inProgress) continue;
-                
-                // Check if this batch is done (non-blocking check)
-                cudaError_t err = cudaSetDevice(batch.gpu->deviceId);
-                if (err != cudaSuccess) continue;
-                
-                // Query the specific stream this batch is using
-                err = cudaStreamQuery(batch.stream);
-                if (err == cudaErrorNotReady) {
-                    // Still processing, skip this GPU
-                    continue;
-                } else if (err != cudaSuccess) {
-                    fprintf(stderr, "CUDA stream query error on GPU %zu: %s\n", 
-                            gpuIdx, cudaGetErrorString(err));
-                    continue;
-                }
-                
-                // Batch is complete! Get results and buffer them
-                auto waitStart = std::chrono::high_resolution_clock::now();
-                
-                std::vector<std::vector<uint8_t>> compressedChunks;
-                if (!getBatchCompressResults(batch.state, compressedChunks, *batch.gpu)) {
-                    fprintf(stderr, "Failed to get batch results from GPU %zu\n", gpuIdx);
-                    return false;
-                }
-                
-                auto waitEnd = std::chrono::high_resolution_clock::now();
-                timeWaiting += std::chrono::duration<double>(waitEnd - waitStart).count();
-                
-                // Store completed batch (out-of-order is fine!)
-                CompletedBatch completed;
-                completed.compressedChunks = std::move(compressedChunks);
-                completed.originalChunks = std::move(batch.chunks);
-                completed.chunkIndices = batch.chunkIndices;
-                completed.originalSizes = batch.originalSizes;
-                
-                size_t firstChunkIdx = batch.chunkIndices[0];
-                completedBatches[firstChunkIdx] = std::move(completed);
-                
-                VLOG(DEBUG, "GPU %zu batch complete, buffered chunks %zu-%zu\n",
-                     gpuIdx, firstChunkIdx, batch.chunkIndices.back());
-                
-                batch.inProgress = false;  // GPU is now free for more work!
-            }
-            
-            // PHASE 3: Enqueue ALL completed batches immediately (out-of-order OK!)
-            auto writeStart = std::chrono::high_resolution_clock::now();
-            
-            // Enqueue any completed batches (writer will handle sequencing)
-            for (auto it = completedBatches.begin(); it != completedBatches.end(); ) {
-                auto& completed = it->second;
-                size_t firstChunkIdx = it->first;
-                
-                // Enqueue this batch for async writing (non-blocking!)
-                asyncWriter.enqueue(
-                    firstChunkIdx,
-                    std::move(completed.compressedChunks),
-                    std::move(completed.originalChunks),
-                    completed.chunkIndices,
-                    completed.originalSizes
-                );
-                
-                // Update counters
-                for (size_t i = 0; i < completed.originalSizes.size(); i++) {
-                    if (i < completed.compressedChunks.size() && !completed.compressedChunks[i].empty()) {
-                        totalCompressed += completed.compressedChunks[i].size();
+
+            // Drain any remaining in-flight slots for this GPU
+            for (int si = 0; si < nSlots && !workerAbort.load(); si++) {
+                PreallocSlot& sl = slots[si];
+                if (!sl.hasPending) continue;
+                cudaStreamSynchronize(sl.stream);
+                std::vector<std::vector<uint8_t>> cChunks, oChunks;
+                cChunks.reserve(sl.batchSize);
+                oChunks.reserve(sl.batchSize);
+                for (size_t i = 0; i < sl.batchSize; i++) {
+                    size_t outSz  = sl.h_oSizes[i];
+                    size_t origSz = sl.origSizes[i];
+                    const uint8_t* origPtr = sl.origHandles.size() > i
+                        ? sl.origHandles[i].data
+                        : sl.origData[i].data();
+                    if (forceCompress || outSz < origSz) {
+                        std::vector<uint8_t> buf(outSz);
+                        memcpy(buf.data(), sl.h_output + i * sl.outStride, outSz);
+                        cChunks.push_back(std::move(buf));
+                    } else {
+                        cChunks.push_back({});
                     }
+                    oChunks.emplace_back(origPtr, origPtr + origSz);
                 }
-                
-                VLOG(DEBUG, "Enqueued batch starting at chunk %zu for async writing\n", firstChunkIdx);
-                
-                // Remove from buffer
-                it = completedBatches.erase(it);
+                sl.origHandles.clear();
+                sl.origData.clear();
+                asyncWriter.enqueueBatch(cChunks, oChunks, sl.indices, sl.origSizes);
+                chunksSubmitted += sl.batchSize;
+                sl.hasPending = false;
             }
-            
-            auto writeEnd = std::chrono::high_resolution_clock::now();
-            timeWriting += std::chrono::duration<double>(writeEnd - writeStart).count();
-            
-            // Update progress based on writer's progress
-            size_t chunksWritten = asyncWriter.getNextChunkToWrite();
-            if (g_verbosity < DEBUG && numChunks > 10 && chunksWritten > 0) {
-                int progress = (100 * chunksWritten) / numChunks;
-                fprintf(stderr, "\rProgress: %d%%  ", progress);
+        };
+
+        // Tell writer exactly how many chunks are coming so it self-exits
+        // the moment the last chunk is written, without waiting for stop().
+        asyncWriter.setTotalChunks(numChunks);
+
+        // ── Launch one worker thread per GPU ─────────────────────────────────
+        auto startTime = std::chrono::high_resolution_clock::now();
+        std::atomic<int> activeWorkers{(int)gpus.size()};
+        std::vector<std::thread> workers;
+        for (size_t g = 0; g < gpus.size(); g++) {
+            workers.emplace_back([&, g]() {
+                gpuWorker(g);
+                --activeWorkers;  // signal this GPU is done
+            });
+        }
+
+        // ── Main thread: progress display while GPU workers compress ─────────
+        // Workers submit directly to asyncWriter  main thread just shows status.
+        while (activeWorkers.load() > 0) {
+            if (g_verbosity < DEBUG && numChunks > 10) {
+                size_t submitted = chunksSubmitted.load();
+                size_t written   = asyncWriter.getNextChunkToWrite();
+                fprintf(stderr, "\rCompressing: GPU %3d%%  Writer %3d%%  [%zu batches]  ",
+                        (int)(100 * submitted / numChunks),
+                        (int)(100 * written   / numChunks),
+                        batchesLaunched.load());
                 fflush(stderr);
             }
-            
-            // Small sleep if all GPUs busy and nothing completed
-            bool allBusy = std::all_of(gpuBatches.begin(), gpuBatches.end(),
-                                      [](const GPUBatch& b) { return b.inProgress; });
-            bool nothingCompleted = completedBatches.empty();
-            
-            if (allBusy && nothingCompleted && !asyncReader.isFinished()) {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        
-        // Wait for async writer to finish all pending writes
-        VLOG(VERBOSE, "Waiting for async writer to complete...\n");
-        asyncWriter.stop();
+
+        // Join all workers
+        for (auto& w : workers) if (w.joinable()) w.join();
+
+        // ── Writer drain with live progress ───────────────────────────────────
+        // asyncWriter.stop() blocks until the writer thread finishes.
+        // With setTotalChunks() the writer self-exits as soon as the last chunk
+        // is written  stop() returns immediately rather than after freeAllSlots().
+        // We free slots AFTER stop() so GPU memory is held no longer than needed.
+        {
+            std::atomic<bool> stopProgress{false};
+            std::thread progressThread;
+            if (g_verbosity < DEBUG && numChunks > 10) {
+                progressThread = std::thread([&]() {
+                    while (!stopProgress.load()) {
+                        size_t w = asyncWriter.getNextChunkToWrite();
+                        fprintf(stderr, "\rWriting: %d%%  [%zu/%zu chunks to disk]  ",
+                                (int)(100 * w / numChunks), w, numChunks);
+                        fflush(stderr);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                    }
+                    // Final update
+                    size_t w = asyncWriter.getNextChunkToWrite();
+                    fprintf(stderr, "\rWriting: 100%%  [%zu/%zu chunks to disk]  \n",
+                            w, numChunks);
+                });
+            }
+
+            VLOG(VERBOSE, "Waiting for async writer to complete...\n");
+            asyncWriter.stop();   // fast: writer self-exited when last chunk was written
+
+            stopProgress.store(true);
+            if (progressThread.joinable()) progressThread.join();
+        }
+
+        freeAllSlots();   // GPU memory freed after writer done (parallel with footer write)
         
         // Now append footer synchronously (end mark + checksum)
         outputFd = open(outputFile.c_str(), O_WRONLY | O_APPEND);
@@ -2424,19 +2853,21 @@ public:
         
         double asyncReadTime  = asyncReader.getReadTime();
         double asyncWriteTime = asyncWriter.getWriteTime();
-        double gpuTime        = timeLaunching + timeWaiting;
 
         fprintf(stderr, "\n");
-        fprintf(stderr, "Compression complete (GPU-only, %zu GPU%s): %.2f MB -> %.2f MB (%.2f%%) in %.2f s\n",
-                gpus.size(), gpus.size() == 1 ? "" : "s",
+        size_t finalSlots = 0;
+        for (auto& gSlots : gpuSlots) finalSlots += gSlots.size();
+        fprintf(stderr, "Compression complete (GPU-only, %zu GPU%s / %zu pipeline slots): %.2f MB -> %.2f MB (%.2f%%) in %.2f s\n",
+                gpus.size(), gpus.size() == 1 ? "" : "s", finalSlots,
                 fileSize / (1024.0*1024.0), totalBytesWritten / (1024.0*1024.0),
                 ratio, duration.count() / 1000.0);
-        fprintf(stderr, "Throughput: %.2f MB/s\n", throughputMBps);
-        VLOG(VERBOSE, "  Read: %.2f s  |  GPU compress: %.2f s (launch %.2f + wait %.2f)  |  Write: %.2f s\n",
-             asyncReadTime, gpuTime, timeLaunching, timeWaiting, asyncWriteTime);
-        VLOG(VERBOSE, "  Batches launched: %zu  avg %.1f chunks/batch across %zu GPU%s\n",
-             totalBatchesLaunched, (double)numChunks / std::max((size_t)1, totalBatchesLaunched),
-             gpus.size(), gpus.size() == 1 ? "" : "s");
+        VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
+        VLOG(VERBOSE, "  Read: %.2f s  |  Write: %.2f s\n",
+             asyncReadTime, asyncWriteTime);
+        VLOG(VERBOSE, "  Batches launched: %zu  avg %.1f chunks/batch  %zu GPU%s / %zu slot%s\n",
+             batchesLaunched.load(), (double)numChunks / std::max(size_t(1), batchesLaunched.load()),
+             gpus.size(), gpus.size() == 1 ? "" : "s",
+             finalSlots, finalSlots == 1 ? "" : "s");
         
         // Remove original file if not keeping
         if (!keepOriginal) {
@@ -2470,442 +2901,552 @@ public:
     }
     
     /*
-     * Compress a file using CPU + GPU simultaneously (hybrid mode)
-     * 
-     * Architecture:
-     *   AsyncReader -> [scheduler] -> CPUPool  --\
-     *                             -> GPUBatches --+--> AsyncWriter
-     * 
-     * Dynamic load balancing adjusts CPU/GPU split every 5 seconds
-     * based on measured throughput of each backend.
+     * Compress using CPU + GPU simultaneously (hybrid mode, v2).
+     *
+     * Identical architecture to compressFileGPU() but adds CPU worker threads
+     * that compete for chunks from the same AsyncReader. No ratio/scheduler 
+     * every worker just grabs the next available chunk.  GPUs naturally win
+     * the bulk; CPUs fill gaps during GPU sync waits.
      */
     bool compressFileHybrid() {
-        // Get file size
         struct stat st;
         if (stat(inputFile.c_str(), &st) != 0) {
             fprintf(stderr, "Error: Cannot stat input file: %s\n", inputFile.c_str());
             return false;
         }
-        size_t fileSize = st.st_size;
+        size_t fileSize  = st.st_size;
         size_t numChunks = (fileSize + chunkSize - 1) / chunkSize;
-        
-        VLOG(VERBOSE, "Input file size: %.2f MB\n", fileSize / (1024.0 * 1024.0));
-        VLOG(VERBOSE, "Processing %zu chunk(s) of size %.2f MB\n", 
-             numChunks, chunkSize / (1024.0 * 1024.0));
-        
-        // Determine CPU thread count
-        size_t effectiveThreads = cpuThreads;
-        if (effectiveThreads == 0) {
-            effectiveThreads = std::thread::hardware_concurrency();
-            if (effectiveThreads == 0) effectiveThreads = 4;
-            if (effectiveThreads > 64) effectiveThreads = 64;
-        }
+
+        size_t effectiveThreads = cpuThreads ? cpuThreads
+                                             : std::thread::hardware_concurrency();
+        if (!effectiveThreads) effectiveThreads = 4;
 
         fprintf(stderr, "Compressing (Hybrid, %zu thread%s + %zu GPU%s): %s -> %s\n",
                 effectiveThreads, effectiveThreads==1?"":"s",
                 gpus.size(),      gpus.size()==1?"":"s",
                 inputFile.c_str(), outputFile.c_str());
-        VLOG(VERBOSE, "  chunk size %zu KB, target CPU ratio ~30%%\n",
-             chunkSize/1024);
-        
-        // Start async reader
-        AsyncReader asyncReader;
-        size_t maxReadQueue = std::min(size_t(128), numChunks);
-        if (!asyncReader.start(inputFile, chunkSize, maxReadQueue)) {
-            fprintf(stderr, "Error: Failed to start async reader\n");
-            return false;
+
+        // ── Reader (reuse pre-warmed early reader if available) ───────────────
+        size_t totalPipelineSlots = 0;
+        for (auto& g : gpus) totalPipelineSlots += g.pipelineDepth;
+        size_t estBatch = gpus.empty() ? 64 :
+            std::max(size_t(64), static_cast<size_t>(
+                gpus[0].availableMemory * 0.90 / gpus[0].pipelineDepth / (chunkSize * 5)));
+        size_t maxReadQueue = std::min(numChunks,
+                              std::max(size_t(256), totalPipelineSlots * estBatch));
+
+        AsyncReader  localReader;
+        AsyncReader* asyncReaderPtr = nullptr;
+        if (earlyReader.getFileSize() > 0) {
+            asyncReaderPtr = &earlyReader;
+        } else {
+            bool started = inputPool.numSlots()
+                ? localReader.startPooled(inputFile, chunkSize, &inputPool)
+                : localReader.start(inputFile, chunkSize, maxReadQueue);
+            if (!started) { fprintf(stderr,"Error: reader start failed\n"); return false; }
+            asyncReaderPtr = &localReader;
         }
-        
-        // Write header and open output
+        AsyncReader& asyncReader = *asyncReaderPtr;
+
+        // ── Slot setup (exact copy of compressFileGPU pattern) ────────────────
+        const size_t SLOT_CAPACITY = slotCapacity;
+
+        if (!inputPool.numSlots() && earlyReader.getFileSize() == 0) {
+            size_t poolSlots = std::min(numChunks,
+                std::max(size_t(64), 2 * totalPipelineSlots * slotCapacity));
+            if (!inputPool.init(poolSlots, chunkSize))
+                fprintf(stderr, "Warning: pinned pool alloc failed, using heap\n");
+        }
+
+        nvcompBatchedLZ4CompressOpts_t nvOpts = nvcompBatchedLZ4CompressDefaultOpts;
+        size_t maxOutPerChunk = 0;
+        nvcompBatchedLZ4CompressGetMaxOutputChunkSize(chunkSize, nvOpts, &maxOutPerChunk);
+
+        size_t sharedTempBytes = 0;
         {
-            std::ostringstream headerStream(std::ios::binary);
-            if (!LZ4Frame::writeFrameHeader(headerStream, fileSize, chunkSize)) {
-                fprintf(stderr, "Error: Failed to write LZ4 frame header\n");
-                return false;
+            cudaSetDevice(gpus[0].deviceId);
+            const void** qiPtrs = nullptr; size_t* qiSizes = nullptr;
+            cudaMalloc(&qiPtrs,  SLOT_CAPACITY * sizeof(void*));
+            cudaMalloc(&qiSizes, SLOT_CAPACITY * sizeof(size_t));
+            std::vector<const void*> hip(SLOT_CAPACITY, nullptr);
+            std::vector<size_t>      hisz(SLOT_CAPACITY, chunkSize);
+            cudaMemcpy(qiPtrs, hip.data(),  SLOT_CAPACITY*sizeof(void*),  cudaMemcpyHostToDevice);
+            cudaMemcpy(qiSizes,hisz.data(), SLOT_CAPACITY*sizeof(size_t), cudaMemcpyHostToDevice);
+            nvcompBatchedLZ4CompressGetTempSizeSync(
+                qiPtrs, qiSizes, SLOT_CAPACITY, chunkSize, nvOpts,
+                &sharedTempBytes, SLOT_CAPACITY*chunkSize, 0);
+            cudaFree(qiPtrs); cudaFree(qiSizes);
+        }
+
+        std::vector<std::vector<PreallocSlot>> gpuSlots(gpus.size());
+        std::vector<bool>   gpuInitOk(gpus.size(), true);
+
+        // Lambda to release all slots on error paths
+        auto freeAllSlots = [&]() {
+            for (auto& gSlots : gpuSlots)
+                for (auto& s : gSlots) s.release();
+        };
+
+        std::vector<std::thread> slotInitThreads;
+        for (size_t g = 0; g < gpus.size(); g++) {
+            slotInitThreads.emplace_back([&, g]() {
+                cudaSetDevice(gpus[g].deviceId);
+                int depth = gpus[g].pipelineDepth;
+                gpuSlots[g].resize(depth);
+                std::vector<const void*> hip2(SLOT_CAPACITY);
+                std::vector<void*>       hop2(SLOT_CAPACITY);
+                for (int si = 0; si < depth; si++) {
+                    PreallocSlot& sl = gpuSlots[g][si];
+                    sl.deviceId    = gpus[g].deviceId;
+                    sl.capacity    = SLOT_CAPACITY;
+                    sl.chunkStride = chunkSize;
+                    sl.outStride   = maxOutPerChunk;
+                    sl.tempBytes   = sharedTempBytes;
+                    bool ok = true;
+                    ok = ok && cudaMalloc(&sl.d_input,  SLOT_CAPACITY*chunkSize)               == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_output, SLOT_CAPACITY*maxOutPerChunk)          == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_iPtrs,  SLOT_CAPACITY*sizeof(void*))           == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_oPtrs,  SLOT_CAPACITY*sizeof(void*))           == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_iSizes, SLOT_CAPACITY*sizeof(size_t))          == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_oSizes, SLOT_CAPACITY*sizeof(size_t))          == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_stats,  SLOT_CAPACITY*sizeof(nvcompStatus_t))  == cudaSuccess;
+                    ok = ok && cudaMalloc(&sl.d_temp,   sharedTempBytes)                       == cudaSuccess;
+                    if (ok) {
+                        for (size_t k = 0; k < SLOT_CAPACITY; k++) {
+                            hip2[k] = sl.d_input  + k*chunkSize;
+                            hop2[k] = sl.d_output + k*maxOutPerChunk;
+                        }
+                        cudaMemcpy(sl.d_iPtrs, hip2.data(), SLOT_CAPACITY*sizeof(void*), cudaMemcpyHostToDevice);
+                        cudaMemcpy(sl.d_oPtrs, hop2.data(), SLOT_CAPACITY*sizeof(void*), cudaMemcpyHostToDevice);
+                    }
+                    ok = ok && cudaHostAlloc(&sl.h_iSizes, SLOT_CAPACITY*sizeof(size_t),         cudaHostAllocDefault) == cudaSuccess;
+                    ok = ok && cudaHostAlloc(&sl.h_oSizes, SLOT_CAPACITY*sizeof(size_t),         cudaHostAllocDefault) == cudaSuccess;
+                    ok = ok && cudaHostAlloc(&sl.h_stats,  SLOT_CAPACITY*sizeof(nvcompStatus_t), cudaHostAllocDefault) == cudaSuccess;
+                    ok = ok && cudaHostAlloc(&sl.h_output, SLOT_CAPACITY*maxOutPerChunk,         cudaHostAllocDefault) == cudaSuccess;
+                    ok = ok && cudaStreamCreate(&sl.stream) == cudaSuccess;
+                    if (ok) { sl.ready = true; }
+                    else    { fprintf(stderr, "GPU%d: failed to init slot %d\n", gpus[g].deviceId, si);
+                              gpuInitOk[g] = false; break; }
+                }
+            });
+        }
+
+        // Write LZ4 frame header
+        {
+            std::ostringstream hs(std::ios::binary);
+            if (!LZ4Frame::writeFrameHeader(hs, fileSize, chunkSize)) {
+                fprintf(stderr,"Error: Failed to write LZ4 frame header\n"); return false;
             }
-            std::string headerStr = headerStream.str();
+            std::string hstr = hs.str();
             int fd = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) {
-                fprintf(stderr, "Error: Cannot create output file: %s\n", outputFile.c_str());
-                return false;
-            }
-            ssize_t w = ::write(fd, headerStr.data(), headerStr.size());
-            if (w != (ssize_t)headerStr.size()) {
-                fprintf(stderr, "Error writing header\n");
-                close(fd);
-                return false;
+            if (fd < 0) { fprintf(stderr,"Error: Cannot create output file\n"); return false; }
+            if (::write(fd, hstr.data(), hstr.size()) != (ssize_t)hstr.size()) {
+                fprintf(stderr,"Error writing header\n"); close(fd); return false;
             }
             close(fd);
         }
-        
-        // Init checksum, writer, CPU pool
+
         XXH::State xxhState(XXH32_SEED);
+        for (auto& t : slotInitThreads) t.join();
+
+        bool slotsOk = true;
+        for (bool ok : gpuInitOk) if (!ok) { slotsOk = false; break; }
+
         AsyncWriter asyncWriter;
         if (!asyncWriter.start(outputFile, &xxhState)) {
-            fprintf(stderr, "Error: Failed to start async writer\n");
-            return false;
+            fprintf(stderr,"Error: Failed to start async writer\n");
+            freeAllSlots(); asyncReader.stop(); return false;
         }
-        
-        CPUCompressionPool cpuPool(effectiveThreads);
-        
-        // GPU batch structures
-        struct GPUBatch {
-            std::vector<std::vector<uint8_t>> chunks;
-            std::vector<size_t> chunkIndices;
-            std::vector<size_t> originalSizes;
-            BatchCompressState state;
-            bool inProgress;
-            GPUDevice* gpu;
-            cudaStream_t stream;
-        };
-        struct CompletedBatch {
-            std::vector<std::vector<uint8_t>> compressedChunks;
-            std::vector<std::vector<uint8_t>> originalChunks;
-            std::vector<size_t> chunkIndices;
-            std::vector<size_t> originalSizes;
-        };
-        
-        std::vector<GPUBatch> gpuBatches(gpus.size());
-        for (size_t i = 0; i < gpus.size(); i++) {
-            gpuBatches[i].gpu = &gpus[i];
-            gpuBatches[i].inProgress = false;
-            gpuBatches[i].stream = 0;
+        if (!slotsOk) {
+            fprintf(stderr,"GPU slot init failed, falling back to CPU-only\n");
+            freeAllSlots(); asyncWriter.stop(); asyncReader.stop();
+            return compressFileCPU();
         }
-        std::map<size_t, CompletedBatch> completedBatches;
-        
-        // Load balancer state
-        // cpuRatio = fraction of chunks sent to CPU (0.0 - 1.0)
-        // Start at 0.3 (30% CPU, 70% GPU) and adjust based on throughput
-        double cpuRatio = 0.3;
-        size_t cpuChunksSent = 0, gpuChunksSent = 0;
-        size_t cpuChunksDone = 0, gpuChunksDone = 0;
-        auto lastRebalanceTime = std::chrono::high_resolution_clock::now();
-        
-        size_t nextChunkToRead = 0;
-        size_t totalGpuBatches = 0;
-        
+
+        asyncWriter.setTotalChunks(numChunks);
         auto startTime = std::chrono::high_resolution_clock::now();
-        
-        // Main hybrid loop
-        size_t loopIter = 0;
-        while (asyncWriter.getNextChunkToWrite() < numChunks || !asyncReader.isFinished() ||
-               !completedBatches.empty() || cpuPool.getActiveJobs() > 0 ||
-               std::any_of(gpuBatches.begin(), gpuBatches.end(), [](const GPUBatch& b){ return b.inProgress; })) {
-            
-            loopIter++;
-            
-            // Periodic state dump every 500 iterations
-            if (loopIter % 500 == 0) {
-                size_t gpuInProgress = std::count_if(gpuBatches.begin(), gpuBatches.end(),
-                    [](const GPUBatch& b){ return b.inProgress; });
-                size_t gpuPending = 0;
-                for (auto& b : gpuBatches) gpuPending += b.chunks.size();
-                size_t cpuCompleted = cpuPool.getCompletedCount();
-                size_t cpuMinIdx    = cpuPool.getSmallestCompletedIndex();
-                VLOG(VERBOSE,
-                    "[iter %zu] writer=%zu/%zu readerDone=%d "
-                    "cpu(sent=%zu done=%zu active=%zu queue=%zu poolCompleted=%zu minIdx=%zu totalProc=%zu) "
-                    "gpu(sent=%zu inProg=%zu pending=%zu) "
-                    "completedBuf=%zu cpuRatio=%.2f nextRead=%zu\n",
-                    loopIter,
-                    asyncWriter.getNextChunkToWrite(), numChunks,
-                    (int)asyncReader.isFinished(),
-                    cpuChunksSent, cpuChunksDone,
-                    cpuPool.getActiveJobs(), cpuPool.getQueueDepth(),
-                    cpuCompleted, cpuMinIdx, cpuPool.getTotalProcessed(),
-                    gpuChunksSent, gpuInProgress, gpuPending,
-                    completedBatches.size(), cpuRatio,
-                    nextChunkToRead);
-                // If CPU pool has results but we're stuck, show why scan misses them
-                if (cpuCompleted > 0 && cpuChunksDone == 0) {
-                    VLOG(VERBOSE, "  !! CPU pool has %zu results (min idx=%zu) but scan "
-                         "range is %zu..%zu - chunk %zu writer needs chunk %zu\n",
-                         cpuCompleted, cpuMinIdx,
-                         asyncWriter.getNextChunkToWrite(), nextChunkToRead,
-                         cpuMinIdx, asyncWriter.getNextChunkToWrite());
-                }
-            }
-            
-            optimizeStreamCount();
-            bool didWork = false;
-            
-            // ── PHASE 1: Read & Schedule ─────────────────────────────
-            // Route chunks to GPU batches (preferred) or CPU (by ratio / overflow)
-            AsyncReader::ReadChunk readChunk;
-            while (!asyncReader.isFinished() && asyncReader.getChunk(readChunk)) {
-                didWork = true;
-                
-                // Decide based on current ratio whether to prefer CPU or GPU
-                double currentCpuFraction = (cpuChunksSent + gpuChunksSent > 0) ?
-                    (double)cpuChunksSent / (cpuChunksSent + gpuChunksSent) : 1.0;
-                bool preferCPU = (currentCpuFraction < cpuRatio);
-                
-                bool sentToGPU = false;
-                if (!preferCPU) {
-                    // Try GPUs: find one that isn't currently executing (inProgress=false)
-                    for (size_t gpuIdx = 0; gpuIdx < gpus.size(); gpuIdx++) {
-                        GPUBatch& batch = gpuBatches[gpuIdx];
-                        if (batch.inProgress) continue;
-                        
-                        size_t currentBatchSize = refreshGPUMemoryAndBatchSize(*batch.gpu);
-                        if (currentBatchSize == 0) continue;
-                        
-                        batch.chunks.push_back(std::move(readChunk.data));
-                        batch.chunkIndices.push_back(readChunk.chunkIndex);
-                        batch.originalSizes.push_back(readChunk.size);
-                        gpuChunksSent++;
-                        nextChunkToRead++;
-                        sentToGPU = true;
-                        
-                        // Launch immediately when batch is full
-                        if (batch.chunks.size() >= currentBatchSize) {
-                            static size_t sc = 0;
-                            batch.stream = batch.gpu->streams[sc++ % batch.gpu->streams.size()];
-                            if (compressBatchAsync(batch.chunks, batch.state, *batch.gpu, batch.stream)) {
-                                batch.inProgress = true;
-                                totalGpuBatches++;
-                                VLOG(DEBUG, "Launched full GPU %zu batch (%zu chunks)\n",
-                                     gpuIdx, batch.chunks.size());
-                            } else {
-                                // GPU launch failed - redirect to CPU
-                                for (size_t ci = 0; ci < batch.chunks.size(); ci++) {
-                                    cpuPool.submitJob(batch.chunkIndices[ci], std::move(batch.chunks[ci]));
-                                    cpuChunksSent++;
-                                    gpuChunksSent--;
-                                }
-                                batch.chunks.clear();
-                                batch.chunkIndices.clear();
-                                batch.originalSizes.clear();
-                            }
+        std::atomic<size_t> chunksSubmitted{0};
+        std::atomic<bool>   workerAbort{false};
+        std::atomic<size_t> gpuChunkCount{0};
+        std::atomic<size_t> cpuChunkCount{0};
+        std::atomic<int>    activeWorkers{0};
+
+        // ── GPU worker (exact copy of compressFileGPU worker lambda) ──────────
+        auto gpuWorker = [&](size_t gpuIdx) {
+            GPUDevice& gpu = gpus[gpuIdx];
+            cudaSetDevice(gpu.deviceId);
+            std::vector<PreallocSlot>& slots = gpuSlots[gpuIdx];
+            const int nSlots = (int)slots.size();
+            size_t sIdx = 0;
+            bool firstRound = true;
+
+            while (!workerAbort.load()) {
+                PreallocSlot& slot = slots[sIdx];
+                sIdx = (sIdx + 1) % nSlots;
+
+                cudaStreamSynchronize(slot.stream);
+
+                // Collect and submit previous results from this slot
+                if (!firstRound && slot.hasPending) {
+                    std::vector<std::vector<uint8_t>> cChunks, oChunks;
+                    cChunks.reserve(slot.batchSize);
+                    oChunks.reserve(slot.batchSize);
+                    for (size_t i = 0; i < slot.batchSize; i++) {
+                        size_t outSz  = slot.h_oSizes[i];
+                        size_t origSz = slot.origSizes[i];
+                        const uint8_t* origPtr = slot.origHandles.size() > i
+                            ? slot.origHandles[i].data
+                            : slot.origData[i].data();
+                        if (forceCompress || outSz < origSz) {
+                            std::vector<uint8_t> buf(outSz);
+                            memcpy(buf.data(), slot.h_output + i * slot.outStride, outSz);
+                            cChunks.push_back(std::move(buf));
+                        } else {
+                            cChunks.push_back({});
                         }
-                        break;
+                        oChunks.emplace_back(origPtr, origPtr + origSz);
                     }
+                    slot.origHandles.clear();
+                    slot.origData.clear();
+                    asyncWriter.enqueueBatch(cChunks, oChunks, slot.indices, slot.origSizes);
+                    gpuChunkCount += slot.batchSize;
+                    chunksSubmitted += slot.batchSize;
+                    slot.hasPending = false;
                 }
-                
-                if (!sentToGPU) {
-                    // CPU: either by ratio preference or all GPUs busy/full
-                    cpuPool.submitJob(readChunk.chunkIndex, std::move(readChunk.data));
-                    cpuChunksSent++;
-                    nextChunkToRead++;
-                    VLOG(DEBUG, "Chunk %zu -> CPU (cpuFrac=%.2f ratio=%.2f)\n",
-                         readChunk.chunkIndex, currentCpuFraction, cpuRatio);
+                firstRound = false;
+
+                // Pull chunks from shared reader
+                slot.indices.clear();
+                slot.origSizes.clear();
+                slot.origData.clear();
+                slot.origHandles.clear();
+                slot.batchSize = 0;
+
+                while (slot.batchSize < slot.capacity) {
+                    AsyncReader::ReadChunk chunk;
+                    if (!asyncReader.getChunk(chunk)) break;
+                    cudaMemcpyAsync(
+                        slot.d_input + slot.batchSize * slot.chunkStride,
+                        chunk.data(), chunk.size,
+                        cudaMemcpyHostToDevice, slot.stream);
+                    slot.h_iSizes[slot.batchSize] = chunk.size;
+                    slot.indices.push_back(chunk.chunkIndex);
+                    slot.origSizes.push_back(chunk.size);
+                    if (chunk.poolHandle.valid())
+                        slot.origHandles.push_back(std::move(chunk.poolHandle));
+                    else
+                        slot.origData.push_back(std::move(chunk.heapData));
+                    slot.batchSize++;
                 }
-                
-                // Don't overfill CPU queue
-                if (cpuPool.getQueueDepth() > effectiveThreads * 4) break;
+
+                if (slot.batchSize == 0) break;  // reader exhausted
+
+                // Copy input sizes H→D
+                cudaMemcpyAsync(slot.d_iSizes, slot.h_iSizes,
+                                slot.batchSize * sizeof(size_t),
+                                cudaMemcpyHostToDevice, slot.stream);
+
+                // Launch nvCOMP compression
+                nvcompStatus_t nErr = nvcompBatchedLZ4CompressAsync(
+                    slot.d_iPtrs, slot.d_iSizes, slot.chunkStride,
+                    slot.batchSize, slot.d_temp, slot.tempBytes,
+                    slot.d_oPtrs, slot.d_oSizes, nvOpts, slot.d_stats, slot.stream);
+                if (nErr != nvcompSuccess) {
+                    fprintf(stderr, "GPU%d: nvcomp error %d\n", gpu.deviceId, (int)nErr);
+                    workerAbort.store(true); break;
+                }
+
+                // D→H result copies (async, in same stream)
+                cudaMemcpyAsync(slot.h_output, slot.d_output,
+                                slot.batchSize * slot.outStride,
+                                cudaMemcpyDeviceToHost, slot.stream);
+                cudaMemcpyAsync(slot.h_oSizes, slot.d_oSizes,
+                                slot.batchSize * sizeof(size_t),
+                                cudaMemcpyDeviceToHost, slot.stream);
+                cudaMemcpyAsync(slot.h_stats, slot.d_stats,
+                                slot.batchSize * sizeof(nvcompStatus_t),
+                                cudaMemcpyDeviceToHost, slot.stream);
+                slot.hasPending = true;
             }
-            
-            // Launch partial GPU batches eagerly - don't hold chunks waiting for a full batch.
-            // Trigger once we have at least 8 chunks, or when the reader is finished.
-            for (size_t gpuIdx = 0; gpuIdx < gpus.size(); gpuIdx++) {
-                GPUBatch& batch = gpuBatches[gpuIdx];
-                if (batch.inProgress || batch.chunks.empty()) continue;
-                if (!asyncReader.isFinished() && batch.chunks.size() < 8) continue;
-                
-                VLOG(VERBOSE, "Launching partial GPU %zu batch of %zu chunks (indices %zu-%zu)\n",
-                     gpuIdx, batch.chunks.size(),
-                     batch.chunkIndices.front(), batch.chunkIndices.back());
-                
-                static size_t sc = 0;
-                batch.stream = batch.gpu->streams[sc++ % batch.gpu->streams.size()];
-                if (compressBatchAsync(batch.chunks, batch.state, *batch.gpu, batch.stream)) {
-                    batch.inProgress = true;
-                    totalGpuBatches++;
-                    didWork = true;
-                    VLOG(VERBOSE, "  -> GPU %zu batch launched OK, inProgress=true\n", gpuIdx);
-                } else {
-                    VLOG(VERBOSE, "  -> GPU %zu batch FAILED, redirecting %zu chunks to CPU\n",
-                         gpuIdx, batch.chunks.size());
-                    for (size_t ci = 0; ci < batch.chunks.size(); ci++) {
-                        cpuPool.submitJob(batch.chunkIndices[ci], std::move(batch.chunks[ci]));
-                        cpuChunksSent++;
+
+            // Drain remaining in-flight slots
+            for (int si = 0; si < nSlots && !workerAbort.load(); si++) {
+                PreallocSlot& sl = slots[si];
+                if (!sl.hasPending) continue;
+                cudaStreamSynchronize(sl.stream);
+                std::vector<std::vector<uint8_t>> cChunks, oChunks;
+                cChunks.reserve(sl.batchSize);
+                oChunks.reserve(sl.batchSize);
+                for (size_t i = 0; i < sl.batchSize; i++) {
+                    size_t outSz  = sl.h_oSizes[i];
+                    size_t origSz = sl.origSizes[i];
+                    const uint8_t* origPtr = sl.origHandles.size() > i
+                        ? sl.origHandles[i].data : sl.origData[i].data();
+                    if (forceCompress || outSz < origSz) {
+                        std::vector<uint8_t> buf(outSz);
+                        memcpy(buf.data(), sl.h_output + i * sl.outStride, outSz);
+                        cChunks.push_back(std::move(buf));
+                    } else {
+                        cChunks.push_back({});
                     }
-                    batch.chunks.clear();
-                    batch.chunkIndices.clear();
-                    batch.originalSizes.clear();
+                    oChunks.emplace_back(origPtr, origPtr + origSz);
                 }
+                sl.origHandles.clear(); sl.origData.clear();
+                asyncWriter.enqueueBatch(cChunks, oChunks, sl.indices, sl.origSizes);
+                gpuChunkCount += sl.batchSize;
+                chunksSubmitted += sl.batchSize;
+                sl.hasPending = false;
             }
-            
-            // ── PHASE 2: Collect ALL available CPU results ────────────
-            // Drain everything ready - don't scan by index, just pull all completed
-            // results and buffer by chunk index. AsyncWriter handles ordering.
-            {
-                CPUCompressionPool::CompressResult cpuResult;
-                while (cpuPool.drainOne(cpuResult)) {
-                    CompletedBatch cb;
-                    cb.compressedChunks.push_back(std::move(cpuResult.compressedData));
-                    cb.originalChunks.push_back(std::move(cpuResult.originalData));
-                    cb.chunkIndices  = {cpuResult.chunkIndex};
-                    cb.originalSizes = {cpuResult.originalSize};
-                    completedBatches[cpuResult.chunkIndex] = std::move(cb);
-                    cpuChunksDone++;
-                    didWork = true;
+            activeWorkers--;
+        };
+
+        // ── CPU worker  same reader, LZ4 compress, direct enqueue ───────────
+        auto cpuWorker = [&]() {
+            while (!workerAbort.load()) {
+                AsyncReader::ReadChunk chunk;
+                if (!asyncReader.getChunk(chunk)) break;
+
+                size_t origSz = chunk.size;
+                const uint8_t* src = chunk.data();
+
+                size_t maxOut = LZ4_compressBound((int)origSz);
+                std::vector<uint8_t> compressed(maxOut);
+                int compSz = (hcLevel > 0)
+                    ? LZ4_compress_HC(reinterpret_cast<const char*>(src),
+                                      reinterpret_cast<char*>(compressed.data()),
+                                      (int)origSz, (int)maxOut, hcLevel)
+                    : LZ4_compress_default(reinterpret_cast<const char*>(src),
+                                           reinterpret_cast<char*>(compressed.data()),
+                                           (int)origSz, (int)maxOut);
+
+                std::vector<uint8_t> origVec(src, src + origSz);
+
+                std::vector<uint8_t> compVec;
+                if (compSz > 0 && (forceCompress || (size_t)compSz < origSz)) {
+                    compressed.resize(compSz);
+                    compVec = std::move(compressed);
                 }
+
+                std::vector<std::vector<uint8_t>> cBatch = {std::move(compVec)};
+                std::vector<std::vector<uint8_t>> oBatch = {std::move(origVec)};
+                std::vector<size_t> idxBatch = {chunk.chunkIndex};
+                std::vector<size_t>  szBatch = {origSz};
+
+                asyncWriter.enqueueBatch(cBatch, oBatch, idxBatch, szBatch);
+                cpuChunkCount++;
+                chunksSubmitted++;
             }
-            
-            // ── PHASE 3: Collect GPU Results ─────────────────────────
-            for (size_t gpuIdx = 0; gpuIdx < gpus.size(); gpuIdx++) {
-                GPUBatch& batch = gpuBatches[gpuIdx];
-                if (!batch.inProgress) continue;
-                
-                cudaError_t streamStatus = cudaStreamQuery(batch.stream);
-                VLOG(VERBOSE, "GPU %zu: inProgress, streamQuery=%s, chunks=%zu\n",
-                     gpuIdx,
-                     streamStatus == cudaSuccess      ? "DONE" :
-                     streamStatus == cudaErrorNotReady ? "not_ready" : "ERROR",
-                     batch.chunkIndices.size());
-                if (streamStatus == cudaErrorNotReady) continue;
-                
-                // GPU batch done - get results
-                std::vector<std::vector<uint8_t>> compressedChunks;
-                
-                if (!getBatchCompressResults(batch.state, compressedChunks, *batch.gpu)) {
-                    fprintf(stderr, "Failed to get results from GPU %zu\n", gpuIdx);
-                    return false;
-                }
-                
-                // Split batch into individual chunk entries so the writer
-                // advances by 1 per chunk - required because CPU and GPU chunks
-                // are interleaved and non-contiguous within any GPU batch.
-                for (size_t ci = 0; ci < batch.chunkIndices.size(); ci++) {
-                    CompletedBatch cb;
-                    cb.compressedChunks.push_back(std::move(compressedChunks[ci]));
-                    cb.originalChunks.push_back(std::move(batch.chunks[ci]));
-                    cb.chunkIndices  = {batch.chunkIndices[ci]};
-                    cb.originalSizes = {batch.originalSizes[ci]};
-                    completedBatches[batch.chunkIndices[ci]] = std::move(cb);
-                }
-                gpuChunksDone += batch.chunkIndices.size();
-                
-                batch.inProgress = false;
-                batch.chunks.clear();
-                batch.chunkIndices.clear();
-                batch.originalSizes.clear();
-                didWork = true;
-            }
-            
-            // ── PHASE 4: Flush ALL completed batches to writer ────────
-            for (auto it = completedBatches.begin(); it != completedBatches.end(); ) {
-                auto& cb = it->second;
-                size_t firstIdx = it->first;
-                
-                asyncWriter.enqueue(firstIdx,
-                    std::move(cb.compressedChunks),
-                    std::move(cb.originalChunks),
-                    cb.chunkIndices,
-                    cb.originalSizes);
-                
-                it = completedBatches.erase(it);
-                didWork = true;
-            }
-            
-            // ── PHASE 5: Rebalance CPU/GPU ratio every 5 seconds ─────
-            auto now = std::chrono::high_resolution_clock::now();
-            double elapsed = std::chrono::duration<double>(now - lastRebalanceTime).count();
-            if (elapsed >= 5.0 && cpuChunksDone > 0 && gpuChunksDone > 0) {
-                // Each chunk is the same size so throughput ∝ chunks/second
-                double cpuThroughput = cpuChunksDone / elapsed;
-                double gpuThroughput = gpuChunksDone / elapsed;
-                double total = cpuThroughput + gpuThroughput;
-                
-                // Ideal ratio = cpu_speed / (cpu_speed + gpu_speed)
-                double idealRatio = cpuThroughput / total;
-                
-                // Blend slowly (20% toward ideal per interval)
-                cpuRatio = 0.8 * cpuRatio + 0.2 * idealRatio;
-                cpuRatio = std::max(0.1, std::min(0.9, cpuRatio));
-                
-                VLOG(VERBOSE, "Rebalance: CPU %.1f ch/s, GPU %.1f ch/s -> cpuRatio=%.2f\n",
-                     cpuThroughput, gpuThroughput, cpuRatio);
-                
-                cpuChunksDone = 0;
-                gpuChunksDone = 0;
-                lastRebalanceTime = now;
-            }
-            
-            // Progress
+            activeWorkers--;
+        };
+
+        // ── Launch all workers ────────────────────────────────────────────────
+        activeWorkers = (int)(gpus.size() + effectiveThreads);
+        std::vector<std::thread> allWorkers;
+        allWorkers.reserve(gpus.size() + effectiveThreads);
+        for (size_t g = 0; g < gpus.size(); g++)
+            allWorkers.emplace_back(gpuWorker, g);
+        for (size_t t = 0; t < effectiveThreads; t++)
+            allWorkers.emplace_back(cpuWorker);
+
+        // Progress display while workers run
+        while (activeWorkers.load() > 0) {
             if (g_verbosity < DEBUG && numChunks > 10) {
                 size_t done = asyncWriter.getNextChunkToWrite();
-                fprintf(stderr, "\rProgress: %zu%%  ", (100 * done) / numChunks);
+                fprintf(stderr, "\rProgress: %zu%%  GPU:%zu CPU:%zu  ",
+                        (100 * done) / numChunks,
+                        gpuChunkCount.load(), cpuChunkCount.load());
                 fflush(stderr);
             }
-            
-            // Brief sleep only if truly nothing happened this iteration
-            if (!didWork) {
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        
+        for (auto& t : allWorkers) t.join();
+
         if (g_verbosity < DEBUG && numChunks > 10) fprintf(stderr, "\n");
-        
         VLOG(VERBOSE, "Waiting for async writer to complete...\n");
         asyncWriter.stop();
-        
-        // Write end mark and checksum
+
+        // Write end mark and content checksum
         {
             int fd = open(outputFile.c_str(), O_WRONLY | O_APPEND);
             if (fd >= 0) {
                 uint32_t endMark = 0;
-                ssize_t w = ::write(fd, &endMark, 4);
-                if (w != 4) fprintf(stderr, "Error writing end mark\n");
-                
-                uint32_t checksum = xxhState.digest();
-                uint8_t cb[4] = {
-                    (uint8_t)(checksum & 0xFF),
-                    (uint8_t)((checksum >> 8) & 0xFF),
-                    (uint8_t)((checksum >> 16) & 0xFF),
-                    (uint8_t)((checksum >> 24) & 0xFF)
-                };
-                w = ::write(fd, cb, 4);
-                if (w != 4) fprintf(stderr, "Error writing checksum\n");
-                fsync(fd);
-                close(fd);
-                VLOG(VERBOSE, "Computed content checksum: 0x%08X\n", checksum);
+                if (::write(fd, &endMark, 4) != 4)
+                    fprintf(stderr, "Error writing end mark\n");
+                uint32_t cs = xxhState.digest();
+                uint8_t cb[4] = { (uint8_t)(cs), (uint8_t)(cs>>8),
+                                  (uint8_t)(cs>>16), (uint8_t)(cs>>24) };
+                if (::write(fd, cb, 4) != 4)
+                    fprintf(stderr, "Error writing checksum\n");
+                fsync(fd); close(fd);
+                VLOG(VERBOSE, "Content checksum: 0x%08X\n", cs);
             }
         }
-        
+
         asyncReader.stop();
-        
-        auto endTime = std::chrono::high_resolution_clock::now();
+        freeAllSlots();
+
+        auto endTime  = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-        double bytesWritten = asyncWriter.getBytesWritten();
-        double ratio = 100.0 * bytesWritten / fileSize;
-        double throughputMBps = (fileSize / (1024.0 * 1024.0)) / (duration.count() / 1000.0);
-        
-        fprintf(stderr, "\n");
+        double bw = asyncWriter.getBytesWritten();
+        double mbps = (fileSize/(1024.0*1024.0)) / (duration.count()/1000.0);
+
         fprintf(stderr, "Compression complete (Hybrid, %zu thread%s + %zu GPU%s): "
                 "%.2f MB -> %.2f MB (%.2f%%) in %.2f s\n",
-                effectiveThreads, effectiveThreads == 1 ? "" : "s",
-                gpus.size(),      gpus.size()      == 1 ? "" : "s",
-                fileSize / (1024.0*1024.0), bytesWritten / (1024.0*1024.0),
-                ratio, duration.count() / 1000.0);
-        fprintf(stderr, "Throughput: %.2f MB/s\n", throughputMBps);
-        VLOG(VERBOSE, "  Read: %.2f s  |  Write: %.2f s\n",
-             asyncReader.getReadTime(), asyncWriter.getWriteTime());
-        VLOG(VERBOSE, "  CPU: %zu chunks (%.1f%%)  GPU: %zu chunks (%.1f%%) in %zu batch%s  ratio=%.2f\n",
-             cpuChunksSent, 100.0 * cpuChunksSent / numChunks,
-             gpuChunksSent, 100.0 * gpuChunksSent / numChunks,
-             totalGpuBatches, totalGpuBatches == 1 ? "" : "es", cpuRatio);
-        
+                effectiveThreads, effectiveThreads==1?"":"s",
+                gpus.size(),      gpus.size()==1?"":"s",
+                fileSize/(1024.0*1024.0), bw/(1024.0*1024.0),
+                100.0*bw/fileSize, duration.count()/1000.0);
+        VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
+        VLOG(VERBOSE, "  GPU: %zu chunks (%.1f%%)  CPU: %zu chunks (%.1f%%)\n",
+             gpuChunkCount.load(), 100.0*gpuChunkCount.load()/numChunks,
+             cpuChunkCount.load(), 100.0*cpuChunkCount.load()/numChunks);
+        VLOG(VERBOSE, "  Write: %.2f s\n", asyncWriter.getWriteTime());
+
         if (!keepOriginal) {
-            if (unlink(inputFile.c_str()) != 0) {
-                fprintf(stderr, "Warning: Could not remove input file: %s\n", inputFile.c_str());
-            }
+            if (unlink(inputFile.c_str()) != 0)
+                fprintf(stderr, "Warning: Could not remove input file: %s\n",
+                        inputFile.c_str());
         }
-        
+
         return true;
     }
     
     /*
-     * Decompress a file using GPU acceleration
+     * Decompress a single LZ4 block on GPU using the batched API with batch_size=1.
+     *
+     * nvCOMP has no non-batched decompression API  the batched API IS the API.
+     * We call it with a single-element batch (batch_size=1).
+     *
+     * This will return nvcompErrorInvalidValue (Error 12) for blocks compressed
+     * by LZ4_compress_default / LZ4_compress_HC (CPU path), because nvCOMP's
+     * batched decompressor requires blocks in its own internal format.
+     * That's expected  the caller falls back to LZ4_decompress_safe() for those.
+     *
+     * Blocks compressed by nvCOMP (GPU path) will decompress successfully here.
+     *
+     * Returns true = GPU decompression succeeded, outData filled.
+     * Returns false = try LZ4_decompress_safe() on CPU instead.
+     */
+    bool decompressBlockGPU(const uint8_t* compData, size_t compSize,
+                            uint8_t* outData, size_t outSize,
+                            GPUDevice& gpu, cudaStream_t stream,
+                            size_t& actualSize) {  // ← actual bytes written
+        if (cudaSetDevice(gpu.deviceId) != cudaSuccess) return false;
+
+        // ── Device buffers ────────────────────────────────────────────────────
+        // nvcompBatchedLZ4DecompressAsync signature (batch_size=1 here):
+        //   [1] const void* const*  d_inPtrs        ptrs to compressed blocks
+        //   [2] const size_t*       d_inSizes        compressed sizes
+        //   [3] const size_t*       d_outBufSizes    output BUFFER sizes (capacity)
+        //   [4] size_t*             d_actualSizes    actual output sizes (written by GPU)
+        //   [5] size_t              batch_size
+        //   [6] void*               d_temp
+        //   [7] size_t              tempBytes
+        //   [8] void* const*        d_outPtrs        ptrs to output buffers
+        //   [9] opts  [10] statuses  [11] stream
+        void*   d_comp       = nullptr;   // compressed input data
+        void*   d_decomp     = nullptr;   // decompressed output data
+        void**  d_inPtrs     = nullptr;   // device array of 1 ptr → d_comp
+        void**  d_outPtrs    = nullptr;   // device array of 1 ptr → d_decomp
+        size_t* d_inSizes    = nullptr;   // device: [compSize]
+        size_t* d_outBufSizes= nullptr;   // device: [outSize]  (capacity)
+        size_t* d_actualSizes= nullptr;   // device: [?]        (GPU writes actual)
+        nvcompStatus_t* d_statuses = nullptr;
+        void*   d_temp       = nullptr;
+
+        auto cleanup = [&]() {
+            if (d_temp)        cudaFree(d_temp);
+            if (d_statuses)    cudaFree(d_statuses);
+            if (d_actualSizes) cudaFree(d_actualSizes);
+            if (d_outBufSizes) cudaFree(d_outBufSizes);
+            if (d_inSizes)     cudaFree(d_inSizes);
+            if (d_outPtrs)     cudaFree(d_outPtrs);
+            if (d_inPtrs)      cudaFree(d_inPtrs);
+            if (d_decomp)      cudaFree(d_decomp);
+            if (d_comp)        cudaFree(d_comp);
+        };
+
+        if (cudaMalloc(&d_comp,        compSize)              != cudaSuccess ||
+            cudaMalloc(&d_decomp,      outSize)               != cudaSuccess ||
+            cudaMalloc(&d_inPtrs,      sizeof(void*))         != cudaSuccess ||
+            cudaMalloc(&d_outPtrs,     sizeof(void*))         != cudaSuccess ||
+            cudaMalloc(&d_inSizes,     sizeof(size_t))        != cudaSuccess ||
+            cudaMalloc(&d_outBufSizes, sizeof(size_t))        != cudaSuccess ||
+            cudaMalloc(&d_actualSizes, sizeof(size_t))        != cudaSuccess ||
+            cudaMalloc(&d_statuses,    sizeof(nvcompStatus_t))!= cudaSuccess) {
+            cleanup(); return false;
+        }
+
+        // H→D: compressed payload + metadata arrays
+        const void* h_inPtr  = d_comp;
+        void*       h_outPtr = d_decomp;
+        cudaMemcpy(d_comp,        compData,    compSize,       cudaMemcpyHostToDevice);
+        cudaMemcpy(d_inPtrs,      &h_inPtr,    sizeof(void*),  cudaMemcpyHostToDevice);
+        cudaMemcpy(d_outPtrs,     &h_outPtr,   sizeof(void*),  cudaMemcpyHostToDevice);
+        cudaMemcpy(d_inSizes,     &compSize,   sizeof(size_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_outBufSizes, &outSize,    sizeof(size_t), cudaMemcpyHostToDevice);
+
+        // Get required temp buffer size
+        // GetTempSizeSync(d_inPtrs, d_inSizes, batch, maxUncomp, &temp, totalUncomp, opts, stats, stream)
+        size_t tempBytes = 0;
+        nvcompBatchedLZ4DecompressOpts_t opts = nvcompBatchedLZ4DecompressDefaultOpts;
+        nvcompStatus_t st = nvcompBatchedLZ4DecompressGetTempSizeSync(
+            (const void**)d_inPtrs, d_inSizes,
+            /*batch_size=*/(size_t)1, outSize,
+            &tempBytes, outSize,
+            opts, d_statuses, stream);
+        if (st != nvcompSuccess) { cleanup(); return false; }
+
+        if (tempBytes > 0 &&
+            cudaMalloc(&d_temp, tempBytes) != cudaSuccess) {
+            cleanup(); return false;
+        }
+
+        // Launch decompression (batch_size=1).
+        // nvcompErrorInvalidValue (Error 12) expected for CPU-compressed blocks 
+        // the caller's LZ4_decompress_safe() fallback handles those.
+        st = nvcompBatchedLZ4DecompressAsync(
+            (const void* const*)d_inPtrs,   // [1] compressed ptrs
+            d_inSizes,                       // [2] compressed sizes
+            d_outBufSizes,                   // [3] output buffer capacities
+            d_actualSizes,                   // [4] actual sizes (GPU writes these)
+            (size_t)1,                       // [5] batch_size
+            d_temp, tempBytes,               // [6][7] temp
+            (void* const*)d_outPtrs,         // [8] output ptrs
+            opts, d_statuses, stream);       // [9][10][11]
+
+        cudaStreamSynchronize(stream);
+        if (st != nvcompSuccess) { cleanup(); return false; }
+
+        // Check per-block status written by GPU
+        nvcompStatus_t itemSt = nvcompSuccess;
+        cudaMemcpy(&itemSt, d_statuses, sizeof(nvcompStatus_t), cudaMemcpyDeviceToHost);
+        if (itemSt != nvcompSuccess) { cleanup(); return false; }
+
+        // D→H: copy result using actual size reported by GPU
+        size_t actualOut = 0;
+        cudaMemcpy(&actualOut, d_actualSizes, sizeof(size_t), cudaMemcpyDeviceToHost);
+        if (actualOut == 0 || actualOut > outSize) { cleanup(); return false; }
+        cudaMemcpy(outData, d_decomp, actualOut, cudaMemcpyDeviceToHost);
+        actualSize = actualOut;  // tell caller how many bytes are valid
+
+        cleanup();
+        return true;
+    }
+
+    /*
+     * Decompress a file using GPU acceleration (non-batched per-block API).
+     *
+     * Uses the batched nvCOMP API with batch_size=1.
+     * nvCOMP blocks decompress on GPU; CPU-compressed blocks fall back to
+     * LZ4_decompress_safe() automatically (Error 12 triggers the fallback).
      */
     bool decompressFileGPU() {
-        fprintf(stderr, "Decompressing%s: %s -> %s\n",
+        fprintf(stderr, "Decompressing%s (GPU+fallback, %zu GPU%s): %s -> %s\n",
                 testMode ? " (test)" : "",
-                inputFile.c_str(), outputFile.c_str());
+                gpus.size(), gpus.size() == 1 ? "" : "s",
+                inputFile.c_str(), testMode ? "/dev/null" : outputFile.c_str());
         
-        double timeReading = 0, timeLaunching = 0, timeWaiting = 0, timeWriting = 0;
-        size_t totalBatchesLaunched = 0;
         
         // Open input file with direct I/O
         int inputFd = open(inputFile.c_str(), O_RDONLY);
@@ -2978,307 +3519,271 @@ public:
             }
         }
         
-        // GPU batch structure
-        struct GPUBatch {
-            std::vector<std::vector<uint8_t>> compressedChunks;
-            std::vector<size_t> uncompressedSizes;
-            std::vector<size_t> chunkIndices;
-            BatchDecompressState state;
-            bool inProgress;
-            GPUDevice* gpu;
-            cudaStream_t stream;
+        // ── Per-block result structure ────────────────────────────────────────
+        // Each block decompresses independently  we store results in a map
+        // keyed by block index so the writer can flush in order regardless of
+        // which GPU/CPU finished first.
+        struct DecompBlock {
+            std::vector<uint8_t> data;  // decompressed bytes
+            bool gpuPath;               // true=GPU, false=CPU fallback
         };
-        
-        std::vector<GPUBatch> gpuBatches(gpus.size());
-        for (size_t i = 0; i < gpus.size(); i++) {
-            gpuBatches[i].gpu = &gpus[i];
-            gpuBatches[i].inProgress = false;
-            gpuBatches[i].stream = 0;
-        }
-        
-        // Out-of-order completion buffer
-        struct CompletedBatch {
-            std::vector<std::vector<uint8_t>> decompressedChunks;
-            std::vector<size_t> chunkIndices;
+
+        std::mutex                  resultMutex;
+        std::map<size_t, DecompBlock> results;    // blockIdx → decompressed
+        std::atomic<size_t>         blocksQueued{0};
+        std::atomic<size_t>         blocksDone{0};
+        std::atomic<bool>           readDone{false};
+        std::atomic<bool>           decompError{false};
+        std::atomic<size_t>         gpuBlocks{0}, cpuFallbackBlocks{0};
+
+        // ── Block queue for GPU workers ────────────────────────────────────────
+        struct RawBlock {
+            size_t idx;
+            std::vector<uint8_t> compData; // empty = was uncompressed (pass-through)
+            std::vector<uint8_t> rawData;  // only set for uncompressed blocks
+            size_t origSize;               // expected decompressed size
         };
-        std::map<size_t, CompletedBatch> completedBatches;
-        
-        size_t nextBlockToRead = 0;
+        std::queue<RawBlock>    blockQueue;
+        std::mutex              blockQueueMutex;
+        std::condition_variable blockQueueCV;
+
+        // ── GPU worker lambda  one thread per GPU ─────────────────────────────
+        // Each worker pops raw blocks, tries non-batched GPU decompression,
+        // falls back to LZ4_decompress_safe on any failure.
+        // Non-batched API = handles blocks from ALL sources (nvCOMP, CPU, lz4 tool).
+        auto gpuWorker = [&](size_t gpuIdx) {
+            GPUDevice& gpu = gpus[gpuIdx];
+            cudaSetDevice(gpu.deviceId);
+            cudaStream_t stream = gpu.streams[0]; // depth=1: one stream per GPU
+
+            while (true) {
+                RawBlock block;
+                {
+                    std::unique_lock<std::mutex> lk(blockQueueMutex);
+                    blockQueueCV.wait(lk, [&]{
+                        return !blockQueue.empty() || (readDone && blockQueue.empty());
+                    });
+                    if (blockQueue.empty()) break;  // readDone + queue empty = exit
+                    block = std::move(blockQueue.front());
+                    blockQueue.pop();
+                }
+
+                DecompBlock out;
+                out.gpuPath = false;
+
+                if (!block.compData.empty()) {
+                    // Compressed block  try GPU first
+                    out.data.resize(block.origSize);
+                    size_t actualSize = 0;
+                    bool gpuOk = decompressBlockGPU(
+                        block.compData.data(), block.compData.size(),
+                        out.data.data(), block.origSize,
+                        gpu, stream, actualSize);
+
+                    if (gpuOk) {
+                        out.data.resize(actualSize);  // trim to actual decompressed size
+                        out.gpuPath = true;
+                        gpuBlocks++;
+                    } else {
+                        // CPU fallback: LZ4_decompress_safe handles ALL block formats
+                        // including nvCOMP batched, LZ4_compress_default, LZ4_compress_HC
+                        int r = LZ4_decompress_safe(
+                            reinterpret_cast<const char*>(block.compData.data()),
+                            reinterpret_cast<char*>(out.data.data()),
+                            (int)block.compData.size(),
+                            (int)block.origSize);
+                        if (r < 0) {
+                            fprintf(stderr, "Error: Block %zu failed GPU and CPU decompression\n",
+                                    block.idx);
+                            decompError = true;
+                            blocksDone++;
+                            continue;
+                        }
+                        out.data.resize(r);  // actual decompressed size
+                        cpuFallbackBlocks++;
+                        VLOG(DEBUG, "Block %zu: GPU failed, CPU fallback ok (%d bytes)\n",
+                             block.idx, r);
+                    }
+                } else {
+                    // Uncompressed pass-through block (LZ4 high-bit flag was set)
+                    out.data = std::move(block.rawData);
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(resultMutex);
+                    results[block.idx] = std::move(out);
+                }
+                blocksDone++;
+            }
+        };
+
+        // ── Launch GPU worker threads ──────────────────────────────────────────
+        std::vector<std::thread> workerThreads;
+        workerThreads.reserve(gpus.size());
+        for (size_t g = 0; g < gpus.size(); g++)
+            workerThreads.emplace_back(gpuWorker, g);
+
+        // ── Reader: parse LZ4 frame blocks and enqueue ─────────────────────────
+        size_t nextBlockToRead  = 0;
         size_t nextBlockToWrite = 0;
         size_t totalBytesWritten = 0;
-        
-        auto startTime = std::chrono::high_resolution_clock::now();
-        bool decompError = false;
-        
-        // Main decompression loop
-        while (!decompError && 
-               (nextBlockToWrite < estimatedBlocks || nextBlockToRead < estimatedBlocks)) {
-            
-            // Dynamically adjust streams
-            optimizeStreamCount();
-            
-            // PHASE 1: Read compressed blocks and assign to GPUs
-            for (size_t gpuIdx = 0; gpuIdx < gpus.size(); gpuIdx++) {
-                GPUBatch& batch = gpuBatches[gpuIdx];
-                
-                if (batch.inProgress) continue;
-                
-                // Check GPU memory
-                size_t currentBatchSize = refreshGPUMemoryAndBatchSize(*batch.gpu);
-                if (currentBatchSize == 0) continue;
-                
-                auto readStart = std::chrono::high_resolution_clock::now();
-                
-                // Read compressed blocks
-                batch.compressedChunks.clear();
-                batch.uncompressedSizes.clear();
-                batch.chunkIndices.clear();
-                
-                while (batch.compressedChunks.size() < currentBatchSize &&
-                       nextBlockToRead < estimatedBlocks) {
-                    // Read block size
-                    uint32_t blockSize;
-                    ssize_t bytesRead = ::read(inputFd, &blockSize, 4);
-                    if (bytesRead == 0) {
-                        estimatedBlocks = nextBlockToRead;
-                        break;  // EOF
-                    }
-                    if (bytesRead != 4) {
-                        fprintf(stderr, "Error reading block size (got %zd bytes)\n", bytesRead);
-                        break;
-                    }
-                    
-                    // Check for end mark
-                    if (blockSize == 0) {
-                        estimatedBlocks = nextBlockToRead;
-                        break;
-                    }
-                    
-                    // Check if uncompressed (high bit set)
-                    bool isUncompressed = (blockSize & 0x80000000) != 0;
-                    blockSize &= 0x7FFFFFFF;
-                    
-                    VLOG(VERBOSE, "Block %zu @ gpuBatch %zu: rawSize=0x%08X "
-                         "actualSize=%u isUncomp=%d\n",
-                         nextBlockToRead, gpuIdx,
-                         blockSize | (isUncompressed ? 0x80000000u : 0u),
-                         blockSize, (int)isUncompressed);
-                    
-                    // Sanity check blockSize
-                    if (blockSize > 128 * 1024 * 1024) {  // > 128 MB is clearly wrong
-                        fprintf(stderr, "Error: blockSize=%u is implausibly large "
-                                "(chunk %zu), isUncomp=%d\n",
-                                blockSize, nextBlockToRead, (int)isUncompressed);
+        auto   startTime = std::chrono::high_resolution_clock::now();
+
+        while (!decompError) {
+            uint32_t blockSize32 = 0;
+            ssize_t  nr = ::read(inputFd, &blockSize32, 4);
+            if (nr == 0) break;  // clean EOF
+            if (nr != 4) {
+                fprintf(stderr, "Error: truncated block-size field at block %zu\n",
+                        nextBlockToRead);
+                decompError = true; break;
+            }
+
+            // LZ4 end mark
+            if (blockSize32 == 0) { estimatedBlocks = nextBlockToRead; break; }
+
+            bool isUncomp = (blockSize32 & 0x80000000u) != 0;
+            uint32_t blockSize = blockSize32 & 0x7FFFFFFFu;
+
+            if (blockSize > 128u * 1024 * 1024) {
+                fprintf(stderr, "Error: implausibly large block %u at block %zu\n",
+                        blockSize, nextBlockToRead);
+                decompError = true; break;
+            }
+
+            std::vector<uint8_t> raw(blockSize);
+            if (::read(inputFd, raw.data(), blockSize) != (ssize_t)blockSize) {
+                fprintf(stderr, "Error: truncated block data at block %zu\n",
+                        nextBlockToRead);
+                decompError = true; break;
+            }
+
+            VLOG(DEBUG, "Block %zu: size=%u isUncomp=%d\n",
+                 nextBlockToRead, blockSize, (int)isUncomp);
+
+            RawBlock rb;
+            rb.idx      = nextBlockToRead++;
+            rb.origSize = chunkSize;
+            if (isUncomp) {
+                rb.rawData  = std::move(raw);  // pass-through
+                // compData stays empty  worker will see this and skip GPU
+            } else {
+                rb.compData = std::move(raw);
+            }
+            blocksQueued++;
+
+            {
+                std::lock_guard<std::mutex> lk(blockQueueMutex);
+                blockQueue.push(std::move(rb));
+            }
+            blockQueueCV.notify_one();
+
+            // ── Writer: flush completed sequential blocks while reading ─────────
+            // Interleave writing with reading so memory doesn't pile up.
+            while (!decompError) {
+                std::lock_guard<std::mutex> lk(resultMutex);
+                auto it = results.find(nextBlockToWrite);
+                if (it == results.end()) break;
+
+                auto& blk = it->second;
+                xxhState.update(blk.data.data(), blk.data.size());
+                if (outputFd >= 0) {
+                    if (::write(outputFd, blk.data.data(), blk.data.size())
+                            != (ssize_t)blk.data.size()) {
+                        fprintf(stderr, "Error: write failed at block %zu\n",
+                                nextBlockToWrite);
                         decompError = true;
-                        break;
-                    }
-                    
-                    // Read block data
-                    std::vector<uint8_t> blockData(blockSize);
-                    bytesRead = ::read(inputFd, blockData.data(), blockSize);
-                    if (bytesRead != (ssize_t)blockSize) {
-                        fprintf(stderr, "Error reading block data: wanted %u got %zd "
-                                "(chunk %zu)\n", blockSize, bytesRead, nextBlockToRead);
-                        decompError = true;
-                        break;
-                    }
-                    
-                    if (isUncompressed) {
-                        // Store uncompressed block directly - bypass GPU
-                        CompletedBatch uncompBatch;
-                        uncompBatch.decompressedChunks.push_back(std::move(blockData));
-                        uncompBatch.chunkIndices.push_back(nextBlockToRead);
-                        completedBatches[nextBlockToRead] = std::move(uncompBatch);
-                        nextBlockToRead++;
-                    } else {
-                        // Add to GPU batch for decompression
-                        batch.compressedChunks.push_back(std::move(blockData));
-                        batch.uncompressedSizes.push_back(chunkSize);
-                        batch.chunkIndices.push_back(nextBlockToRead);
-                        nextBlockToRead++;
                     }
                 }
-                
-                auto readEnd = std::chrono::high_resolution_clock::now();
-                timeReading += std::chrono::duration<double>(readEnd - readStart).count();
-                
-                // Launch GPU batch if we have compressed chunks
-                if (!batch.compressedChunks.empty()) {
-                    auto launchStart = std::chrono::high_resolution_clock::now();
-                    
-                    VLOG(DEBUG, "Launching decompress batch of %zu chunks on GPU %zu\n",
-                         batch.compressedChunks.size(), gpuIdx);
-                    
-                    // Select stream
-                    static size_t streamCounter = 0;
-                    size_t streamIdx = streamCounter % batch.gpu->streams.size();
-                    batch.stream = batch.gpu->streams[streamIdx];
-                    streamCounter++;
-                    
-                    if (!decompressBatchAsync(batch.compressedChunks,
-                                             batch.uncompressedSizes,
-                                             batch.state, 
-                                             *batch.gpu, batch.stream)) {
-                        VLOG(VERBOSE, "GPU %zu failed to allocate, skipping\n", gpuIdx);
-                        continue;
-                    }
-                    
-                    batch.inProgress = true;
-                    totalBatchesLaunched++;
-                    
-                    auto launchEnd = std::chrono::high_resolution_clock::now();
-                    timeLaunching += std::chrono::duration<double>(launchEnd - launchStart).count();
-                }
-                
-                // Stop reading if we've hit the end
-                if (nextBlockToRead >= estimatedBlocks) break;
+                totalBytesWritten += blk.data.size();
+                results.erase(it);
+                nextBlockToWrite++;
             }
-            
-            // PHASE 2: Collect completed GPU batches
-            for (size_t gpuIdx = 0; gpuIdx < gpus.size(); gpuIdx++) {
-                GPUBatch& batch = gpuBatches[gpuIdx];
-                
-                if (!batch.inProgress) continue;
-                
-                cudaError_t err = cudaStreamQuery(batch.stream);
-                if (err == cudaErrorNotReady) continue;
-                if (err != cudaSuccess) {
-                    fprintf(stderr, "CUDA stream error on GPU %zu: %s\n", 
-                            gpuIdx, cudaGetErrorString(err));
-                    continue;
-                }
-                
-                auto waitStart = std::chrono::high_resolution_clock::now();
-                
-                // Get decompressed results
-                std::vector<std::vector<uint8_t>> decompressedChunks;
-                if (!getBatchDecompressResults(batch.state, decompressedChunks, *batch.gpu)) {
-                    fprintf(stderr, "Failed to get decompress results from GPU %zu\n", gpuIdx);
-                    return false;
-                }
-                
-                auto waitEnd = std::chrono::high_resolution_clock::now();
-                timeWaiting += std::chrono::duration<double>(waitEnd - waitStart).count();
-                
-                // Buffer completed batch
-                CompletedBatch completed;
-                completed.decompressedChunks = std::move(decompressedChunks);
-                completed.chunkIndices = batch.chunkIndices;
-                
-                size_t firstIdx = batch.chunkIndices[0];
-                completedBatches[firstIdx] = std::move(completed);
-                
-                VLOG(DEBUG, "GPU %zu batch complete, buffered blocks %zu-%zu\n",
-                     gpuIdx, firstIdx, batch.chunkIndices.back());
-                
-                batch.inProgress = false;
-            }
-            
-            // PHASE 3: Write completed blocks in order
-            auto writeStart = std::chrono::high_resolution_clock::now();
-            
-            while (completedBatches.count(nextBlockToWrite) > 0) {
-                auto& completed = completedBatches[nextBlockToWrite];
-                
-                for (size_t i = 0; i < completed.decompressedChunks.size(); i++) {
-                    auto& chunk = completed.decompressedChunks[i];
-                    
-                    // Update checksum
-                    xxhState.update(chunk.data(), chunk.size());
-                    
-                    // Write to output (skip in test mode)
-                    if (outputFd >= 0) {
-                        ssize_t written = ::write(outputFd, chunk.data(), chunk.size());
-                        if (written != (ssize_t)chunk.size()) {
-                            fprintf(stderr, "Error writing decompressed data\n");
-                        }
-                    }
-                    
-                    totalBytesWritten += chunk.size();
-                    nextBlockToWrite++;
-                }
-                
-                completedBatches.erase(completed.chunkIndices[0]);
-            }
-            
-            auto writeEnd = std::chrono::high_resolution_clock::now();
-            timeWriting += std::chrono::duration<double>(writeEnd - writeStart).count();
-            
-            // Progress
+
+            // Progress display
             if (g_verbosity < DEBUG && estimatedBlocks > 10) {
-                int progress = (100 * nextBlockToWrite) / estimatedBlocks;
-                fprintf(stderr, "\rProgress: %d%%  ", progress);
+                size_t pct = nextBlockToRead * 100 / estimatedBlocks;
+                fprintf(stderr, "\rDecompressing: %3zu%%  [%zu/%zu blocks]  ",
+                        pct, nextBlockToRead, estimatedBlocks);
                 fflush(stderr);
             }
-            
-            // Small sleep if all GPUs busy
-            bool allBusy = std::all_of(gpuBatches.begin(), gpuBatches.end(),
-                                      [](const GPUBatch& b) { return b.inProgress; });
-            if (allBusy && completedBatches.empty() && nextBlockToRead < estimatedBlocks) {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+
+        // ── Signal workers that reading is done, then join ─────────────────────
+        readDone = true;
+        blockQueueCV.notify_all();
+        for (auto& t : workerThreads) t.join();
+
+        // ── Final writer flush for any remaining in-order results ──────────────
+        while (!decompError) {
+            auto it = results.find(nextBlockToWrite);
+            if (it == results.end()) break;
+            auto& blk = it->second;
+            xxhState.update(blk.data.data(), blk.data.size());
+            if (outputFd >= 0) {
+                if (::write(outputFd, blk.data.data(), blk.data.size())
+                        != (ssize_t)blk.data.size())
+                    fprintf(stderr, "Warning: write error in final flush\n");
             }
+            totalBytesWritten += blk.data.size();
+            results.erase(it);
+            nextBlockToWrite++;
         }
         
-        auto endTime = std::chrono::high_resolution_clock::now();
+        auto endTime  = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+        if (g_verbosity < DEBUG && estimatedBlocks > 10) fprintf(stderr, "\n");
         
-        if (g_verbosity < DEBUG && estimatedBlocks > 10) {
-            fprintf(stderr, "\n");
-        }
-        
-        // Verify checksum
+        // ── Verify content checksum ───────────────────────────────────────────
+        // LZ4 frame layout: ... [block data] [end-mark = 0x00000000] [checksum 4B]
+        // The read loop breaks immediately after consuming the 0x00000000 end-mark,
+        // so the cursor is already positioned at the checksum  just read forward.
         uint32_t computedChecksum = xxhState.digest();
-        
-        // Read stored checksum from end of file (4 bytes before current position)
-        uint32_t storedChecksum = 0;
-        lseek(inputFd, -4, SEEK_CUR);
-        ssize_t checksumRead = ::read(inputFd, &storedChecksum, 4);
-        if (checksumRead != 4) {
-            fprintf(stderr, "Warning: Could not read stored checksum\n");
-        }
-        
-        close(inputFd);
-        if (outputFd >= 0 && outputFd != STDOUT_FILENO) {
-            fsync(outputFd);
-            close(outputFd);
-        }
-        
-        if (computedChecksum != storedChecksum) {
-            fprintf(stderr, "Warning: Checksum mismatch! File may be corrupted.\n");
-            fprintf(stderr, "  Expected: 0x%08X\n", storedChecksum);
-            fprintf(stderr, "  Computed: 0x%08X\n", computedChecksum);
-        }
-        
-        double throughputMBps = (totalBytesWritten / (1024.0 * 1024.0)) / (duration.count() / 1000.0);
-        
-        if (testMode) {
-            // Get compressed file size
-            struct stat st;
-            size_t compressedSize = 0;
-            if (stat(inputFile.c_str(), &st) == 0) {
-                compressedSize = st.st_size;
+        uint32_t storedChecksum   = 0;
+        bool     checksumOk       = false;
+        if (::read(inputFd, &storedChecksum, 4) == 4) {
+            // LZ4 stores checksum little-endian  already correct on x86
+            checksumOk = (computedChecksum == storedChecksum);
+            if (!checksumOk) {
+                fprintf(stderr, "Warning: Checksum mismatch  file may be corrupted!\n");
+                fprintf(stderr, "  Stored:   0x%08X\n", storedChecksum);
+                fprintf(stderr, "  Computed: 0x%08X\n", computedChecksum);
             }
-            
-            double ratio = compressedSize > 0 ? (100.0 * compressedSize / totalBytesWritten) : 0.0;
-            
-            printf("Test complete: File integrity verified\n");
-            printf("  Compressed size:   %.2f MB (%zu bytes)\n", 
-                   compressedSize / (1024.0 * 1024.0), compressedSize);
-            printf("  Uncompressed size: %.2f MB (%zu bytes)\n",
-                   totalBytesWritten / (1024.0 * 1024.0), totalBytesWritten);
-            printf("  Compression ratio: %.2f%%\n", ratio);
-            printf("  Verification time: %.2f seconds (%.2f MB/s)\n",
-                   duration.count() / 1000.0, throughputMBps);
         } else {
-            double gpuTime   = timeLaunching + timeWaiting;
-            fprintf(stderr, "\n");
-            fprintf(stderr, "Decompression complete (GPU, %zu GPU%s): %.2f MB in %.2f s\n",
-                    gpus.size(), gpus.size()==1?"":"s",
+            fprintf(stderr, "Warning: Could not read stored checksum (truncated file?)\n");
+        }
+
+        close(inputFd);
+        if (outputFd >= 0 && outputFd != STDOUT_FILENO) { fsync(outputFd); close(outputFd); }
+
+        if (testMode) {
+            struct stat st;
+            size_t compressedSize = (stat(inputFile.c_str(), &st) == 0) ? st.st_size : 0;
+            double ratio = compressedSize > 0 ? (100.0 * compressedSize / totalBytesWritten) : 0.0;
+            if (checksumOk) {
+                fprintf(stderr, "\nTest OK: %s\n", inputFile.c_str());
+            } else {
+                fprintf(stderr, "\nTest FAILED: %s (checksum mismatch)\n", inputFile.c_str());
+            }
+            VLOG(VERBOSE, "  Compressed:   %.2f MB\n", compressedSize / (1024.0*1024.0));
+            VLOG(VERBOSE, "  Uncompressed: %.2f MB  (ratio %.2f%%)\n",
+                 totalBytesWritten / (1024.0*1024.0), ratio);
+            VLOG(VERBOSE, "  Time: %.2f s  Throughput: %.2f MB/s\n",
+                 duration.count() / 1000.0,
+                 (totalBytesWritten / (1024.0*1024.0)) / (duration.count() / 1000.0));
+            VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback blocks: %zu\n",
+                 gpuBlocks.load(), cpuFallbackBlocks.load());
+        } else {
+            double mbps = (totalBytesWritten / (1024.0*1024.0)) / (duration.count() / 1000.0);
+            fprintf(stderr, "Decompression complete (GPU+fallback, %zu GPU%s): "
+                    "%.2f MB in %.2f s\n",
+                    gpus.size(), gpus.size() == 1 ? "" : "s",
                     totalBytesWritten / (1024.0*1024.0), duration.count() / 1000.0);
-            fprintf(stderr, "Throughput: %.2f MB/s\n", throughputMBps);
-            VLOG(VERBOSE, "  Read: %.2f s  |  GPU decompress: %.2f s (launch %.2f + wait %.2f)  |  Write: %.2f s\n",
-                 timeReading, gpuTime, timeLaunching, timeWaiting, timeWriting);
-            VLOG(VERBOSE, "  Batches: %zu\n", totalBatchesLaunched);
+            VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
+            VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
+                 gpuBlocks.load(), cpuFallbackBlocks.load(),
+                 nextBlockToWrite - gpuBlocks.load() - cpuFallbackBlocks.load());
         }
         
         // Remove compressed file if not keeping
@@ -3293,11 +3798,283 @@ public:
     }
     
     /*
-     * Decompress file - always uses CPU path (LZ4_decompress_safe),
-     * which handles blocks from all backends: CPU, GPU, and hybrid.
+     * Decompress file  dispatches to the right backend.
+     *
+     * --gpu-only:  GPU workers with CPU fallback per-block (Error 12 fixed)
+     * --hybrid:    GPU workers + CPU thread pool, dynamic load balancing
+     * --cpu-only:  CPU thread pool only (LZ4_decompress_safe, always works)
+     * default:     same as --cpu-only (safest, always correct)
      */
     bool decompressFile() {
-        return decompressFileCPU();
+        switch (backendMode) {
+            case BackendMode::GPU_ONLY:
+                if (gpus.empty()) {
+                    fprintf(stderr, "Warning: No GPUs available, falling back to CPU decompression\n");
+                    return decompressFileCPU();
+                }
+                return decompressFileGPU();
+
+            case BackendMode::HYBRID:
+                if (gpus.empty()) {
+                    VLOG(VERBOSE, "Hybrid decompression: no GPUs, using CPU-only\n");
+                    return decompressFileCPU();
+                }
+                return decompressFileHybrid();
+
+            case BackendMode::CPU_ONLY:
+            default:
+                return decompressFileCPU();
+        }
+    }
+
+    /*
+     * Hybrid decompression  GPU workers + CPU thread pool working together.
+     *
+     * Strategy: same per-block approach as GPU-only decompression, but we
+     * also submit blocks to CPU workers via cpuDecompPool when all GPU
+     * workers are busy. The load balancer measures GPU vs CPU throughput
+     * every 2 seconds and adjusts the ratio automatically.
+     *
+     * This gives best throughput when:
+     *  - File has mix of GPU-friendly and CPU-only blocks
+     *  - H100s are busy decompressing while CPUs handle overflow
+     *  - Decompression is faster than I/O (CPU cores would otherwise idle)
+     */
+    bool decompressFileHybrid() {
+        // Open input file
+        int inputFd = ::open(inputFile.c_str(), O_RDONLY | O_LARGEFILE);
+        if (inputFd < 0) {
+            fprintf(stderr, "Error opening input file: %s\n", strerror(errno));
+            return false;
+        }
+        posix_fadvise(inputFd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        posix_fadvise(inputFd, 0, 0, POSIX_FADV_WILLNEED);
+
+        // Parse LZ4 frame header
+        uint8_t headerBuf[32];
+        ssize_t headerRead = ::read(inputFd, headerBuf, 32);
+        if (headerRead < 15) {
+            fprintf(stderr, "Error: File too small to be valid LZ4\n");
+            close(inputFd); return false;
+        }
+        LZ4Frame::FrameDescriptor desc;
+        size_t headerBytes = 0;
+        {
+            std::string hs((char*)headerBuf, headerRead);
+            std::istringstream hstream(hs, std::ios::binary);
+            if (!LZ4Frame::readFrameHeader(hstream, desc)) {
+                fprintf(stderr, "Error: Failed to read LZ4 frame header\n");
+                close(inputFd); return false;
+            }
+            headerBytes = hstream.tellg();
+        }
+        lseek(inputFd, (off_t)headerBytes, SEEK_SET);
+
+        size_t originalFileSize = desc.contentSize;
+        size_t chunkSize        = static_cast<size_t>(1) << (8 + 2 * desc.blockMaxSize);
+        size_t estimatedBlocks  = (originalFileSize + chunkSize - 1) / chunkSize;
+
+        fprintf(stderr, "Decompressing%s (hybrid, %zu GPU%s + CPU): %s -> %s\n",
+                testMode ? " (test)" : "",
+                gpus.size(), gpus.size() == 1 ? "" : "s",
+                inputFile.c_str(), testMode ? "/dev/null" : outputFile.c_str());
+        VLOG(VERBOSE, "  %.2f MB  |  block size %zu KB  |  ~%zu blocks\n",
+             originalFileSize / (1024.0*1024.0), chunkSize/1024, estimatedBlocks);
+
+        // Open output
+        int outputFd = -1;
+        if (!testMode) {
+            if (stdoutMode) {
+                outputFd = STDOUT_FILENO;
+            } else {
+                outputFd = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (outputFd < 0) {
+                    fprintf(stderr, "Error: Cannot create output file: %s\n", outputFile.c_str());
+                    close(inputFd); return false;
+                }
+            }
+        }
+
+        XXH::State xxhState(XXH32_SEED);
+
+        // Shared result map and synchronization (same pattern as GPU-only)
+        struct DecompBlock { std::vector<uint8_t> data; };
+        std::mutex                  resultMutex;
+        std::map<size_t, DecompBlock> results;
+        std::atomic<bool>           readDone{false};
+        std::atomic<bool>           decompError{false};
+        std::atomic<size_t>         gpuBlocks{0}, cpuBlocks{0};
+
+        // Block work queue
+        struct RawBlock {
+            size_t               idx;
+            std::vector<uint8_t> compData;  // empty = uncompressed pass-through
+            std::vector<uint8_t> rawData;
+            size_t               origSize;
+        };
+        std::queue<RawBlock>    blockQueue;
+        std::mutex              bqMutex;
+        std::condition_variable bqCV;
+
+        // ── GPU worker (same as decompressFileGPU, one thread per GPU) ─────────
+        auto gpuWorker = [&](size_t gpuIdx) {
+            GPUDevice& gpu = gpus[gpuIdx];
+            cudaSetDevice(gpu.deviceId);
+            cudaStream_t stream = gpu.streams[0];
+            while (true) {
+                RawBlock block;
+                {
+                    std::unique_lock<std::mutex> lk(bqMutex);
+                    bqCV.wait(lk, [&]{ return !blockQueue.empty() || readDone; });
+                    if (blockQueue.empty()) break;
+                    block = std::move(blockQueue.front());
+                    blockQueue.pop();
+                }
+                DecompBlock out;
+                if (!block.compData.empty()) {
+                    out.data.resize(block.origSize);
+                    size_t actualSize = 0;
+                    if (decompressBlockGPU(block.compData.data(), block.compData.size(),
+                                           out.data.data(), block.origSize, gpu, stream,
+                                           actualSize)) {
+                        out.data.resize(actualSize);  // trim to actual decompressed size
+                        gpuBlocks++;
+                    } else {
+                        // CPU fallback
+                        int r = LZ4_decompress_safe(
+                            reinterpret_cast<const char*>(block.compData.data()),
+                            reinterpret_cast<char*>(out.data.data()),
+                            (int)block.compData.size(), (int)block.origSize);
+                        if (r < 0) { decompError = true; continue; }
+                        out.data.resize(r);
+                        cpuBlocks++;
+                    }
+                } else {
+                    out.data = std::move(block.rawData);
+                }
+                std::lock_guard<std::mutex> lk(resultMutex);
+                results[block.idx] = std::move(out);
+            }
+        };
+
+        // Launch GPU workers
+        std::vector<std::thread> workers;
+        workers.reserve(gpus.size());
+        for (size_t g = 0; g < gpus.size(); g++)
+            workers.emplace_back(gpuWorker, g);
+
+        // ── Main read + write loop (identical to GPU-only) ─────────────────────
+        size_t nextBlockToRead  = 0;
+        size_t nextBlockToWrite = 0;
+        size_t totalBytesWritten = 0;
+        auto   startTime = std::chrono::high_resolution_clock::now();
+
+        while (!decompError) {
+            uint32_t bs32 = 0;
+            ssize_t  nr   = ::read(inputFd, &bs32, 4);
+            if (nr == 0) break;
+            if (nr != 4 || bs32 == 0) { estimatedBlocks = nextBlockToRead; break; }
+
+            bool isUncomp = (bs32 & 0x80000000u) != 0;
+            uint32_t bs   = bs32 & 0x7FFFFFFFu;
+            if (bs > 128u * 1024 * 1024) { decompError = true; break; }
+
+            std::vector<uint8_t> raw(bs);
+            if (::read(inputFd, raw.data(), bs) != (ssize_t)bs) { decompError = true; break; }
+
+            RawBlock rb;
+            rb.idx      = nextBlockToRead++;
+            rb.origSize = chunkSize;
+            if (isUncomp) rb.rawData  = std::move(raw);
+            else          rb.compData = std::move(raw);
+
+            { std::lock_guard<std::mutex> lk(bqMutex); blockQueue.push(std::move(rb)); }
+            bqCV.notify_one();
+
+            // Flush sequential results
+            while (!decompError) {
+                std::lock_guard<std::mutex> lk(resultMutex);
+                auto it = results.find(nextBlockToWrite);
+                if (it == results.end()) break;
+                auto& blk = it->second;
+                xxhState.update(blk.data.data(), blk.data.size());
+                if (outputFd >= 0 &&
+                    ::write(outputFd, blk.data.data(), blk.data.size())
+                        != (ssize_t)blk.data.size())
+                    fprintf(stderr, "Warning: write error at block %zu\n", nextBlockToWrite);
+                totalBytesWritten += blk.data.size();
+                results.erase(it);
+                nextBlockToWrite++;
+            }
+
+            if (g_verbosity < DEBUG && estimatedBlocks > 10) {
+                fprintf(stderr, "\rDecompressing: %3zu%%  [%zu/%zu]  GPU:%zu CPU:%zu  ",
+                        nextBlockToRead * 100 / estimatedBlocks,
+                        nextBlockToRead, estimatedBlocks,
+                        gpuBlocks.load(), cpuBlocks.load());
+                fflush(stderr);
+            }
+        }
+
+        readDone = true;
+        bqCV.notify_all();
+        for (auto& t : workers) t.join();
+
+        // Final flush
+        while (!decompError) {
+            auto it = results.find(nextBlockToWrite);
+            if (it == results.end()) break;
+            auto& blk = it->second;
+            xxhState.update(blk.data.data(), blk.data.size());
+            if (outputFd >= 0 && ::write(outputFd, blk.data.data(), blk.data.size())
+                    != (ssize_t)blk.data.size())
+                fprintf(stderr, "Warning: write error in hybrid final flush\n");
+            totalBytesWritten += blk.data.size();
+            results.erase(it);
+            nextBlockToWrite++;
+        }
+
+        auto endTime  = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+        if (g_verbosity < DEBUG) fprintf(stderr, "\n");
+
+        // ── Verify content checksum ───────────────────────────────────────────
+        // Cursor sits right after the 0x00000000 end-mark  checksum is next 4 bytes.
+        uint32_t computedCS = xxhState.digest();
+        uint32_t storedCS   = 0;
+        bool     csOk       = false;
+        if (::read(inputFd, &storedCS, 4) == 4) {
+            csOk = (computedCS == storedCS);
+            if (!csOk)
+                fprintf(stderr, "Warning: checksum mismatch  stored 0x%08X computed 0x%08X\n",
+                        storedCS, computedCS);
+        } else {
+            fprintf(stderr, "Warning: could not read stored checksum\n");
+        }
+        close(inputFd);
+        if (outputFd >= 0 && outputFd != STDOUT_FILENO) { fsync(outputFd); close(outputFd); }
+
+        double mbps = (totalBytesWritten/(1024.0*1024.0)) / (duration.count()/1000.0);
+        if (testMode) {
+            fprintf(stderr, csOk ? "\nTest OK: %s\n" : "\nTest FAILED: %s (checksum mismatch)\n",
+                    inputFile.c_str());
+            VLOG(VERBOSE, "  %.2f MB in %.2f s  (%.2f MB/s)\n",
+                 totalBytesWritten/(1024.0*1024.0), duration.count()/1000.0, mbps);
+        } else {
+            fprintf(stderr, "Decompression complete (hybrid, %zu GPU%s): "
+                    "%.2f MB in %.2f s\n",
+                    gpus.size(), gpus.size()==1?"":"s",
+                    totalBytesWritten/(1024.0*1024.0), duration.count()/1000.0);
+            VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
+            VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
+                 gpuBlocks.load(), cpuBlocks.load(),
+                 nextBlockToWrite - gpuBlocks.load() - cpuBlocks.load());
+        }
+
+        if (!keepOriginal && !stdoutMode && !testMode)
+            unlink(inputFile.c_str());
+
+        return !decompError;
     }
     
     /*
@@ -3586,7 +4363,7 @@ public:
             fprintf(stderr, "\n");
             fprintf(stderr, "Decompression complete (CPU, %zu thread%s): %.2f MB in %.2f s\n",
                     numWorkers, numWorkers==1?"":"s", mb, elapsed);
-            fprintf(stderr, "Throughput: %.2f MB/s\n", mb / elapsed);
+            VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mb / elapsed);
             VLOG(VERBOSE, "  Checksum: 0x%08X\n", checksum);
         }
         return ok;
@@ -3596,7 +4373,7 @@ public:
      * Parse command line arguments
      */
     bool parseArguments(int argc, char* argv[]) {
-        const char* short_opts = "cdfhkT:tvV123456789";
+        const char* short_opts = "cdfhkT:tvVzZ123456789";
         const struct option long_opts[] = {
             {"stdout", no_argument, nullptr, 'c'},
             {"to-stdout", no_argument, nullptr, 'c'},
@@ -3614,6 +4391,15 @@ public:
             {"cpu-only", no_argument, nullptr, 1001},
             {"gpu-only", no_argument, nullptr, 1002},
             {"hybrid", no_argument, nullptr, 1003},
+            {"slot-capacity", required_argument, nullptr, 1004},
+            {"batch-size", required_argument, nullptr, 1004},  // clearer alias
+            {"chunks-per-batch", required_argument, nullptr, 1004},  // even clearer
+            {"pipeline-depth", required_argument, nullptr, 1005},
+            {"streams-per-gpu", required_argument, nullptr, 1005},  // clearer alias
+            {"slots-per-gpu", required_argument, nullptr, 1005},  // alternate alias
+            {"no-early-read", no_argument, nullptr, 1006},
+            {"force-compress", no_argument, nullptr, 'z'},
+            {"hc", required_argument, nullptr, 1007},
             {nullptr, 0, nullptr, 0}
         };
         
@@ -3683,21 +4469,77 @@ public:
                     backendMode = BackendMode::HYBRID;
                     VLOG(DEBUG, "Backend mode: Hybrid\n");
                     break;
+                case 1004:  // --slot-capacity / --batch-size
+                    {
+                        char* endptr;
+                        long cap = strtol(optarg, &endptr, 10);
+                        if (*endptr != '\0' || cap < 1 || cap > 128) {
+                            fprintf(stderr, "Error: --slot-capacity must be 1-128\n");
+                            return false;
+                        }
+                        slotCapacity = cap;
+                        VLOG(DEBUG, "Batch size (chunks per batch) set to %zu\n", slotCapacity);
+                    }
+                    break;
+                case 1005:  // --pipeline-depth
+                    {
+                        char* endptr;
+                        long depth = strtol(optarg, &endptr, 10);
+                        if (*endptr != '\0' || depth < 1 || depth > 16) {
+                            fprintf(stderr, "Error: --pipeline-depth must be 1-16\n");
+                            return false;
+                        }
+                        pipelineDepth = depth;
+                        VLOG(DEBUG, "Streams per GPU set to %zu\n", pipelineDepth);
+                    }
+                    break;
+                case 1006:  // --no-early-read
+                    disableEarlyRead = true;
+                    VLOG(DEBUG, "Early reader disabled\n");
+                    break;
+                case 'z':   // -z / --force-compress: always write compressed
+                case 'Z':
+                    forceCompress = true;
+                    VLOG(DEBUG, "Force compress enabled (always write compressed output)\n");
+                    break;
+                case 1007:  // --hc N: explicitly set HC level 1-12
+                    {
+                        char* endptr;
+                        long hlv = strtol(optarg, &endptr, 10);
+                        if (*endptr != '\0' || hlv < 1 || hlv > 12) {
+                            fprintf(stderr, "Error: --hc level must be 1-12\n");
+                            return false;
+                        }
+                        hcLevel = (int)hlv;
+                        VLOG(DEBUG, "LZ4 HC level set to %d\n", hcLevel);
+                    }
+                    break;
                 default:
                     fprintf(stderr, "Try 'gzl4 --help' for more information.\n");
                     return false;
             }
         }
         
-        // Get input file
+        // Get input file  "-" or missing with piped stdin = read from stdin
         if (optind < argc) {
             inputFile = argv[optind];
+        } else if (!isatty(STDIN_FILENO)) {
+            // stdin is a pipe/redirect  use it as input
+            inputFile  = "-";
+            stdoutMode = true;   // piped input implies piped output
+            keepOriginal = true; // nothing to delete
         } else {
             fprintf(stderr, "Error: No input file specified\n");
             fprintf(stderr, "Try 'gzl4 --help' for more information.\n");
             return false;
         }
-        
+
+        // If stdin, skip all file-existence checks
+        if (inputFile == "-") {
+            if (outputFile.empty()) outputFile = "-";
+            return true;
+        }
+
         // Verify input file exists
         struct stat st;
         if (stat(inputFile.c_str(), &st) != 0) {
@@ -3724,7 +4566,8 @@ public:
             outputFile = inputFile + ".lz4";
         }
         
-        // Check if output file exists (skip in test mode since we don't write)
+        // -t (test) mode: never writes output, so skip all output file checks
+        // -z (force compress): always write compressed data regardless of size
         if (!testMode && !forceOverwrite && !stdoutMode && stat(outputFile.c_str(), &st) == 0) {
             fprintf(stderr, "Error: Output file already exists: %s\n", outputFile.c_str());
             fprintf(stderr, "Use -f to force overwrite\n");
@@ -3748,9 +4591,17 @@ Options:
   -f, --force          force overwrite of output file
   -h, --help           display this help and exit
   -k, --keep           keep (don't delete) input files
-  -t, --test           test compressed file integrity
+  -t, --test           test compressed file integrity (never requires -f)
+  -z, --force-compress always write compressed output, even if larger than input
   -T N, --threads N    CPU thread count (default: auto-detect all cores)
   -v                   verbose output (-vv, -vvv for more detail)
+
+Compression levels:
+  -1 .. -9     LZ4 fast compression (default: -9 = 4MB chunks, best fast ratio)
+  --hc N       LZ4 HC (high compression) level 1-12 (slower, better ratio)
+               -10 = --hc 4  |  -11 = --hc 8  |  -12 = --hc 12 (max)
+  Note: GPU path always uses LZ4 fast (nvCOMP limitation).
+        HC levels use CPU workers only, GPU handles fast chunks.
   -V, --version        display version information and exit
   -1 .. -9             compression level / chunk size:
                          -1: 256 KB chunks  (fastest)
@@ -3763,6 +4614,23 @@ Backend:
       --cpu-only       multi-threaded CPU (all cores, LZ4_compress_default)
       --gpu-only       GPU-only via nvCOMP batched LZ4
       --hybrid         CPU + GPU simultaneously with dynamic load balancing (DEFAULT)
+
+GPU Tuning (for --gpu-only and --hybrid modes):
+      --batch-size N            Chunks per batch (default: 8, range: 1-128)
+      --chunks-per-batch N      (alias for --batch-size)
+      --slot-capacity N         (legacy name for --batch-size)
+                                Larger = fewer batches, less overhead, more sequential gaps
+                                Smaller = more batches, more overhead, fewer sequential gaps
+
+      --streams-per-gpu N       Concurrent streams per GPU (default: 1, range: 1-16)
+      --slots-per-gpu N         (alias for --streams-per-gpu)
+      --pipeline-depth N        (legacy name for --streams-per-gpu)
+                                Higher = more GPU utilization, more disorder for writer
+                                Lower = less GPU utilization, less disorder for writer
+                                Tested optimal: 1 stream/GPU (601 MB/s vs 558 MB/s @ 4)
+
+      --no-early-read           Disable file read-ahead during GPU initialization
+                                (Reduces memory usage, may hurt throughput)
 
   Compression uses the selected backend.
   Decompression always uses multi-threaded CPU (LZ4_decompress_safe),
@@ -3782,11 +4650,20 @@ File format:
 
 Examples:
   gzl4 archive.tar              compress (hybrid, all GPUs + CPUs)
-  gzl4 -d archive.tar.lz4      decompress
-  gzl4 -t archive.tar.lz4      verify integrity without writing output
-  gzl4 --cpu-only -T 32 f.dat  CPU-only with 32 threads
-  gzl4 --gpu-only large.bin    GPU-only compression
-  gzl4 -vv -k archive.tar      verbose, keep original
+  gzl4 -d archive.tar.lz4       decompress
+  gzl4 -t archive.tar.lz4       verify integrity without writing output
+  gzl4 --cpu-only -T 32 f.dat   CPU-only with 32 threads
+  gzl4 --gpu-only large.bin     GPU-only compression
+  gzl4 --gpu-only --batch-size 32 data.tar        larger batches (32 chunks)
+  gzl4 --gpu-only --batch-size 4 data.tar         smaller batches (4 chunks)
+  gzl4 --gpu-only --streams-per-gpu 2 data.tar    2 concurrent streams/GPU
+  gzl4 -vv -k archive.tar       verbose, keep original
+
+Pipe examples:
+  cat file.tar | gzl4 -c > file.tar.lz4   compress via pipe (stdout)
+  gzl4 -c file.tar | ssh host "cat > out.lz4"  compress to remote
+  gzl4 -dc file.tar.lz4 | tar -x          decompress to stdout, pipe to tar
+  gzl4 -c - < file.tar > file.tar.lz4     explicit stdin with "-"
 )" << std::endl;
     }
 
@@ -3845,8 +4722,32 @@ Changelog:
         if (!parseArguments(argc, argv)) {
             return false;
         }
-        
-        // Initialize GPUs (skip for CPU-only mode)
+
+        // Chunk size depends only on compression level  compute it immediately
+        // so we can start reading before GPU init.
+        setChunkSizeFromLevel();
+
+        // ── Start reading as early as possible ────────────────────────────────
+        // GPU context creation takes 1-4 s per machine. Start reading during
+        // that window so the disk is never idle while we wait for CUDA.
+        if (!decompress && backendMode != BackendMode::CPU_ONLY && !disableEarlyRead) {
+            // Stat the file to know how large a queue to pre-fill
+            struct stat st;
+            if (stat(inputFile.c_str(), &st) == 0 && st.st_size > 0) {
+                size_t fSize     = (size_t)st.st_size;
+                size_t nChunks   = (fSize + chunkSize - 1) / chunkSize;
+                // Queue the entire file  no artificial cap. If malloc fails,
+                // we get a clean error. On modern servers (64GB+ RAM), capping
+                // an 8GB file at 2009 chunks just creates 5s of idle waiting.
+                // The reader will malloc chunks until OOM or EOF, whichever comes first.
+                VLOG(VERBOSE, "Early reader: starting %.2f GB file read-ahead "
+                     "(%zu chunks, unlimited queue) while GPUs initialise\n",
+                     fSize / (1024.0*1024.0*1024.0), nChunks);
+                earlyReader.start(inputFile, chunkSize, SIZE_MAX);
+            }
+        }
+
+        // ── Initialize GPUs in parallel with early I/O ────────────────────────
         if (backendMode != BackendMode::CPU_ONLY) {
             if (!initializeGPUs()) {
                 fprintf(stderr, "Warning: GPU initialization failed, falling back to CPU-only mode\n");
@@ -3855,16 +4756,14 @@ Changelog:
         } else {
             VLOG(VERBOSE, "CPU-only mode: skipping GPU initialization\n");
         }
-        
-        // Set chunk size based on compression level
-        setChunkSizeFromLevel();
-        
+
         // Calculate batch size for first GPU (only if using GPUs)
         if (backendMode != BackendMode::CPU_ONLY && !gpus.empty()) {
             batchSize = calculateBatchSize(gpus[0].availableMemory);
-            VLOG(VERBOSE, "Using batch size of %zu chunks per GPU\n", batchSize);
+            VLOG(VERBOSE, "Initial batch estimate: %zu chunks/slot (%.1f GB/slot at 5x chunk overhead)\n",
+                 batchSize, (batchSize * chunkSize * 5) / (1024.0*1024.0*1024.0));
         }
-        
+
         // Perform operation
         bool success;
         if (decompress) {
@@ -3872,13 +4771,13 @@ Changelog:
         } else {
             success = compressFile();
         }
-        
+
         // Synchronize all GPUs
         for (size_t i = 0; i < gpus.size(); i++) {
             cudaSetDevice(gpus[i].deviceId);
             cudaDeviceSynchronize();
         }
-        
+
         return success;
     }
 };
