@@ -43,7 +43,7 @@
 #include <getopt.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.12.1";
+constexpr const char* VERSION = "3.14.0";
 
 // Compression backend modes
 enum class BackendMode {
@@ -1575,14 +1575,18 @@ public:
      * Calculate optimal chunk size based on compression level
      */
     void setChunkSizeFromLevel() {
-        // Map -1..-9 to chunk sizes; -10..-12 are HC levels using 4MB chunks
-        // HC levels:  -10 = HC level 4, -11 = HC level 8, -12 = HC level 12
+        // Map -1..-9 to chunk sizes
+        // HC levels are set via --hc-level N or -10/-11/-12 (converted to --hc-level by preprocessor)
         if (compressionLevel >= 10) {
+            // Legacy: -10, -11, -12 as compressionLevel (shouldn't happen anymore)
             chunkSize = CHUNK_SIZE_LEVEL_9;  // 4MB max for HC
             static const int hcMap[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 8, 12};
-            hcLevel = hcMap[std::min(compressionLevel, 12)];
+            if (hcLevel == 0) {  // only set if not already set by --hc-level
+                hcLevel = hcMap[std::min(compressionLevel, 12)];
+            }
         } else {
-            hcLevel = 0;  // fast LZ4
+            // compressionLevel 1-9: map to chunk sizes
+            // Don't reset hcLevel if it was set by --hc-level
             switch (compressionLevel) {
                 case 1: chunkSize = CHUNK_SIZE_LEVEL_1; break;
                 case 2: chunkSize = CHUNK_SIZE_LEVEL_2; break;
@@ -2343,7 +2347,6 @@ public:
         double cpuReadTime  = asyncReader.getReadTime();
         double cpuWriteTime = asyncWriter.getWriteTime();
 
-        fprintf(stderr, "\n");
         fprintf(stderr, "Compression complete (CPU-only): %.2f MB -> %.2f MB (%.2f%%) in %.2f s\n",
                 fileSize / (1024.0*1024.0), totalBytesWritten / (1024.0*1024.0),
                 ratio, duration.count() / 1000.0);
@@ -2616,6 +2619,7 @@ public:
                     std::vector<std::vector<uint8_t>> cChunks, oChunks;
                     cChunks.reserve(slot.batchSize);
                     oChunks.reserve(slot.batchSize);
+                    
                     for (size_t i = 0; i < slot.batchSize; i++) {
                         size_t outSz  = slot.h_oSizes[i];
                         size_t origSz = slot.origSizes[i];
@@ -2854,7 +2858,6 @@ public:
         double asyncReadTime  = asyncReader.getReadTime();
         double asyncWriteTime = asyncWriter.getWriteTime();
 
-        fprintf(stderr, "\n");
         size_t finalSlots = 0;
         for (auto& gSlots : gpuSlots) finalSlots += gSlots.size();
         fprintf(stderr, "Compression complete (GPU-only, %zu GPU%s / %zu pipeline slots): %.2f MB -> %.2f MB (%.2f%%) in %.2f s\n",
@@ -2901,12 +2904,20 @@ public:
     }
     
     /*
-     * Compress using CPU + GPU simultaneously (hybrid mode, v2).
+     * Compress using CPU + GPU simultaneously (hybrid mode, v3 - GPU priority).
      *
-     * Identical architecture to compressFileGPU() but adds CPU worker threads
-     * that compete for chunks from the same AsyncReader. No ratio/scheduler 
-     * every worker just grabs the next available chunk.  GPUs naturally win
-     * the bulk; CPUs fill gaps during GPU sync waits.
+     * Architecture:
+     *   Dispatcher thread pulls from AsyncReader:
+     *     - Try to push to GPU work queue first (limited capacity)
+     *     - If GPU queue full → push to CPU work queue
+     *   
+     *   GPU workers pull from GPU queue, process batches
+     *   CPU workers pull from CPU queue, process single chunks
+     *   
+     *   Both write directly to AsyncWriter (thread-safe)
+     *
+     * This ensures GPUs always get chunks first; CPUs only work when GPUs
+     * are saturated. As soon as a GPU slot frees up, it pulls the next chunk.
      */
     bool compressFileHybrid() {
         struct stat st;
@@ -2926,7 +2937,7 @@ public:
                 gpus.size(),      gpus.size()==1?"":"s",
                 inputFile.c_str(), outputFile.c_str());
 
-        // ── Reader (reuse pre-warmed early reader if available) ───────────────
+        // ── Reader setup ───────────────────────────────────────────────────────
         size_t totalPipelineSlots = 0;
         for (auto& g : gpus) totalPipelineSlots += g.pipelineDepth;
         size_t estBatch = gpus.empty() ? 64 :
@@ -2948,7 +2959,7 @@ public:
         }
         AsyncReader& asyncReader = *asyncReaderPtr;
 
-        // ── Slot setup (exact copy of compressFileGPU pattern) ────────────────
+        // ── GPU slot setup (same as compressFileGPU) ──────────────────────────
         const size_t SLOT_CAPACITY = slotCapacity;
 
         if (!inputPool.numSlots() && earlyReader.getFileSize() == 0) {
@@ -2981,7 +2992,6 @@ public:
         std::vector<std::vector<PreallocSlot>> gpuSlots(gpus.size());
         std::vector<bool>   gpuInitOk(gpus.size(), true);
 
-        // Lambda to release all slots on error paths
         auto freeAllSlots = [&]() {
             for (auto& gSlots : gpuSlots)
                 for (auto& s : gSlots) s.release();
@@ -3069,9 +3079,34 @@ public:
         std::atomic<bool>   workerAbort{false};
         std::atomic<size_t> gpuChunkCount{0};
         std::atomic<size_t> cpuChunkCount{0};
-        std::atomic<int>    activeWorkers{0};
 
-        // ── GPU worker (exact copy of compressFileGPU worker lambda) ──────────
+        // ── Work queues: GPU priority, CPU fallback ───────────────────────────
+        // GPU queue capacity = total slots * batch size (so all GPU slots can fill)
+        size_t gpuQueueCap = totalPipelineSlots * SLOT_CAPACITY * 2;  // 2x for overlap
+        TsQueue<AsyncReader::ReadChunk> gpuWorkQueue;
+        TsQueue<AsyncReader::ReadChunk> cpuWorkQueue;
+
+        // ── Dispatcher: feeds GPU queue first, CPU queue when GPU saturated ───
+        std::atomic<bool> dispatcherDone{false};
+        std::thread dispatcherThread([&]() {
+            while (true) {
+                AsyncReader::ReadChunk chunk;
+                if (!asyncReader.getChunk(chunk)) break;
+
+                // Try GPU queue first (non-blocking check)
+                if (gpuWorkQueue.size() < gpuQueueCap) {
+                    gpuWorkQueue.push(std::move(chunk));
+                } else {
+                    // GPU queue full, send to CPU
+                    cpuWorkQueue.push(std::move(chunk));
+                }
+            }
+            gpuWorkQueue.close();
+            cpuWorkQueue.close();
+            dispatcherDone.store(true);
+        });
+
+        // ── GPU worker (pulls from GPU queue) ─────────────────────────────────
         auto gpuWorker = [&](size_t gpuIdx) {
             GPUDevice& gpu = gpus[gpuIdx];
             cudaSetDevice(gpu.deviceId);
@@ -3086,7 +3121,7 @@ public:
 
                 cudaStreamSynchronize(slot.stream);
 
-                // Collect and submit previous results from this slot
+                // Collect and submit previous results
                 if (!firstRound && slot.hasPending) {
                     std::vector<std::vector<uint8_t>> cChunks, oChunks;
                     cChunks.reserve(slot.batchSize);
@@ -3095,8 +3130,7 @@ public:
                         size_t outSz  = slot.h_oSizes[i];
                         size_t origSz = slot.origSizes[i];
                         const uint8_t* origPtr = slot.origHandles.size() > i
-                            ? slot.origHandles[i].data
-                            : slot.origData[i].data();
+                            ? slot.origHandles[i].data : slot.origData[i].data();
                         if (forceCompress || outSz < origSz) {
                             std::vector<uint8_t> buf(outSz);
                             memcpy(buf.data(), slot.h_output + i * slot.outStride, outSz);
@@ -3106,8 +3140,7 @@ public:
                         }
                         oChunks.emplace_back(origPtr, origPtr + origSz);
                     }
-                    slot.origHandles.clear();
-                    slot.origData.clear();
+                    slot.origHandles.clear(); slot.origData.clear();
                     asyncWriter.enqueueBatch(cChunks, oChunks, slot.indices, slot.origSizes);
                     gpuChunkCount += slot.batchSize;
                     chunksSubmitted += slot.batchSize;
@@ -3115,7 +3148,7 @@ public:
                 }
                 firstRound = false;
 
-                // Pull chunks from shared reader
+                // Pull chunks from GPU queue
                 slot.indices.clear();
                 slot.origSizes.clear();
                 slot.origData.clear();
@@ -3124,7 +3157,10 @@ public:
 
                 while (slot.batchSize < slot.capacity) {
                     AsyncReader::ReadChunk chunk;
-                    if (!asyncReader.getChunk(chunk)) break;
+                    if (!gpuWorkQueue.pop(chunk, 5)) {  // 5ms timeout
+                        if (gpuWorkQueue.isClosed()) break;
+                        continue;
+                    }
                     cudaMemcpyAsync(
                         slot.d_input + slot.batchSize * slot.chunkStride,
                         chunk.data(), chunk.size,
@@ -3139,14 +3175,13 @@ public:
                     slot.batchSize++;
                 }
 
-                if (slot.batchSize == 0) break;  // reader exhausted
+                if (slot.batchSize == 0) break;  // queue closed and empty
 
-                // Copy input sizes H→D
+                // Launch GPU compression
                 cudaMemcpyAsync(slot.d_iSizes, slot.h_iSizes,
                                 slot.batchSize * sizeof(size_t),
                                 cudaMemcpyHostToDevice, slot.stream);
 
-                // Launch nvCOMP compression
                 nvcompStatus_t nErr = nvcompBatchedLZ4CompressAsync(
                     slot.d_iPtrs, slot.d_iSizes, slot.chunkStride,
                     slot.batchSize, slot.d_temp, slot.tempBytes,
@@ -3156,7 +3191,6 @@ public:
                     workerAbort.store(true); break;
                 }
 
-                // D→H result copies (async, in same stream)
                 cudaMemcpyAsync(slot.h_output, slot.d_output,
                                 slot.batchSize * slot.outStride,
                                 cudaMemcpyDeviceToHost, slot.stream);
@@ -3169,14 +3203,12 @@ public:
                 slot.hasPending = true;
             }
 
-            // Drain remaining in-flight slots
-            for (int si = 0; si < nSlots && !workerAbort.load(); si++) {
+            // Drain remaining slots
+            for (int si = 0; si < nSlots; si++) {
                 PreallocSlot& sl = slots[si];
                 if (!sl.hasPending) continue;
                 cudaStreamSynchronize(sl.stream);
                 std::vector<std::vector<uint8_t>> cChunks, oChunks;
-                cChunks.reserve(sl.batchSize);
-                oChunks.reserve(sl.batchSize);
                 for (size_t i = 0; i < sl.batchSize; i++) {
                     size_t outSz  = sl.h_oSizes[i];
                     size_t origSz = sl.origSizes[i];
@@ -3195,16 +3227,17 @@ public:
                 asyncWriter.enqueueBatch(cChunks, oChunks, sl.indices, sl.origSizes);
                 gpuChunkCount += sl.batchSize;
                 chunksSubmitted += sl.batchSize;
-                sl.hasPending = false;
             }
-            activeWorkers--;
         };
 
-        // ── CPU worker  same reader, LZ4 compress, direct enqueue ───────────
+        // ── CPU worker (pulls from CPU queue) ─────────────────────────────────
         auto cpuWorker = [&]() {
             while (!workerAbort.load()) {
                 AsyncReader::ReadChunk chunk;
-                if (!asyncReader.getChunk(chunk)) break;
+                if (!cpuWorkQueue.pop(chunk, 50)) {  // 50ms timeout
+                    if (cpuWorkQueue.isClosed()) break;
+                    continue;
+                }
 
                 size_t origSz = chunk.size;
                 const uint8_t* src = chunk.data();
@@ -3220,7 +3253,6 @@ public:
                                            (int)origSz, (int)maxOut);
 
                 std::vector<uint8_t> origVec(src, src + origSz);
-
                 std::vector<uint8_t> compVec;
                 if (compSz > 0 && (forceCompress || (size_t)compSz < origSz)) {
                     compressed.resize(compSz);
@@ -3236,11 +3268,9 @@ public:
                 cpuChunkCount++;
                 chunksSubmitted++;
             }
-            activeWorkers--;
         };
 
         // ── Launch all workers ────────────────────────────────────────────────
-        activeWorkers = (int)(gpus.size() + effectiveThreads);
         std::vector<std::thread> allWorkers;
         allWorkers.reserve(gpus.size() + effectiveThreads);
         for (size_t g = 0; g < gpus.size(); g++)
@@ -3248,8 +3278,8 @@ public:
         for (size_t t = 0; t < effectiveThreads; t++)
             allWorkers.emplace_back(cpuWorker);
 
-        // Progress display while workers run
-        while (activeWorkers.load() > 0) {
+        // Progress display
+        while (chunksSubmitted.load() < numChunks) {
             if (g_verbosity < DEBUG && numChunks > 10) {
                 size_t done = asyncWriter.getNextChunkToWrite();
                 fprintf(stderr, "\rProgress: %zu%%  GPU:%zu CPU:%zu  ",
@@ -3259,13 +3289,15 @@ public:
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
+
+        dispatcherThread.join();
         for (auto& t : allWorkers) t.join();
 
         if (g_verbosity < DEBUG && numChunks > 10) fprintf(stderr, "\n");
         VLOG(VERBOSE, "Waiting for async writer to complete...\n");
         asyncWriter.stop();
 
-        // Write end mark and content checksum
+        // Write end mark and checksum
         {
             int fd = open(outputFile.c_str(), O_WRONLY | O_APPEND);
             if (fd >= 0) {
@@ -3310,7 +3342,6 @@ public:
 
         return true;
     }
-    
     /*
      * Decompress a single LZ4 block on GPU using the batched API with batch_size=1.
      *
@@ -4370,6 +4401,47 @@ public:
     }
     
     /*
+     * Pre-process argv to support multi-digit compression level options.
+     * Converts -10, -11, -12 into --hc-level N equivalents since getopt
+     * only supports single-character short options.
+     */
+    void preprocessArgv(int& argc, char**& argv) {
+        static std::vector<char*> newArgv;
+        static std::vector<std::string> allocatedStrings;
+        
+        newArgv.clear();
+        allocatedStrings.clear();
+        newArgv.push_back(argv[0]);  // program name
+        
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+            
+            // Convert -10, -11, -12 to --hc-level N
+            if (arg == "-10") {
+                allocatedStrings.push_back("--hc-level");
+                allocatedStrings.push_back("4");
+                newArgv.push_back(const_cast<char*>(allocatedStrings[allocatedStrings.size()-2].c_str()));
+                newArgv.push_back(const_cast<char*>(allocatedStrings[allocatedStrings.size()-1].c_str()));
+            } else if (arg == "-11") {
+                allocatedStrings.push_back("--hc-level");
+                allocatedStrings.push_back("8");
+                newArgv.push_back(const_cast<char*>(allocatedStrings[allocatedStrings.size()-2].c_str()));
+                newArgv.push_back(const_cast<char*>(allocatedStrings[allocatedStrings.size()-1].c_str()));
+            } else if (arg == "-12") {
+                allocatedStrings.push_back("--hc-level");
+                allocatedStrings.push_back("12");
+                newArgv.push_back(const_cast<char*>(allocatedStrings[allocatedStrings.size()-2].c_str()));
+                newArgv.push_back(const_cast<char*>(allocatedStrings[allocatedStrings.size()-1].c_str()));
+            } else {
+                newArgv.push_back(argv[i]);
+            }
+        }
+        
+        argc = (int)newArgv.size();
+        argv = newArgv.data();
+    }
+    
+    /*
      * Parse command line arguments
      */
     bool parseArguments(int argc, char* argv[]) {
@@ -4399,7 +4471,7 @@ public:
             {"slots-per-gpu", required_argument, nullptr, 1005},  // alternate alias
             {"no-early-read", no_argument, nullptr, 1006},
             {"force-compress", no_argument, nullptr, 'z'},
-            {"hc", required_argument, nullptr, 1007},
+            {"hc-level", required_argument, nullptr, 1007},
             {nullptr, 0, nullptr, 0}
         };
         
@@ -4502,16 +4574,15 @@ public:
                     forceCompress = true;
                     VLOG(DEBUG, "Force compress enabled (always write compressed output)\n");
                     break;
-                case 1007:  // --hc N: explicitly set HC level 1-12
+                case 1007:  // --hc-level N: explicitly set HC level 1-12
                     {
                         char* endptr;
                         long hlv = strtol(optarg, &endptr, 10);
                         if (*endptr != '\0' || hlv < 1 || hlv > 12) {
-                            fprintf(stderr, "Error: --hc level must be 1-12\n");
+                            fprintf(stderr, "Error: --hc-level must be 1-12\n");
                             return false;
                         }
                         hcLevel = (int)hlv;
-                        VLOG(DEBUG, "LZ4 HC level set to %d\n", hcLevel);
                     }
                     break;
                 default:
@@ -4597,18 +4668,23 @@ Options:
   -v                   verbose output (-vv, -vvv for more detail)
 
 Compression levels:
-  -1 .. -9     LZ4 fast compression (default: -9 = 4MB chunks, best fast ratio)
-  --hc N       LZ4 HC (high compression) level 1-12 (slower, better ratio)
-               -10 = --hc 4  |  -11 = --hc 8  |  -12 = --hc 12 (max)
-  Note: GPU path always uses LZ4 fast (nvCOMP limitation).
-        HC levels use CPU workers only, GPU handles fast chunks.
-  -V, --version        display version information and exit
-  -1 .. -9             compression level / chunk size:
+  -1 .. -9             LZ4 fast compression (default: -9 = 4MB chunks)
                          -1: 256 KB chunks  (fastest)
-                         -5: 2 MB chunks    (default)
+                         -5: 2 MB chunks    (default chunk size)
                          -9: 4 MB chunks    (best ratio, LZ4 frame limit)
       --fast           alias for -1
       --best           alias for -9
+  
+  -10, -11, -12        LZ4 HC (high compression) - slower, better ratio
+                         -10: HC level 4   (moderate)
+                         -11: HC level 8   (strong)
+                         -12: HC level 12  (maximum)
+      --hc-level N     Explicit HC level 1-12 (e.g., --hc-level 6)
+
+  Note: GPU path always uses LZ4 fast (nvCOMP limitation).
+        HC levels (-10 to -12 or --hc-level) use CPU workers only.
+  
+  -V, --version        display version information and exit
 
 Backend:
       --cpu-only       multi-threaded CPU (all cores, LZ4_compress_default)
@@ -4718,6 +4794,9 @@ Changelog:
      * Main processing entry point
      */
     bool run(int argc, char* argv[]) {
+        // Pre-process argv to convert -10, -11, -12 into --hc-level N
+        preprocessArgv(argc, argv);
+        
         // Parse command line
         if (!parseArguments(argc, argv)) {
             return false;
