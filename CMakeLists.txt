@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 cmake_minimum_required(VERSION 3.22.1)
 
 project(gzl4 LANGUAGES CXX CUDA)
@@ -21,7 +20,7 @@ if(DEFINED ENV{CONDA_PREFIX})
     message(STATUS "Conda environment detected: ${CONDA_PREFIX}")
     
     # Set nvCOMP paths from conda environment
-    set(NVCOMP_INCLUDE_DIR "${CONDA_PREFIX}/lib/python3.12/site-packages/nvidia/libnvcomp/include")
+    set(NVCOMP_INCLUDE_DIR "${CONDA_PREFIX}/include")
     set(NVCOMP_LIB_DIR "${CONDA_PREFIX}/lib")
     
     message(STATUS "nvCOMP include directory: ${NVCOMP_INCLUDE_DIR}")
@@ -65,6 +64,7 @@ set_property(TARGET gzl4 PROPERTY CUDA_ARCHITECTURES
     86      # Ampere (RTX 3090, RTX 4090)
     89      # Ada Lovelace (RTX 4090)
     90      # Hopper (H100)
+    125
 )
 
 # Include directories
@@ -103,7 +103,6 @@ message(STATUS "CUDA Include Dir: ${CUDAToolkit_INCLUDE_DIRS}")
 message(STATUS "nvCOMP Include Dir: ${NVCOMP_INCLUDE_DIR}")
 message(STATUS "nvCOMP Library: ${NVCOMP_LIBRARY}")
 message(STATUS "Target CUDA Architectures: 60, 75, 80, 86, 89, 90")
-=======
 cmake_minimum_required(VERSION 3.22)
 project(gzl4 LANGUAGES CXX CUDA)
 
@@ -236,7 +235,7 @@ endif()
 # -------------------------------
 # Target
 # -------------------------------
-add_executable(gzl4 gzl4.cpp)
+#add_executable(gzl4 gzl4.cpp)
 
 # CUDA architectures: user-specified or a broad default (Turing->Hopper)
 if(GZL4_CUDA_ARCHS)
@@ -313,6 +312,5 @@ get_property(_arch TARGET gzl4 PROPERTY CUDA_ARCHITECTURES)
 message(STATUS "CUDA Architectures   : ${_arch}")
 message(STATUS "Prefer system CUDA   : ${GZL4_PREFER_SYSTEM_CUDA}")
 message(STATUS "Skip RPATH           : ${GZL4_SKIP_RPATH}")
->>>>>>> d426aca43e0ae86438eb78d25e822e6ae6d39df7
 message(STATUS "===================================")
 message(STATUS "")

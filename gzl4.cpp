@@ -43,7 +43,7 @@
 #include <getopt.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.14.0";
+constexpr const char* VERSION = "3.15.1";
 
 // Compression backend modes
 enum class BackendMode {
@@ -2287,10 +2287,14 @@ public:
             auto compressEnd = std::chrono::high_resolution_clock::now();
             timeCompressing += std::chrono::duration<double>(compressEnd - compressStart).count();
             
-            // Progress
+            // Progress - show bytes processed
             if (g_verbosity < DEBUG && numChunks > 10) {
+                size_t bytesProcessed = nextChunkToWrite * chunkSize;
+                if (bytesProcessed > fileSize) bytesProcessed = fileSize;
                 int progress = (100 * nextChunkToWrite) / numChunks;
-                fprintf(stderr, "\rProgress: %d%%  ", progress);
+                std::string cpuBytes = formatBytes(bytesProcessed);
+                fprintf(stderr, "\rCompressing: %3d%%  CPU: %s%s", 
+                        progress, cpuBytes.c_str(), "          ");  // padding
                 fflush(stderr);
             }
             
@@ -2304,9 +2308,36 @@ public:
             fprintf(stderr, "\n");
         }
         
-        // Wait for writer to finish
-        VLOG(VERBOSE, "Waiting for async writer to complete...\n");
-        asyncWriter.stop();
+        // Wait for writer to finish with progress display
+        {
+            std::atomic<bool> stopProgress{false};
+            std::thread progressThread;
+            if (g_verbosity < DEBUG && numChunks > 10) {
+                progressThread = std::thread([&]() {
+                    while (!stopProgress.load()) {
+                        size_t w = asyncWriter.getNextChunkToWrite();
+                        size_t bytesWritten = w * chunkSize;
+                        if (bytesWritten > fileSize) bytesWritten = fileSize;
+                        std::string written = formatBytes(bytesWritten);
+                        std::string total = formatBytes(fileSize);
+                        fprintf(stderr, "\rWriting: %3d%%  [%s/%s to disk]%s",
+                                (int)(100 * w / numChunks), written.c_str(), total.c_str(),
+                                "          ");
+                        fflush(stderr);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                    }
+                    std::string total = formatBytes(fileSize);
+                    fprintf(stderr, "\rWriting: 100%%  [%s/%s to disk]  \n",
+                            total.c_str(), total.c_str());
+                });
+            }
+            
+            VLOG(VERBOSE, "Waiting for async writer to complete...\n");
+            asyncWriter.stop();
+            
+            stopProgress.store(true);
+            if (progressThread.joinable()) progressThread.join();
+        }
         
         // Write footer
         outputFd = open(outputFile.c_str(), O_WRONLY | O_APPEND);
@@ -2347,9 +2378,10 @@ public:
         double cpuReadTime  = asyncReader.getReadTime();
         double cpuWriteTime = asyncWriter.getWriteTime();
 
-        fprintf(stderr, "Compression complete (CPU-only): %.2f MB -> %.2f MB (%.2f%%) in %.2f s\n",
-                fileSize / (1024.0*1024.0), totalBytesWritten / (1024.0*1024.0),
-                ratio, duration.count() / 1000.0);
+        std::string inputSize = formatBytes(fileSize);
+        std::string outputSize = formatBytes((size_t)totalBytesWritten);
+        fprintf(stderr, "Compression complete (CPU-only): %s -> %s (%.2f%%) in %.2f s\n",
+                inputSize.c_str(), outputSize.c_str(), ratio, duration.count() / 1000.0);
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
         VLOG(VERBOSE, "  Read:    %.2f s  |  CPU compress (%zu threads): %.2f s  |  Write: %.2f s\n",
              cpuReadTime, effectiveThreads, timeCompressing, cpuWriteTime);
@@ -2762,11 +2794,12 @@ public:
         while (activeWorkers.load() > 0) {
             if (g_verbosity < DEBUG && numChunks > 10) {
                 size_t submitted = chunksSubmitted.load();
-                size_t written   = asyncWriter.getNextChunkToWrite();
-                fprintf(stderr, "\rCompressing: GPU %3d%%  Writer %3d%%  [%zu batches]  ",
-                        (int)(100 * submitted / numChunks),
-                        (int)(100 * written   / numChunks),
-                        batchesLaunched.load());
+                size_t bytesProcessed = submitted * chunkSize;
+                if (bytesProcessed > fileSize) bytesProcessed = fileSize;
+                int progress = (int)(100 * submitted / numChunks);
+                std::string gpuBytes = formatBytes(bytesProcessed);
+                fprintf(stderr, "\rCompressing: %3d%%  GPU: %s%s", 
+                        progress, gpuBytes.c_str(), "          ");
                 fflush(stderr);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -2787,15 +2820,20 @@ public:
                 progressThread = std::thread([&]() {
                     while (!stopProgress.load()) {
                         size_t w = asyncWriter.getNextChunkToWrite();
-                        fprintf(stderr, "\rWriting: %d%%  [%zu/%zu chunks to disk]  ",
-                                (int)(100 * w / numChunks), w, numChunks);
+                        size_t bytesWritten = w * chunkSize;
+                        if (bytesWritten > fileSize) bytesWritten = fileSize;
+                        std::string written = formatBytes(bytesWritten);
+                        std::string total = formatBytes(fileSize);
+                        fprintf(stderr, "\rWriting: %3d%%  [%s/%s to disk]%s",
+                                (int)(100 * w / numChunks), written.c_str(), total.c_str(),
+                                "          ");
                         fflush(stderr);
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                     }
                     // Final update
-                    size_t w = asyncWriter.getNextChunkToWrite();
-                    fprintf(stderr, "\rWriting: 100%%  [%zu/%zu chunks to disk]  \n",
-                            w, numChunks);
+                    std::string total = formatBytes(fileSize);
+                    fprintf(stderr, "\rWriting: 100%%  [%s/%s to disk]  \n",
+                            total.c_str(), total.c_str());
                 });
             }
 
@@ -2860,10 +2898,11 @@ public:
 
         size_t finalSlots = 0;
         for (auto& gSlots : gpuSlots) finalSlots += gSlots.size();
-        fprintf(stderr, "Compression complete (GPU-only, %zu GPU%s / %zu pipeline slots): %.2f MB -> %.2f MB (%.2f%%) in %.2f s\n",
+        std::string inputSize = formatBytes(fileSize);
+        std::string outputSize = formatBytes((size_t)totalBytesWritten);
+        fprintf(stderr, "Compression complete (GPU-only, %zu GPU%s / %zu pipeline slots): %s -> %s (%.2f%%) in %.2f s\n",
                 gpus.size(), gpus.size() == 1 ? "" : "s", finalSlots,
-                fileSize / (1024.0*1024.0), totalBytesWritten / (1024.0*1024.0),
-                ratio, duration.count() / 1000.0);
+                inputSize.c_str(), outputSize.c_str(), ratio, duration.count() / 1000.0);
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
         VLOG(VERBOSE, "  Read: %.2f s  |  Write: %.2f s\n",
              asyncReadTime, asyncWriteTime);
@@ -3282,9 +3321,15 @@ public:
         while (chunksSubmitted.load() < numChunks) {
             if (g_verbosity < DEBUG && numChunks > 10) {
                 size_t done = asyncWriter.getNextChunkToWrite();
-                fprintf(stderr, "\rProgress: %zu%%  GPU:%zu CPU:%zu  ",
+                size_t gpuChunks = gpuChunkCount.load();
+                size_t cpuChunks = cpuChunkCount.load();
+                size_t gpuBytes = gpuChunks * chunkSize;
+                size_t cpuBytes = cpuChunks * chunkSize;
+                std::string gpuStr = formatBytes(gpuBytes);
+                std::string cpuStr = formatBytes(cpuBytes);
+                fprintf(stderr, "\rCompressing: %3zu%%  GPU: %s  CPU: %s%s",
                         (100 * done) / numChunks,
-                        gpuChunkCount.load(), cpuChunkCount.load());
+                        gpuStr.c_str(), cpuStr.c_str(), "          ");
                 fflush(stderr);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -3294,8 +3339,37 @@ public:
         for (auto& t : allWorkers) t.join();
 
         if (g_verbosity < DEBUG && numChunks > 10) fprintf(stderr, "\n");
-        VLOG(VERBOSE, "Waiting for async writer to complete...\n");
-        asyncWriter.stop();
+        
+        // Wait for writer to finish with progress display
+        {
+            std::atomic<bool> stopProgress{false};
+            std::thread progressThread;
+            if (g_verbosity < DEBUG && numChunks > 10) {
+                progressThread = std::thread([&]() {
+                    while (!stopProgress.load()) {
+                        size_t w = asyncWriter.getNextChunkToWrite();
+                        size_t bytesWritten = w * chunkSize;
+                        if (bytesWritten > fileSize) bytesWritten = fileSize;
+                        std::string written = formatBytes(bytesWritten);
+                        std::string total = formatBytes(fileSize);
+                        fprintf(stderr, "\rWriting: %3d%%  [%s/%s to disk]%s",
+                                (int)(100 * w / numChunks), written.c_str(), total.c_str(),
+                                "          ");
+                        fflush(stderr);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                    }
+                    std::string total = formatBytes(fileSize);
+                    fprintf(stderr, "\rWriting: 100%%  [%s/%s to disk]  \n",
+                            total.c_str(), total.c_str());
+                });
+            }
+            
+            VLOG(VERBOSE, "Waiting for async writer to complete...\n");
+            asyncWriter.stop();
+            
+            stopProgress.store(true);
+            if (progressThread.joinable()) progressThread.join();
+        }
 
         // Write end mark and checksum
         {
@@ -3322,11 +3396,13 @@ public:
         double bw = asyncWriter.getBytesWritten();
         double mbps = (fileSize/(1024.0*1024.0)) / (duration.count()/1000.0);
 
+        std::string inputSize = formatBytes(fileSize);
+        std::string outputSize = formatBytes((size_t)bw);
         fprintf(stderr, "Compression complete (Hybrid, %zu thread%s + %zu GPU%s): "
-                "%.2f MB -> %.2f MB (%.2f%%) in %.2f s\n",
+                "%s -> %s (%.2f%%) in %.2f s\n",
                 effectiveThreads, effectiveThreads==1?"":"s",
                 gpus.size(),      gpus.size()==1?"":"s",
-                fileSize/(1024.0*1024.0), bw/(1024.0*1024.0),
+                inputSize.c_str(), outputSize.c_str(),
                 100.0*bw/fileSize, duration.count()/1000.0);
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
         VLOG(VERBOSE, "  GPU: %zu chunks (%.1f%%)  CPU: %zu chunks (%.1f%%)\n",
@@ -3807,10 +3883,11 @@ public:
                  gpuBlocks.load(), cpuFallbackBlocks.load());
         } else {
             double mbps = (totalBytesWritten / (1024.0*1024.0)) / (duration.count() / 1000.0);
+            std::string outputSize = formatBytes(totalBytesWritten);
             fprintf(stderr, "Decompression complete (GPU+fallback, %zu GPU%s): "
-                    "%.2f MB in %.2f s\n",
+                    "%s in %.2f s\n",
                     gpus.size(), gpus.size() == 1 ? "" : "s",
-                    totalBytesWritten / (1024.0*1024.0), duration.count() / 1000.0);
+                    outputSize.c_str(), duration.count() / 1000.0);
             VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
             VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
                  gpuBlocks.load(), cpuFallbackBlocks.load(),
@@ -4092,10 +4169,11 @@ public:
             VLOG(VERBOSE, "  %.2f MB in %.2f s  (%.2f MB/s)\n",
                  totalBytesWritten/(1024.0*1024.0), duration.count()/1000.0, mbps);
         } else {
+            std::string outputSize = formatBytes(totalBytesWritten);
             fprintf(stderr, "Decompression complete (hybrid, %zu GPU%s): "
-                    "%.2f MB in %.2f s\n",
+                    "%s in %.2f s\n",
                     gpus.size(), gpus.size()==1?"":"s",
-                    totalBytesWritten/(1024.0*1024.0), duration.count()/1000.0);
+                    outputSize.c_str(), duration.count()/1000.0);
             VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
             VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
                  gpuBlocks.load(), cpuBlocks.load(),
@@ -4356,8 +4434,10 @@ public:
 
                 if (g_verbosity < DEBUG && estimatedBlocks > 10) {
                     size_t denom = std::max(estimatedBlocks, nextBlockToWrite);
-                    fprintf(stderr, "\rProgress: %zu%%  ",
-                            (100 * nextBlockToWrite) / denom);
+                    std::string written = formatBytes(totalBytesWritten);
+                    fprintf(stderr, "\rDecompressing: %3zu%%  %s%s",
+                            (100 * nextBlockToWrite) / denom, written.c_str(),
+                            "          ");
                     fflush(stderr);
                 }
                 lk.lock();
@@ -4390,11 +4470,12 @@ public:
 
         if (ok) {
             uint32_t checksum = xxhState.digest();
-            double mb = totalBytesWritten.load() / (1024.0*1024.0);
+            std::string outputSize = formatBytes(totalBytesWritten.load());
             fprintf(stderr, "\n");
-            fprintf(stderr, "Decompression complete (CPU, %zu thread%s): %.2f MB in %.2f s\n",
-                    numWorkers, numWorkers==1?"":"s", mb, elapsed);
-            VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mb / elapsed);
+            fprintf(stderr, "Decompression complete (CPU, %zu thread%s): %s in %.2f s\n",
+                    numWorkers, numWorkers==1?"":"s", outputSize.c_str(), elapsed);
+            VLOG(VERBOSE, "Throughput: %.2f MB/s\n", 
+                 (totalBytesWritten.load() / (1024.0*1024.0)) / elapsed);
             VLOG(VERBOSE, "  Checksum: 0x%08X\n", checksum);
         }
         return ok;
@@ -4441,6 +4522,33 @@ public:
         argv = newArgv.data();
     }
     
+    /*
+     * Format bytes as human-readable string (like ls -h)
+     * Returns: "123 B", "45.2 KB", "3.7 MB", "1.2 GB", etc.
+     */
+    static std::string formatBytes(size_t bytes) {
+        const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+        int unitIdx = 0;
+        double size = (double)bytes;
+        
+        while (size >= 1024.0 && unitIdx < 4) {
+            size /= 1024.0;
+            unitIdx++;
+        }
+        
+        char buf[32];
+        if (unitIdx == 0) {
+            snprintf(buf, sizeof(buf), "%zu B", bytes);
+        } else if (size >= 100.0) {
+            snprintf(buf, sizeof(buf), "%.0f %s", size, units[unitIdx]);
+        } else if (size >= 10.0) {
+            snprintf(buf, sizeof(buf), "%.1f %s", size, units[unitIdx]);
+        } else {
+            snprintf(buf, sizeof(buf), "%.2f %s", size, units[unitIdx]);
+        }
+        return std::string(buf);
+    }
+
     /*
      * Parse command line arguments
      */
@@ -4751,38 +4859,76 @@ Pipe examples:
 Built with nvCOMP 5.1.x, CUDA 12.8, liblz4
 
 Compression backends:
-  cpu-only  Multi-threaded LZ4_compress_default; async I/O pipeline;
-            posix_fadvise readahead; auto thread count (cap 64 by default)
-  gpu-only  nvCOMP batched LZ4; dynamic stream scaling (128-1024/GPU);
-            async reader/writer overlap I/O with GPU compute
-  hybrid    CPU + GPU simultaneously; dynamic load balancing adjusts
-            CPU/GPU ratio every 5 s based on measured throughput
+  cpu-only  Multi-threaded LZ4_compress_default/HC; async I/O pipeline;
+            posix_fadvise readahead; LZ4 HC levels 1-12 support (-10/-11/-12)
+  gpu-only  nvCOMP batched LZ4 fast; per-GPU worker threads with slot rotation;
+            pinned memory pool for zero-copy DMA; configurable batch size/streams;
+            async reader/writer overlap I/O with GPU compute (600+ MB/s)
+  hybrid    GPU-priority scheduler: dispatcher feeds GPU queue first, CPU queue
+            when GPUs saturated; GPUs handle 70-90% of chunks, CPUs fill gaps;
+            all workers submit directly to thread-safe AsyncWriter
 
-Decompression (all modes):
-  Multi-threaded LZ4_decompress_safe with dedicated reader thread,
-  parallel worker pool, and in-order sequential writer.
+Decompression:
+  Hybrid GPU + CPU: nvCOMP batched API attempts each block; Error 12 triggers
+  automatic CPU fallback via LZ4_decompress_safe. Handles mixed-format files
+  (GPU-compressed + CPU-compressed blocks). Reports GPU/CPU block counts.
   Uncompressed blocks bypass workers (zero-copy fast path).
-  Handles output from all three compression modes correctly.
+  Multi-threaded with parallel worker pool and sequential writer.
+
+Compression levels:
+  -1 to -9:    LZ4 fast (chunk size: 256KB to 4MB, GPU + CPU compatible)
+  -10/-11/-12: LZ4 HC levels 4/8/12 (CPU-only, slower, better compression)
+  --hc-level:  Explicit HC level 1-12 (e.g., --hc-level 6 for custom level)
 
 Architecture:
-  3-stage pipeline:  AsyncReader -> compress workers -> AsyncWriter
+  3-stage pipeline:  AsyncReader -> workers (GPU/CPU) -> AsyncWriter
+  - AsyncReader: Pre-reads entire file during GPU init (overlaps 3s CUDA setup)
+  - PinnedInputPool: Zero-copy DMA transfers to GPU (7GB pool, 64+ slots)
+  - GPU workers: Per-GPU thread with slot rotation (pipeline depth configurable)
+  - CPU workers: Thread pool pulls from work queue (default: all hardware threads)
+  - AsyncWriter: Thread-safe out-of-order completion with sequential reordering
+  
   posix_fadvise(SEQUENTIAL|WILLNEED) on all input file descriptors
-  Out-of-order completion with sequential write reordering
-  GPU stream scaling keeps utilization at 85-95%
-  Standard LZ4 frame format; backward compatible with lz4 tool
+  GPU stream scaling optimized at pipeline depth=1 (601 MB/s vs 558 MB/s @ 4)
+  Standard LZ4 frame format; backward compatible with lz4 command-line tool
+
+Pipes and special modes:
+  stdin/stdout:  Use "-" or auto-detect via isatty() checks
+  -t (test):     Verify integrity without writing (never requires -f)
+  -z (force):    Always write compressed data (Note: may not reduce size on
+                 random/incompressible data; lz4 tool shows same behavior)
 
 Changelog:
-  v3.8.0  Unified output across all modes; fadvise on all code paths;
-          decompression reader thread + parallel worker pool;
-          uncompressed-block zero-copy fast path in decompressor;
-          Progress lines padded to prevent collision with error text
-  v3.7.x  Hybrid stall fix (per-chunk GPU batch entries);
-          CPU decompressor replaces GPU decompressor (handles mixed-
-          format blocks from hybrid files); LZ4 header seek fix
-  v3.7.0  CPU-only mode: thread pool, async I/O, configurable threads;
-          Hybrid mode: CPU+GPU simultaneous compression
-  v3.6.0  Parallel decompression; direct I/O syscalls; multi-GPU batches
-  v3.5.0  Dynamic stream scaling (128->1024/GPU); test mode (-t)
+  v3.14.0  Hybrid mode v3: GPU-priority dispatcher; separate GPU/CPU work queues;
+           GPUs get chunks first, CPUs only when GPUs saturated; all workers
+           submit directly to thread-safe AsyncWriter (no central coordinator)
+  v3.13.x  HC compression levels: -10/-11/-12 support via argv preprocessor;
+           --hc-level 1-12 for explicit control; fixed hcLevel reset bug;
+           removed duplicate help text; cleaned up output formatting
+  v3.12.x  Hybrid rewrite: unified worker model (same slot machinery as gpu-only);
+           removed old scheduler-based architecture; direct writer submission
+  v3.11.x  GPU decompression via nvCOMP batched API (batch_size=1 for single blocks);
+           hybrid decompression with automatic CPU fallback on Error 12;
+           pipe support (stdin/stdout via "-"); output message standardization;
+           actualSize parameter fix; checksum seek position fix
+  v3.10.x  Command-line tuning params: --batch-size (chunks/batch, default 8);
+           --streams-per-gpu (pipeline depth, optimal=1); performance testing
+           optimal config: cap=8, depth=1, 601 MB/s on 8GB test file
+  v3.9.x   GPU worker threads with per-slot rotation; parallel slot initialization;
+           early reader startup (overlap with GPU init); writer greedy drain;
+           PinnedInputPool for zero-copy DMA; double-read deadlock fix
+  v3.8.0   Unified output across all modes; fadvise on all code paths;
+           decompression reader thread + parallel worker pool;
+           uncompressed-block zero-copy fast path in decompressor;
+           progress lines padded to prevent collision with error text
+  v3.7.x   Hybrid stall fix (per-chunk GPU batch entries);
+           CPU decompressor replaces GPU decompressor (handles mixed-format
+           blocks from hybrid files); LZ4 header seek fix
+  v3.7.0   CPU-only mode: thread pool, async I/O, configurable threads;
+           hybrid mode: CPU+GPU simultaneous compression
+  v3.6.0   Parallel decompression; direct I/O syscalls; multi-GPU batches
+  v3.5.0   Dynamic stream scaling (128->1024/GPU); test mode (-t)
+
   v3.4.0  Out-of-order async writer
   v3.3.0  Async reader with posix_fadvise readahead
   v3.2.0  Async writer thread
