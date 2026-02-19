@@ -43,7 +43,7 @@
 #include <getopt.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.16.2";
+constexpr const char* VERSION = "3.16.4";
 
 // Compression backend modes
 enum class BackendMode {
@@ -3607,10 +3607,9 @@ public:
      * LZ4_decompress_safe() automatically (Error 12 triggers the fallback).
      */
     bool decompressFileGPU() {
-        fprintf(stderr, "Decompressing%s (GPU+fallback, %zu GPU%s): %s -> %s\n",
-                testMode ? " (test)" : "",
+        fprintf(stderr, "Decompressing (GPU+fallback, %zu GPU%s): %s -> %s\n",
                 gpus.size(), gpus.size() == 1 ? "" : "s",
-                inputFile.c_str(), testMode ? "/dev/null" : outputFile.c_str());
+                inputFile.c_str(), outputFile.c_str());
         
         
         // Open input file with direct I/O
@@ -3868,8 +3867,10 @@ public:
             // Progress display
             if (g_verbosity < DEBUG && estimatedBlocks > 10) {
                 size_t pct = nextBlockToRead * 100 / estimatedBlocks;
-                fprintf(stderr, "\rDecompressing: %3zu%%  [%zu/%zu blocks]  ",
-                        pct, nextBlockToRead, estimatedBlocks);
+                std::string written = formatBytes(totalBytesWritten);
+                fprintf(stderr, "\rDecompressing%s: %3zu%%  %s%s",
+                        testMode ? " (test)" : "",
+                        pct, written.c_str(), "          ");
                 fflush(stderr);
             }
         }
@@ -3926,10 +3927,18 @@ public:
             struct stat st;
             size_t compressedSize = (stat(inputFile.c_str(), &st) == 0) ? st.st_size : 0;
             double ratio = compressedSize > 0 ? (100.0 * compressedSize / totalBytesWritten) : 0.0;
+            std::string outputSize = formatBytes(totalBytesWritten);
+            
+            // Overwrite progress line with completion message
+            fprintf(stderr, "\rDecompression (test) complete (GPU+fallback, %zu GPU%s): %s in %.2f s%s\n",
+                    gpus.size(), gpus.size() == 1 ? "" : "s",
+                    outputSize.c_str(), duration.count() / 1000.0,
+                    "          ");  // Clear any progress debris
+            
             if (checksumOk) {
-                fprintf(stderr, "\nTest OK: %s\n", inputFile.c_str());
+                fprintf(stderr, "Test OK: %s\n", inputFile.c_str());
             } else {
-                fprintf(stderr, "\nTest FAILED: %s (checksum mismatch)\n", inputFile.c_str());
+                fprintf(stderr, "Test FAILED: %s (checksum mismatch)\n", inputFile.c_str());
             }
             VLOG(VERBOSE, "  Compressed:   %.2f MB\n", compressedSize / (1024.0*1024.0));
             VLOG(VERBOSE, "  Uncompressed: %.2f MB  (ratio %.2f%%)\n",
@@ -3942,10 +3951,11 @@ public:
         } else {
             double mbps = (totalBytesWritten / (1024.0*1024.0)) / (duration.count() / 1000.0);
             std::string outputSize = formatBytes(totalBytesWritten);
-            fprintf(stderr, "Decompression complete (GPU+fallback, %zu GPU%s): "
-                    "%s in %.2f s\n",
+            fprintf(stderr, "\rDecompression complete (GPU+fallback, %zu GPU%s): "
+                    "%s in %.2f s%s\n",
                     gpus.size(), gpus.size() == 1 ? "" : "s",
-                    outputSize.c_str(), duration.count() / 1000.0);
+                    outputSize.c_str(), duration.count() / 1000.0,
+                    "          ");  // Clear any progress debris
             VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
             VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
                  gpuBlocks.load(), cpuFallbackBlocks.load(),
@@ -4040,10 +4050,9 @@ public:
         size_t chunkSize        = static_cast<size_t>(1) << (8 + 2 * desc.blockMaxSize);
         size_t estimatedBlocks  = (originalFileSize + chunkSize - 1) / chunkSize;
 
-        fprintf(stderr, "Decompressing%s (hybrid, %zu GPU%s + CPU): %s -> %s\n",
-                testMode ? " (test)" : "",
+        fprintf(stderr, "Decompressing (hybrid, %zu GPU%s + CPU): %s -> %s\n",
                 gpus.size(), gpus.size() == 1 ? "" : "s",
-                inputFile.c_str(), testMode ? "/dev/null" : outputFile.c_str());
+                inputFile.c_str(), outputFile.c_str());
         VLOG(VERBOSE, "  %.2f MB  |  block size %zu KB  |  ~%zu blocks\n",
              originalFileSize / (1024.0*1024.0), chunkSize/1024, estimatedBlocks);
 
@@ -4174,10 +4183,11 @@ public:
             }
 
             if (g_verbosity < DEBUG && estimatedBlocks > 10) {
-                fprintf(stderr, "\rDecompressing: %3zu%%  [%zu/%zu]  GPU:%zu CPU:%zu  ",
+                std::string written = formatBytes(totalBytesWritten);
+                fprintf(stderr, "\rDecompressing%s: %3zu%%  %s%s",
+                        testMode ? " (test)" : "",
                         nextBlockToRead * 100 / estimatedBlocks,
-                        nextBlockToRead, estimatedBlocks,
-                        gpuBlocks.load(), cpuBlocks.load());
+                        written.c_str(), "          ");
                 fflush(stderr);
             }
         }
@@ -4221,17 +4231,25 @@ public:
         if (outputFd >= 0 && outputFd != STDOUT_FILENO) { fsync(outputFd); close(outputFd); }
 
         double mbps = (totalBytesWritten/(1024.0*1024.0)) / (duration.count()/1000.0);
+        std::string outputSize = formatBytes(totalBytesWritten);
+        
         if (testMode) {
-            fprintf(stderr, csOk ? "\nTest OK: %s\n" : "\nTest FAILED: %s (checksum mismatch)\n",
+            // Overwrite progress line with completion message
+            fprintf(stderr, "\rDecompression (test) complete (hybrid, %zu GPU%s): %s in %.2f s%s\n",
+                    gpus.size(), gpus.size()==1?"":"s",
+                    outputSize.c_str(), duration.count()/1000.0,
+                    "          ");  // Clear any progress debris
+            
+            fprintf(stderr, csOk ? "Test OK: %s\n" : "Test FAILED: %s (checksum mismatch)\n",
                     inputFile.c_str());
             VLOG(VERBOSE, "  %.2f MB in %.2f s  (%.2f MB/s)\n",
                  totalBytesWritten/(1024.0*1024.0), duration.count()/1000.0, mbps);
         } else {
-            std::string outputSize = formatBytes(totalBytesWritten);
-            fprintf(stderr, "Decompression complete (hybrid, %zu GPU%s): "
-                    "%s in %.2f s\n",
+            fprintf(stderr, "\rDecompression complete (hybrid, %zu GPU%s): "
+                    "%s in %.2f s%s\n",
                     gpus.size(), gpus.size()==1?"":"s",
-                    outputSize.c_str(), duration.count()/1000.0);
+                    outputSize.c_str(), duration.count()/1000.0,
+                    "          ");  // Clear any progress debris
             VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
             VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
                  gpuBlocks.load(), cpuBlocks.load(),
@@ -4493,7 +4511,8 @@ public:
                 if (g_verbosity < DEBUG && estimatedBlocks > 10) {
                     size_t denom = std::max(estimatedBlocks, nextBlockToWrite);
                     std::string written = formatBytes(totalBytesWritten);
-                    fprintf(stderr, "\rDecompressing: %3zu%%  %s%s",
+                    fprintf(stderr, "\rDecompressing%s: %3zu%%  %s%s",
+                            testMode ? " (test)" : "",
                             (100 * nextBlockToWrite) / denom, written.c_str(),
                             "          ");
                     fflush(stderr);
@@ -4519,7 +4538,6 @@ public:
         readerThread.join();
         for (auto& w : workers) w.join();
 
-        if (g_verbosity < DEBUG) fprintf(stderr, "\n");
         close(inputFd);
         if (outputFd >= 0) { fsync(outputFd); close(outputFd); }
 
@@ -4529,9 +4547,17 @@ public:
         if (ok) {
             uint32_t checksum = xxhState.digest();
             std::string outputSize = formatBytes(totalBytesWritten.load());
-            fprintf(stderr, "\n");
-            fprintf(stderr, "Decompression complete (CPU, %zu thread%s): %s in %.2f s\n",
-                    numWorkers, numWorkers==1?"":"s", outputSize.c_str(), elapsed);
+            
+            // Overwrite progress line with completion message
+            fprintf(stderr, "\rDecompression%s complete (CPU, %zu thread%s): %s in %.2f s%s\n",
+                    testMode ? " (test)" : "",
+                    numWorkers, numWorkers==1?"":"s", outputSize.c_str(), elapsed,
+                    "          ");  // Clear any progress debris
+            
+            if (testMode) {
+                fprintf(stderr, "Test OK: %s\n", inputFile.c_str());
+            }
+            
             VLOG(VERBOSE, "Throughput: %.2f MB/s\n", 
                  (totalBytesWritten.load() / (1024.0*1024.0)) / elapsed);
             VLOG(VERBOSE, "  Checksum: 0x%08X\n", checksum);
@@ -4964,6 +4990,13 @@ Pipes and special modes:
                  random/incompressible data; lz4 tool shows same behavior)
 
 Changelog:
+  v3.16.4  REFINED TEST MODE OUTPUT: Removed "Testing: <filename>" start line; progress
+           and completion messages now show "Decompressing (test):" when in test mode;
+           cleaner, more consistent output across all decompression modes
+  v3.16.3  UNIFIED DECOMPRESSION OUTPUT: All decompression modes now show consistent output;
+           progress displays human-readable bytes instead of blocks; completion message
+           overwrites progress line using \r; test mode shows "Test OK: filename" on new
+           line after completion; removed "-> /dev/null" clutter from test mode output
   v3.16.2  INTELLIGENT AUTO-TUNING: Batch size and stream count now auto-tune based on
            GPU count; single GPU uses batch=64, streams=4 (RTX 5090: 1208 MB/s); 5+ GPUs
            use batch=4, streams=3 (prevents PCIe flooding on multi-GPU); empirical tuning
