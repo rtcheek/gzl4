@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.19.0";
+constexpr const char* VERSION = "3.19.2";
 
 // Compression backend modes
 enum class BackendMode {
@@ -70,11 +70,11 @@ constexpr size_t CHUNK_SIZE_LEVEL_1 = 256 * 1024;       // 256KB (was 16KB)
 constexpr size_t CHUNK_SIZE_LEVEL_2 = 512 * 1024;       // 512KB (was 32KB)
 constexpr size_t CHUNK_SIZE_LEVEL_3 = 1 * 1024 * 1024;  // 1MB (was 64KB)
 constexpr size_t CHUNK_SIZE_LEVEL_4 = 2 * 1024 * 1024;  // 2MB (was 128KB)
-constexpr size_t CHUNK_SIZE_LEVEL_5 = 2 * 1024 * 1024;  // 2MB (was 256KB, now default)
+constexpr size_t CHUNK_SIZE_LEVEL_5 = 2 * 1024 * 1024;  // 2MB (was 256KB)
 constexpr size_t CHUNK_SIZE_LEVEL_6 = 3 * 1024 * 1024;  // 3MB (was 512KB)
 constexpr size_t CHUNK_SIZE_LEVEL_7 = 3 * 1024 * 1024 + 512 * 1024;  // 3.5MB (was 1MB)
 constexpr size_t CHUNK_SIZE_LEVEL_8 = 4 * 1024 * 1024;  // 4MB (was 2MB)
-constexpr size_t CHUNK_SIZE_LEVEL_9 = 4 * 1024 * 1024;  // 4MB (max for LZ4)
+constexpr size_t CHUNK_SIZE_LEVEL_9 = 4 * 1024 * 1024;  // 4MB (max for LZ4, now default)
 
 // Verbosity levels - unified system
 enum VerbosityLevel {
@@ -1427,6 +1427,7 @@ private:
     
     // Signal handler for cleanup
     static void signalHandler(int signum) {
+        (void)signum;  // Suppress unused parameter warning
         if (g_instance && !g_instance->tempOutputFile.empty()) {
             fprintf(stderr, "\nInterrupted - cleaning up temporary file...\n");
             unlink(g_instance->tempOutputFile.c_str());
@@ -2396,10 +2397,9 @@ public:
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
         }
-        
-        if (g_verbosity == NORMAL && numChunks > 10) {
-            fprintf(stderr, "\n");
-        }
+
+// Commenting out the following line to allow the writer to overwrite the compression progress.	
+//        if (g_verbosity == NORMAL && numChunks > 10) { fprintf(stderr, "\n"); }
         
         // Wait for writer to finish with progress display
         {
@@ -2984,10 +2984,9 @@ public:
         
         auto endTime = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-        
-        if (g_verbosity == NORMAL && numChunks > 10) {
-            fprintf(stderr, "\n");
-        }
+
+// Avoiding the extra blank line before Compression complete output by comentting the following line.	
+//        if (g_verbosity == NORMAL && numChunks > 10) { fprintf(stderr, "\n"); }
         
         // Stop async reader
         asyncReader.stop();
@@ -3441,7 +3440,8 @@ public:
         dispatcherThread.join();
         for (auto& t : allWorkers) t.join();
 
-        if (g_verbosity == NORMAL && numChunks > 10) fprintf(stderr, "\n");
+// Removing this to allow the writer to overwrite the Compression progress line.
+//        if (g_verbosity == NORMAL && numChunks > 10) fprintf(stderr, "\n");
         
         // Wait for writer to finish with progress display
         {
@@ -4755,7 +4755,7 @@ public:
                     g_verbosity++;
                     break;
                 case 'V':
-                    printShortVersion();
+                    printVersion();
                     return false;
                 case 'T':
                     {
@@ -4947,8 +4947,9 @@ Common options:
   -q            quiet mode
   -t            test integrity
   -v            verbose (-vv, -vvv for more)
-  -z            force compression mode
+  -z            force compression (even if .lz4)
   -1 to -9      compression level (default: -9)
+  -10 to -12    LZ4 High Compression (CPUs only)
   -V            show version (use --version for full details)
 
 Program name behavior:
@@ -4971,7 +4972,8 @@ For complete documentation, use --help
      * Print full help message (--help)
      */
     void printHelp() {
-        std::cout << "gzl4 " << VERSION << R"( - Multi-Backend LZ4 Compression Tool
+        std::cout << "gzl4 " << VERSION << 
+            R"( - Multi-Backend (GPU, CPU, and Hybrid) LZ4 Compression Tool
 
 Usage: gzl4 [OPTION]... [FILE]
 
@@ -4983,13 +4985,15 @@ Options:
       --help           display this complete help and exit
   -k, --keep           keep (don't delete) input files
   -q, --quiet          quiet mode: only errors are output (verbosity level 0)
-  -t, --test           test compressed file integrity (never requires -f)
-  -z, --force-compress force compression mode (ignore .lz4 extension auto-detection)
-                       Note: gzl4 auto-detects decompression when input ends with .lz4
+  -t, --test           test compressed file integrity
+  -z, --force-compress force compression mode (ignore .lz4 auto-detection)
+                       Note: gzl4 auto-detects decompression for .lz4 files
                        Use -z to compress .lz4 files (creates .lz4.lz4)
   -T N, --threads N    CPU thread count (default: auto-detect all cores)
-  -v                   verbose output: -v (level 2), -vv (level 3), -vvv (level 4/debug)
-                       Default is level 1 (progress and completion messages)
+		       only relevant with CPU and Hybrid backend selection.
+  -v                   verbose output: -v (level 2), -vv (level 3),
+                                       -vvv (level 4/debug)
+                       Default is level 1 (progress + completion messages)
 
 Compression levels:
   -1 .. -9             LZ4 fast compression (default: -9 = 4MB chunks)
@@ -5000,137 +5004,93 @@ Compression levels:
       --best           alias for -9
   
   -10, -11, -12        LZ4 HC (high compression) - slower, better ratio
+		       Supported only on CPU. If run in --hybrid mode,
+		       chunks handled by GPU use LZ4 fast compression
                          -10: HC level 4   (moderate)
                          -11: HC level 8   (strong)
                          -12: HC level 12  (maximum)
       --hc-level N     Explicit HC level 1-12 (e.g., --hc-level 6)
 
-  Note: GPU path always uses LZ4 fast (nvCOMP limitation).
+  Note: GPU backend always uses LZ4 fast compression (nvCOMP limitation).
         HC levels (-10 to -12 or --hc-level) use CPU workers only.
   
   -V, --version        display version information and exit
 
-Backend:
+Backend Selection:
       --cpu-only       multi-threaded CPU (all cores, LZ4_compress_default)
       --gpu-only       GPU-only via nvCOMP batched LZ4
-      --hybrid         CPU + GPU simultaneously with dynamic load balancing (DEFAULT)
+      --hybrid         GPU + CPU with dynamic load balancing (DEFAULT)
 
 GPU Tuning (for --gpu-only and --hybrid modes):
-      --batch-size N            Chunks per batch (default: auto, range: 1-1024)
-                                Auto-tuned: 1 GPU=64, 2-4 GPUs=16, 5+ GPUs=4
-                                (Smaller batches with many GPUs avoid PCIe flooding)
+      --batch-size N            Chunks per batch (default: auto,
+                                range: 1-1024)
+                                Auto-tuned: 1 GPU=64, 2-4 GPUs=16,
+                                            5+ GPUs=4
+                                (Smaller batches avoid PCIe flooding)
       --chunks-per-batch N      (alias for --batch-size)
       --slot-capacity N         (legacy name for --batch-size)
-                                Larger = fewer batches, less overhead, more sequential gaps
-                                Smaller = more batches, more overhead, fewer sequential gaps
-
-      --streams-per-gpu N       Concurrent streams per GPU (default: auto, range: 1-128)
+                                Larger = fewer batches, less overhead,
+                                         more sequential gaps
+                                Smaller = more batches, more overhead,
+                                          fewer sequential gaps
+      --streams-per-gpu N       Concurrent streams per GPU (default: auto,
+                                range: 1-128)
                                 Auto-tuned: 1 GPU=4, 2 GPUs=3, 3+ GPUs=3
       --slots-per-gpu N         (alias for --streams-per-gpu)
       --pipeline-depth N        (legacy name for --streams-per-gpu)
-                                Higher = more GPU utilization, more disorder for writer
-                                Lower = less GPU utilization, less disorder for writer
-                                Multiple streams enable overlap with non-blocking workers
-
-      --no-early-read           Disable file read-ahead during GPU initialization
-                                (Reduces memory usage, may hurt throughput)
-
-  Compression uses the selected backend.
-  Decompression always uses multi-threaded CPU (LZ4_decompress_safe),
-  which correctly handles output from all three backends.
-
-Performance notes:
-  - All modes use async reader + async writer threads that overlap I/O with compute
-  - POSIX_FADV_SEQUENTIAL + WILLNEED hints on all input file descriptors
-  - Hybrid: CPU/GPU ratio auto-adjusts every 5 s based on measured throughput
-  - Decompression: uncompressed blocks bypass worker threads (zero-copy fast path)
-
-File format:
-  Standard LZ4 frame format (.lz4 extension).
-  Output is compatible with the lz4 command-line tool:
-    lz4 -d file.tar.lz4
-    unlz4 file.tar.lz4
-
-Examples:
-  gzl4 archive.tar              compress (hybrid, all GPUs + CPUs)
-  gzl4 -d archive.tar.lz4       decompress
-  gzl4 -t archive.tar.lz4       verify integrity without writing output
-  gzl4 --cpu-only -T 32 f.dat   CPU-only with 32 threads
-  gzl4 --gpu-only large.bin     GPU-only compression
-  gzl4 --gpu-only --batch-size 32 data.tar        larger batches (32 chunks)
-  gzl4 --gpu-only --batch-size 4 data.tar         smaller batches (4 chunks)
-  gzl4 --gpu-only --streams-per-gpu 2 data.tar    2 concurrent streams/GPU
-  gzl4 -vv -k archive.tar       verbose, keep original
-
-Pipe examples:
-  cat file.tar | gzl4 -c > file.tar.lz4   compress via pipe (stdout)
-  gzl4 -c file.tar | ssh host "cat > out.lz4"  compress to remote
-  gzl4 -dc file.tar.lz4 | tar -x          decompress to stdout, pipe to tar
-  gzl4 -c - < file.tar > file.tar.lz4     explicit stdin with "-"
-)" << std::endl;
-    }
-
-    /*
-     * Print short version information (-V)
-     */
-    void printShortVersion() {
-        std::cout << "gzl4 " << VERSION << std::endl;
-    }
-    
-    /*
-     * Print full version information (--version)
-     */
-    void printVersion() {
-        std::cout << "gzl4 " << VERSION << R"( - Multi-Backend LZ4 Compression Tool
-Built with nvCOMP 5.1.x, CUDA 12.8, liblz4
+                                Higher = more GPU utilization,
+                                         more disorder for writer
+                                Lower = less GPU utilization,
+                                        less disorder for writer
+                                Enables overlap with non-blocking workers
+      --no-early-read           Disable file read-ahead during GPU init
+                                (Reduces memory, may hurt throughput)
 
 Compression backends:
   cpu-only  Multi-threaded LZ4_compress_default/HC; async I/O pipeline;
-            posix_fadvise readahead; LZ4 HC levels 1-12 support (-10/-11/-12)
-  gpu-only  nvCOMP batched LZ4 fast; per-GPU worker threads with slot rotation;
-            pinned memory pool for zero-copy DMA; configurable batch size/streams;
-            async reader/writer overlap I/O with GPU compute (600+ MB/s)
-  hybrid    GPU-priority scheduler: dispatcher feeds GPU queue first, CPU queue
-            when GPUs saturated; GPUs handle 70-90% of chunks, CPUs fill gaps;
-            all workers submit directly to thread-safe AsyncWriter
+            posix_fadvise readahead; LZ4 HC levels 1-12 (-10/-11/-12)
+  gpu-only  nvCOMP batched LZ4 fast; per-GPU workers with slot rotation;
+            pinned memory pool for zero-copy DMA; configurable batch/streams;
+            async reader/writer overlap I/O with GPU (600+ MB/s)
+  hybrid    GPU-priority scheduler: feeds GPU queue first, CPU when GPUs
+            saturated or not yet initialized; GPUs handle 70-90% of chunks, 
+	    CPUs fill gaps; workers submit directly to thread-safe AsyncWriter
 
 Decompression:
-  Hybrid GPU + CPU: nvCOMP batched API attempts each block; Error 12 triggers
-  automatic CPU fallback via LZ4_decompress_safe. Handles mixed-format files
-  (GPU-compressed + CPU-compressed blocks). Reports GPU/CPU block counts.
-  Uncompressed blocks bypass workers (zero-copy fast path).
+  Hybrid GPU + CPU: nvCOMP batched API tries each block; CUDA Error 12
+  triggers automatic CPU fallback via LZ4_decompress_safe. Handles
+  mixed-format files (GPU + CPU compressed blocks). Reports GPU/CPU
+  block counts. Uncompressed blocks bypass workers (zero-copy fast).
   Multi-threaded with parallel worker pool and sequential writer.
 
-Compression levels:
-  -1 to -9:    LZ4 fast (chunk size: 256KB to 4MB, GPU + CPU compatible)
-  -10/-11/-12: LZ4 HC levels 4/8/12 (CPU-only, slower, better compression)
-  --hc-level:  Explicit HC level 1-12 (e.g., --hc-level 6 for custom level)
+Performance notes:
+  - All modes use async reader + async writer to overlap I/O + compute
+  - POSIX_FADV_SEQUENTIAL + WILLNEED hints on all input file descriptors
+  - Decompression: uncompressed blocks bypass workers (zero-copy)
 
 Architecture:
   3-stage pipeline:  AsyncReader -> workers (GPU/CPU) -> AsyncWriter
-  - AsyncReader: Pre-reads entire file during GPU init (overlaps 3s CUDA setup)
-  - PinnedInputPool: Zero-copy DMA transfers to GPU (7GB pool, 64+ slots)
-  - GPU workers: Per-GPU thread with slot rotation (pipeline depth configurable)
-  - CPU workers: Thread pool pulls from work queue (default: all hardware threads)
-  - AsyncWriter: Thread-safe out-of-order completion with sequential reordering
+  - AsyncReader:     Pre-reads file during GPU init (overlaps 3s CUDA setup)
+  - PinnedInputPool: Zero-copy DMA to GPU (7GB pool, 64+ slots)
+  - GPU workers:     Per-GPU thread with slot rotation (pipeline depth set)
+  - CPU workers:     Thread pool pulls from work queue (default: all cores)
+  - AsyncWriter:     Thread-safe out-of-order with sequential reordering
   
   posix_fadvise(SEQUENTIAL|WILLNEED) on all input file descriptors
   GPU pipeline auto-tuned based on GPU count:
-  - Streams: 1 GPU=4, 2 GPUs=3, 3-8 GPUs=3 (enables overlap with non-blocking workers)
-  - Batch size: 1 GPU=64 chunks, 2-4 GPUs=16, 5+ GPUs=4 (prevents PCIe flooding)
-  Empirical: RTX 5090 peaks at 1208 MB/s with batch=68, streams=4
-             8× H100s work best with batch=3, streams=3 (tiny batches avoid bus saturation)
-  Standard LZ4 frame format; backward compatible with lz4 command-line tool
-
-Pipes and special modes:
-  stdin/stdout:  Use "-" or auto-detect via isatty() checks
-                 No arguments: compress stdin to stdout (if stdout not a tty)
-  Auto-detect:   Files ending with .lz4 are automatically decompressed
-                 Use -z to override and compress them (creates .lz4.lz4)
-  -t (test):     Verify integrity without writing (never requires -f)
-  -q (quiet):    Suppress all non-error output (useful in scripts/pipes)
+  - Streams: 1 GPU=4, 2 GPUs=3, 3-8 GPUs=3 (non-blocking overlap)
+  - Batch size: 1 GPU=64 chunks, 2-4 GPUs=16, 5+ GPUs=4 (avoid PCIe flood)
+  Empirical: RTX 5090 peaks at 1208 MB/s (batch=68, streams=4)
+             8× H100s best with batch=3, streams=3 (avoid bus saturation)
+	     1x H100 best with batch=9, streams=5
+  Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
+  v3.19.1  SIMPLIFIED VERSION OUTPUT: -V and --version now show same concise output; moved
+           detailed backend/architecture info from version to --help for better organization;
+           fixed compiler warning (unused parameter); removed outdated decompression note;
+           fixed changelog formatting (removed extra newline, corrected indentation for
+           v3.4.0-v3.0.0); all --help lines now ≤80 characters for better terminal display
   v3.19.0  SAFE FILE REPLACEMENT & UNGZL4 SUPPORT: -f now uses .tmp files with atomic rename on
            success, protecting original from corruption if interrupted; SIGINT/SIGTERM cleanup temp
            files; program name detection: "ungzl4" auto-enables decompression (-z overrides); two-
@@ -5207,14 +5167,46 @@ Changelog:
            hybrid mode: CPU+GPU simultaneous compression
   v3.6.0   Parallel decompression; direct I/O syscalls; multi-GPU batches
   v3.5.0   Dynamic stream scaling (128->1024/GPU); test mode (-t)
+  v3.4.0   Out-of-order async writer
+  v3.3.0   Async reader with posix_fadvise readahead
+  v3.2.0   Async writer thread
+  v3.0.0   True parallel multi-GPU processing
+  
+File format:
+  Standard LZ4 frame format (.lz4 extension).
+  Output is compatible with the lz4 command-line tool:
+    lz4 -d file.tar.lz4
+    unlz4 file.tar.lz4
 
-  v3.4.0  Out-of-order async writer
-  v3.3.0  Async reader with posix_fadvise readahead
-  v3.2.0  Async writer thread
-  v3.0.0  True parallel multi-GPU processing
+Examples:
+  gzl4 archive.tar              compress (hybrid, all GPUs + CPUs)
+  gzl4 -d archive.tar.lz4       decompress
+  gzl4 -t archive.tar.lz4       verify integrity without writing output
+  gzl4 --cpu-only -T 32 f.dat   CPU-only with 32 threads
+  gzl4 --gpu-only large.bin     GPU-only compression
+  gzl4 --gpu-only --batch-size 32 data.tar        larger batches (32 chunks)
+  gzl4 --gpu-only --batch-size 4 data.tar         smaller batches (4 chunks)
+  gzl4 --gpu-only --streams-per-gpu 2 data.tar    2 concurrent streams/GPU
+  gzl4 -vv -k archive.tar       verbose, keep original
+
+Pipe examples:
+  cat file.tar | gzl4 -c > file.tar.lz4   compress via pipe (stdout)
+  gzl4 -c file.tar | ssh host "cat > out.lz4"  compress to remote
+  gzl4 -dc file.tar.lz4 | tar -x          decompress to stdout, pipe to tar
+  gzl4 -c - < file.tar > file.tar.lz4     explicit stdin with "-"
 )" << std::endl;
     }
-    
+
+    /*
+     * Print version information (-V and --version)
+     */
+    void printVersion() {
+        std::cout << "gzl4 " << VERSION << 
+            R"( - GPU, CPU, and Hybrid LZ4 Compression Tool
+Built with nvCOMP 5.1.x, CUDA 12.8, liblz4
+)" << std::endl;
+    }
+
     /*
      * Main processing entry point
      */
