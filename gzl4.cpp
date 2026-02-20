@@ -41,9 +41,10 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.16.4";
+constexpr const char* VERSION = "3.19.0";
 
 // Compression backend modes
 enum class BackendMode {
@@ -75,18 +76,19 @@ constexpr size_t CHUNK_SIZE_LEVEL_7 = 3 * 1024 * 1024 + 512 * 1024;  // 3.5MB (w
 constexpr size_t CHUNK_SIZE_LEVEL_8 = 4 * 1024 * 1024;  // 4MB (was 2MB)
 constexpr size_t CHUNK_SIZE_LEVEL_9 = 4 * 1024 * 1024;  // 4MB (max for LZ4)
 
-// Verbosity levels
+// Verbosity levels - unified system
 enum VerbosityLevel {
-    QUIET = 0,
-    VERBOSE = 1,
-    VERY_VERBOSE = 2,
-    DEBUG = 3
+    QUIET = 0,        // -q: errors only
+    NORMAL = 1,       // default: progress, completion messages
+    VERBOSE = 2,      // -v: extra details
+    VERY_VERBOSE = 3, // -vv: more details
+    DEBUG = 4         // -vvv: debug info
 };
 
-// Global verbosity setting
-int g_verbosity = QUIET;
+// Global verbosity setting (default: NORMAL)
+int g_verbosity = NORMAL;
 
-// Macro for verbose output
+// Macro for verbosity-aware output
 #define VLOG(level, ...) do { \
     if (g_verbosity >= level) { \
         fprintf(stderr, __VA_ARGS__); \
@@ -1213,7 +1215,6 @@ private:
         std::vector<uint8_t> inputData;
         size_t maxOutputSize;
         int    hcLevel      = 0;      // 0=fast, 1-12=HC
-        bool   forceCompress = false; // write compressed even if larger
     };
     
     std::vector<std::thread> workers;
@@ -1273,11 +1274,12 @@ private:
                     job.inputData.size(),
                     job.maxOutputSize);
 
-            if (compSize > 0 && (job.forceCompress || (size_t)compSize < job.inputData.size())) {
+            if (compSize > 0 && (size_t)compSize < job.inputData.size()) {
+                // Compressed version is smaller - use it
                 result.compressedData.resize(compSize);
                 result.success = true;
             } else {
-                // Didn't compress (or forceCompress not set) - use original
+                // Original is smaller (or compression failed) - use original
                 result.compressedData.clear();
                 result.success = false;
             }
@@ -1318,14 +1320,12 @@ public:
         stop();
     }
     
-    void submitJob(size_t chunkIndex, std::vector<uint8_t> data,
-                   int hcLevel = 0, bool forceCompress = false) {
+    void submitJob(size_t chunkIndex, std::vector<uint8_t> data, int hcLevel = 0) {
         CompressJob job;
         job.chunkIndex    = chunkIndex;
         job.inputData     = std::move(data);
         job.maxOutputSize = LZ4_compressBound(job.inputData.size());
         job.hcLevel       = hcLevel;
-        job.forceCompress = forceCompress;
 
         {
             std::lock_guard<std::mutex> lock(jobMutex);
@@ -1421,15 +1421,60 @@ private:
     bool decompress;
     bool keepOriginal;
     bool forceOverwrite;
-    bool forceCompress;     // -z: always write compressed output even if larger
+    bool forceMode;         // -z: force compression mode (ignore .lz4 extension auto-detection)
     bool stdoutMode;
     bool testMode;
+    
+    // Signal handler for cleanup
+    static void signalHandler(int signum) {
+        if (g_instance && !g_instance->tempOutputFile.empty()) {
+            fprintf(stderr, "\nInterrupted - cleaning up temporary file...\n");
+            unlink(g_instance->tempOutputFile.c_str());
+        }
+        exit(EXIT_FAILURE);
+    }
+    
+    void setupSignalHandlers() {
+        g_instance = this;
+        signal(SIGINT, signalHandler);
+        signal(SIGTERM, signalHandler);
+    }
+    
+    void cleanupTempFile() {
+        if (!tempOutputFile.empty() && !stdoutMode) {
+            unlink(tempOutputFile.c_str());
+            tempOutputFile.clear();
+        }
+    }
+    
+    bool renameTempToFinal() {
+        if (tempOutputFile.empty() || stdoutMode) return true;
+        
+        VLOG(NORMAL, "Finalizing output file...\n");
+        if (rename(tempOutputFile.c_str(), outputFile.c_str()) != 0) {
+            fprintf(stderr, "Error: Failed to rename %s to %s: %s\n",
+                    tempOutputFile.c_str(), outputFile.c_str(), strerror(errno));
+            cleanupTempFile();
+            return false;
+        }
+        tempOutputFile.clear();
+        return true;
+    }
+    
+    // Get the actual file path to write to (temp if set, otherwise final)
+    const char* getActualOutputPath() const {
+        return tempOutputFile.empty() ? outputFile.c_str() : tempOutputFile.c_str();
+    }
     int  hcLevel;           // 0=fast LZ4, 1-12=HC level (for -10 to -12)
     BackendMode backendMode;
     size_t cpuThreads;
     std::string inputFile;
     std::string outputFile;
+    std::string tempOutputFile;  // .tmp file when using -f to overwrite
 
+    // Static instance for signal handler
+    static GZL4Compressor* g_instance;
+    
     // Tunable GPU parameters (set via command line)
     size_t slotCapacity;      // chunks per GPU slot (--slot-capacity)
     size_t pipelineDepth;     // slots per GPU (--pipeline-depth)
@@ -1447,7 +1492,7 @@ public:
         , decompress(false)
         , keepOriginal(false)
         , forceOverwrite(false)
-        , forceCompress(false)
+        , forceMode(false)
         , stdoutMode(false)
         , testMode(false)
         , hcLevel(0)
@@ -2189,7 +2234,7 @@ public:
      * Compress a file using CPU-only multi-threaded compression
      */
     bool compressFileCPU() {
-        fprintf(stderr, "Compressing (CPU-only): %s -> %s\n",
+        VLOG(NORMAL, "Compressing (CPU-only): %s -> %s\n",
                 inputFile.c_str(), outputFile.c_str());
         
         double timeReading = 0, timeCompressing = 0;
@@ -2240,7 +2285,7 @@ public:
         }
         
         // Open output and write header
-        int outputFd = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int outputFd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (outputFd < 0) {
             fprintf(stderr, "Error: Cannot create output file: %s\n", outputFile.c_str());
             return false;
@@ -2282,7 +2327,7 @@ public:
             AsyncReader::ReadChunk chunk;
             while (chunksSubmitted < numChunks && asyncReader.getChunk(chunk)) {
                 // Submit to CPU pool
-                cpuPool.submitJob(chunk.chunkIndex, std::move(chunk.heapData), hcLevel, forceCompress);
+                cpuPool.submitJob(chunk.chunkIndex, std::move(chunk.heapData), hcLevel);
                 chunksSubmitted++;
                 
                 VLOG(DEBUG, "Submitted chunk %zu to CPU pool (queue: %zu)\n",
@@ -2336,7 +2381,7 @@ public:
             timeCompressing += std::chrono::duration<double>(compressEnd - compressStart).count();
             
             // Progress - show bytes processed
-            if (g_verbosity < DEBUG && numChunks > 10) {
+            if (g_verbosity == NORMAL && numChunks > 10) {
                 size_t bytesProcessed = nextChunkToWrite * chunkSize;
                 if (bytesProcessed > fileSize) bytesProcessed = fileSize;
                 int progress = (100 * nextChunkToWrite) / numChunks;
@@ -2352,7 +2397,7 @@ public:
             }
         }
         
-        if (g_verbosity < DEBUG && numChunks > 10) {
+        if (g_verbosity == NORMAL && numChunks > 10) {
             fprintf(stderr, "\n");
         }
         
@@ -2360,7 +2405,7 @@ public:
         {
             std::atomic<bool> stopProgress{false};
             std::thread progressThread;
-            if (g_verbosity < DEBUG && numChunks > 10) {
+            if (g_verbosity == NORMAL && numChunks > 10) {
                 progressThread = std::thread([&]() {
                     while (!stopProgress.load()) {
                         size_t w = asyncWriter.getNextChunkToWrite();
@@ -2368,14 +2413,14 @@ public:
                         if (bytesWritten > fileSize) bytesWritten = fileSize;
                         std::string written = formatBytes(bytesWritten);
                         std::string total = formatBytes(fileSize);
-                        fprintf(stderr, "\rWriting: %3d%%  [%s/%s to disk]%s",
+                        VLOG(NORMAL, "\rWriting: %3d%%  [%s/%s to disk]%s",
                                 (int)(100 * w / numChunks), written.c_str(), total.c_str(),
                                 "          ");
                         fflush(stderr);
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                     }
                     std::string total = formatBytes(fileSize);
-                    fprintf(stderr, "\rWriting: 100%%  [%s/%s to disk]  \n",
+                    VLOG(NORMAL, "\rWriting: 100%%  [%s/%s to disk]  \n",
                             total.c_str(), total.c_str());
                 });
             }
@@ -2388,7 +2433,7 @@ public:
         }
         
         // Write footer
-        outputFd = open(outputFile.c_str(), O_WRONLY | O_APPEND);
+        outputFd = open(getActualOutputPath(), O_WRONLY | O_APPEND);
         if (outputFd >= 0) {
             uint32_t endMark = 0;
             ssize_t bytesWritten = ::write(outputFd, &endMark, 4);
@@ -2428,7 +2473,7 @@ public:
 
         std::string inputSize = formatBytes(fileSize);
         std::string outputSize = formatBytes((size_t)totalBytesWritten);
-        fprintf(stderr, "Compression complete (CPU-only): %s -> %s (%.2f%%) in %.2f s\n",
+        VLOG(NORMAL, "Compression complete (CPU-only): %s -> %s (%.2f%%) in %.2f s\n",
                 inputSize.c_str(), outputSize.c_str(), ratio, duration.count() / 1000.0);
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
         VLOG(VERBOSE, "  Read:    %.2f s  |  CPU compress (%zu threads): %.2f s  |  Write: %.2f s\n",
@@ -2456,7 +2501,7 @@ public:
             VLOG(VERBOSE, "  GPU%d: %s  %.1f GB  %zu SMs  %d pipeline slots\n",
                  g.deviceId, g.properties.name,
                  g.totalMemory/(1024.0*1024.0*1024.0), g.smCount, g.pipelineDepth);
-        fprintf(stderr, "Compressing (GPU-only, %zu GPU%s): %s -> %s\n",
+        VLOG(NORMAL, "Compressing (GPU-only, %zu GPU%s): %s -> %s\n",
                 gpus.size(), gpus.size()==1?"":"s",
                 inputFile.c_str(), outputFile.c_str());
         
@@ -2627,7 +2672,7 @@ public:
         }
         
         // Open output file and write header synchronously
-        int outputFd = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int outputFd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (outputFd < 0) {
             fprintf(stderr, "Error: Cannot create output file: %s\n", outputFile.c_str());
             return false;
@@ -2717,8 +2762,8 @@ public:
                                     ? slot.origHandles[i].data
                                     : slot.origData[i].data();
 
-                                if (forceCompress || outSz < origSz) {
-                                    // Compressed path (or force-compress regardless of size)
+                                if (outSz < origSz) {
+                                    // Compressed version is smaller - use it
                                     std::vector<uint8_t> buf(outSz);
                                     memcpy(buf.data(), slot.h_output + i * slot.outStride, outSz);
                                     cChunks.push_back(std::move(buf));
@@ -2850,7 +2895,7 @@ public:
         // ── Main thread: progress display while GPU workers compress ─────────
         // Workers submit directly to asyncWriter  main thread just shows status.
         while (activeWorkers.load() > 0) {
-            if (g_verbosity < DEBUG && numChunks > 10) {
+            if (g_verbosity == NORMAL && numChunks > 10) {
                 size_t submitted = chunksSubmitted.load();
                 size_t bytesProcessed = submitted * chunkSize;
                 if (bytesProcessed > fileSize) bytesProcessed = fileSize;
@@ -2874,7 +2919,7 @@ public:
         {
             std::atomic<bool> stopProgress{false};
             std::thread progressThread;
-            if (g_verbosity < DEBUG && numChunks > 10) {
+            if (g_verbosity == NORMAL && numChunks > 10) {
                 progressThread = std::thread([&]() {
                     while (!stopProgress.load()) {
                         size_t w = asyncWriter.getNextChunkToWrite();
@@ -2882,7 +2927,7 @@ public:
                         if (bytesWritten > fileSize) bytesWritten = fileSize;
                         std::string written = formatBytes(bytesWritten);
                         std::string total = formatBytes(fileSize);
-                        fprintf(stderr, "\rWriting: %3d%%  [%s/%s to disk]%s",
+                        VLOG(NORMAL, "\rWriting: %3d%%  [%s/%s to disk]%s",
                                 (int)(100 * w / numChunks), written.c_str(), total.c_str(),
                                 "          ");
                         fflush(stderr);
@@ -2890,7 +2935,7 @@ public:
                     }
                     // Final update
                     std::string total = formatBytes(fileSize);
-                    fprintf(stderr, "\rWriting: 100%%  [%s/%s to disk]  \n",
+                    VLOG(NORMAL, "\rWriting: 100%%  [%s/%s to disk]  \n",
                             total.c_str(), total.c_str());
                 });
             }
@@ -2905,7 +2950,7 @@ public:
         freeAllSlots();   // GPU memory freed after writer done (parallel with footer write)
         
         // Now append footer synchronously (end mark + checksum)
-        outputFd = open(outputFile.c_str(), O_WRONLY | O_APPEND);
+        outputFd = open(getActualOutputPath(), O_WRONLY | O_APPEND);
         if (outputFd < 0) {
             fprintf(stderr, "Error reopening file for footer: %s\n", strerror(errno));
             return false;
@@ -2940,7 +2985,7 @@ public:
         auto endTime = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
         
-        if (g_verbosity < DEBUG && numChunks > 10) {
+        if (g_verbosity == NORMAL && numChunks > 10) {
             fprintf(stderr, "\n");
         }
         
@@ -2958,7 +3003,7 @@ public:
         for (auto& gSlots : gpuSlots) finalSlots += gSlots.size();
         std::string inputSize = formatBytes(fileSize);
         std::string outputSize = formatBytes((size_t)totalBytesWritten);
-        fprintf(stderr, "Compression complete (GPU-only, %zu GPU%s / %zu pipeline slots): %s -> %s (%.2f%%) in %.2f s\n",
+        VLOG(NORMAL, "Compression complete (GPU-only, %zu GPU%s / %zu pipeline slots): %s -> %s (%.2f%%) in %.2f s\n",
                 gpus.size(), gpus.size() == 1 ? "" : "s", finalSlots,
                 inputSize.c_str(), outputSize.c_str(), ratio, duration.count() / 1000.0);
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
@@ -3029,7 +3074,7 @@ public:
                                              : std::thread::hardware_concurrency();
         if (!effectiveThreads) effectiveThreads = 4;
 
-        fprintf(stderr, "Compressing (Hybrid, %zu thread%s + %zu GPU%s): %s -> %s\n",
+        VLOG(NORMAL, "Compressing (Hybrid, %zu thread%s + %zu GPU%s): %s -> %s\n",
                 effectiveThreads, effectiveThreads==1?"":"s",
                 gpus.size(),      gpus.size()==1?"":"s",
                 inputFile.c_str(), outputFile.c_str());
@@ -3145,7 +3190,7 @@ public:
                 fprintf(stderr,"Error: Failed to write LZ4 frame header\n"); return false;
             }
             std::string hstr = hs.str();
-            int fd = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) { fprintf(stderr,"Error: Cannot create output file\n"); return false; }
             if (::write(fd, hstr.data(), hstr.size()) != (ssize_t)hstr.size()) {
                 fprintf(stderr,"Error writing header\n"); close(fd); return false;
@@ -3228,7 +3273,7 @@ public:
                         size_t origSz = slot.origSizes[i];
                         const uint8_t* origPtr = slot.origHandles.size() > i
                             ? slot.origHandles[i].data : slot.origData[i].data();
-                        if (forceCompress || outSz < origSz) {
+                        if (outSz < origSz) {
                             std::vector<uint8_t> buf(outSz);
                             memcpy(buf.data(), slot.h_output + i * slot.outStride, outSz);
                             cChunks.push_back(std::move(buf));
@@ -3311,7 +3356,7 @@ public:
                     size_t origSz = sl.origSizes[i];
                     const uint8_t* origPtr = sl.origHandles.size() > i
                         ? sl.origHandles[i].data : sl.origData[i].data();
-                    if (forceCompress || outSz < origSz) {
+                    if (outSz < origSz) {
                         std::vector<uint8_t> buf(outSz);
                         memcpy(buf.data(), sl.h_output + i * sl.outStride, outSz);
                         cChunks.push_back(std::move(buf));
@@ -3351,7 +3396,7 @@ public:
 
                 std::vector<uint8_t> origVec(src, src + origSz);
                 std::vector<uint8_t> compVec;
-                if (compSz > 0 && (forceCompress || (size_t)compSz < origSz)) {
+                if (compSz > 0 && (size_t)compSz < origSz) {
                     compressed.resize(compSz);
                     compVec = std::move(compressed);
                 }
@@ -3377,7 +3422,7 @@ public:
 
         // Progress display
         while (chunksSubmitted.load() < numChunks) {
-            if (g_verbosity < DEBUG && numChunks > 10) {
+            if (g_verbosity == NORMAL && numChunks > 10) {
                 size_t done = asyncWriter.getNextChunkToWrite();
                 size_t gpuChunks = gpuChunkCount.load();
                 size_t cpuChunks = cpuChunkCount.load();
@@ -3396,13 +3441,13 @@ public:
         dispatcherThread.join();
         for (auto& t : allWorkers) t.join();
 
-        if (g_verbosity < DEBUG && numChunks > 10) fprintf(stderr, "\n");
+        if (g_verbosity == NORMAL && numChunks > 10) fprintf(stderr, "\n");
         
         // Wait for writer to finish with progress display
         {
             std::atomic<bool> stopProgress{false};
             std::thread progressThread;
-            if (g_verbosity < DEBUG && numChunks > 10) {
+            if (g_verbosity == NORMAL && numChunks > 10) {
                 progressThread = std::thread([&]() {
                     while (!stopProgress.load()) {
                         size_t w = asyncWriter.getNextChunkToWrite();
@@ -3410,14 +3455,14 @@ public:
                         if (bytesWritten > fileSize) bytesWritten = fileSize;
                         std::string written = formatBytes(bytesWritten);
                         std::string total = formatBytes(fileSize);
-                        fprintf(stderr, "\rWriting: %3d%%  [%s/%s to disk]%s",
+                        VLOG(NORMAL, "\rWriting: %3d%%  [%s/%s to disk]%s",
                                 (int)(100 * w / numChunks), written.c_str(), total.c_str(),
                                 "          ");
                         fflush(stderr);
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                     }
                     std::string total = formatBytes(fileSize);
-                    fprintf(stderr, "\rWriting: 100%%  [%s/%s to disk]  \n",
+                    VLOG(NORMAL, "\rWriting: 100%%  [%s/%s to disk]  \n",
                             total.c_str(), total.c_str());
                 });
             }
@@ -3431,7 +3476,7 @@ public:
 
         // Write end mark and checksum
         {
-            int fd = open(outputFile.c_str(), O_WRONLY | O_APPEND);
+            int fd = open(getActualOutputPath(), O_WRONLY | O_APPEND);
             if (fd >= 0) {
                 uint32_t endMark = 0;
                 if (::write(fd, &endMark, 4) != 4)
@@ -3456,7 +3501,7 @@ public:
 
         std::string inputSize = formatBytes(fileSize);
         std::string outputSize = formatBytes((size_t)bw);
-        fprintf(stderr, "Compression complete (Hybrid, %zu thread%s + %zu GPU%s): "
+        VLOG(NORMAL, "Compression complete (Hybrid, %zu thread%s + %zu GPU%s): "
                 "%s -> %s (%.2f%%) in %.2f s\n",
                 effectiveThreads, effectiveThreads==1?"":"s",
                 gpus.size(),      gpus.size()==1?"":"s",
@@ -3607,7 +3652,7 @@ public:
      * LZ4_decompress_safe() automatically (Error 12 triggers the fallback).
      */
     bool decompressFileGPU() {
-        fprintf(stderr, "Decompressing (GPU+fallback, %zu GPU%s): %s -> %s\n",
+        VLOG(NORMAL, "Decompressing (GPU+fallback, %zu GPU%s): %s -> %s\n",
                 gpus.size(), gpus.size() == 1 ? "" : "s",
                 inputFile.c_str(), outputFile.c_str());
         
@@ -3673,7 +3718,7 @@ public:
             if (stdoutMode) {
                 outputFd = STDOUT_FILENO;
             } else {
-                outputFd = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                outputFd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
                 if (outputFd < 0) {
                     fprintf(stderr, "Error: Cannot create output file: %s\n", outputFile.c_str());
                     close(inputFd);
@@ -3865,7 +3910,7 @@ public:
             }
 
             // Progress display
-            if (g_verbosity < DEBUG && estimatedBlocks > 10) {
+            if (g_verbosity == NORMAL && estimatedBlocks > 10) {
                 size_t pct = nextBlockToRead * 100 / estimatedBlocks;
                 std::string written = formatBytes(totalBytesWritten);
                 fprintf(stderr, "\rDecompressing%s: %3zu%%  %s%s",
@@ -3899,7 +3944,7 @@ public:
         auto endTime  = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
-        if (g_verbosity < DEBUG && estimatedBlocks > 10) fprintf(stderr, "\n");
+        if (g_verbosity == NORMAL && estimatedBlocks > 10) fprintf(stderr, "\n");
         
         // ── Verify content checksum ───────────────────────────────────────────
         // LZ4 frame layout: ... [block data] [end-mark = 0x00000000] [checksum 4B]
@@ -3930,15 +3975,15 @@ public:
             std::string outputSize = formatBytes(totalBytesWritten);
             
             // Overwrite progress line with completion message
-            fprintf(stderr, "\rDecompression (test) complete (GPU+fallback, %zu GPU%s): %s in %.2f s%s\n",
+            VLOG(NORMAL, "\rDecompression (test) complete (GPU+fallback, %zu GPU%s): %s in %.2f s%s\n",
                     gpus.size(), gpus.size() == 1 ? "" : "s",
                     outputSize.c_str(), duration.count() / 1000.0,
                     "          ");  // Clear any progress debris
             
             if (checksumOk) {
-                fprintf(stderr, "Test OK: %s\n", inputFile.c_str());
+                VLOG(NORMAL, "Test OK: %s\n", inputFile.c_str());
             } else {
-                fprintf(stderr, "Test FAILED: %s (checksum mismatch)\n", inputFile.c_str());
+                VLOG(NORMAL, "Test FAILED: %s (checksum mismatch)\n", inputFile.c_str());
             }
             VLOG(VERBOSE, "  Compressed:   %.2f MB\n", compressedSize / (1024.0*1024.0));
             VLOG(VERBOSE, "  Uncompressed: %.2f MB  (ratio %.2f%%)\n",
@@ -3951,7 +3996,7 @@ public:
         } else {
             double mbps = (totalBytesWritten / (1024.0*1024.0)) / (duration.count() / 1000.0);
             std::string outputSize = formatBytes(totalBytesWritten);
-            fprintf(stderr, "\rDecompression complete (GPU+fallback, %zu GPU%s): "
+            VLOG(NORMAL, "\rDecompression complete (GPU+fallback, %zu GPU%s): "
                     "%s in %.2f s%s\n",
                     gpus.size(), gpus.size() == 1 ? "" : "s",
                     outputSize.c_str(), duration.count() / 1000.0,
@@ -4050,7 +4095,7 @@ public:
         size_t chunkSize        = static_cast<size_t>(1) << (8 + 2 * desc.blockMaxSize);
         size_t estimatedBlocks  = (originalFileSize + chunkSize - 1) / chunkSize;
 
-        fprintf(stderr, "Decompressing (hybrid, %zu GPU%s + CPU): %s -> %s\n",
+        VLOG(NORMAL, "Decompressing (hybrid, %zu GPU%s + CPU): %s -> %s\n",
                 gpus.size(), gpus.size() == 1 ? "" : "s",
                 inputFile.c_str(), outputFile.c_str());
         VLOG(VERBOSE, "  %.2f MB  |  block size %zu KB  |  ~%zu blocks\n",
@@ -4062,7 +4107,7 @@ public:
             if (stdoutMode) {
                 outputFd = STDOUT_FILENO;
             } else {
-                outputFd = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                outputFd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
                 if (outputFd < 0) {
                     fprintf(stderr, "Error: Cannot create output file: %s\n", outputFile.c_str());
                     close(inputFd); return false;
@@ -4182,7 +4227,7 @@ public:
                 nextBlockToWrite++;
             }
 
-            if (g_verbosity < DEBUG && estimatedBlocks > 10) {
+            if (g_verbosity == NORMAL && estimatedBlocks > 10) {
                 std::string written = formatBytes(totalBytesWritten);
                 fprintf(stderr, "\rDecompressing%s: %3zu%%  %s%s",
                         testMode ? " (test)" : "",
@@ -4212,7 +4257,7 @@ public:
 
         auto endTime  = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-        if (g_verbosity < DEBUG) fprintf(stderr, "\n");
+        if (g_verbosity == NORMAL) fprintf(stderr, "\n");
 
         // ── Verify content checksum ───────────────────────────────────────────
         // Cursor sits right after the 0x00000000 end-mark  checksum is next 4 bytes.
@@ -4235,17 +4280,17 @@ public:
         
         if (testMode) {
             // Overwrite progress line with completion message
-            fprintf(stderr, "\rDecompression (test) complete (hybrid, %zu GPU%s): %s in %.2f s%s\n",
+            VLOG(NORMAL, "\rDecompression (test) complete (hybrid, %zu GPU%s): %s in %.2f s%s\n",
                     gpus.size(), gpus.size()==1?"":"s",
                     outputSize.c_str(), duration.count()/1000.0,
                     "          ");  // Clear any progress debris
             
-            fprintf(stderr, csOk ? "Test OK: %s\n" : "Test FAILED: %s (checksum mismatch)\n",
+            VLOG(NORMAL, csOk ? "Test OK: %s\n" : "Test FAILED: %s (checksum mismatch)\n",
                     inputFile.c_str());
             VLOG(VERBOSE, "  %.2f MB in %.2f s  (%.2f MB/s)\n",
                  totalBytesWritten/(1024.0*1024.0), duration.count()/1000.0, mbps);
         } else {
-            fprintf(stderr, "\rDecompression complete (hybrid, %zu GPU%s): "
+            VLOG(NORMAL, "\rDecompression complete (hybrid, %zu GPU%s): "
                     "%s in %.2f s%s\n",
                     gpus.size(), gpus.size()==1?"":"s",
                     outputSize.c_str(), duration.count()/1000.0,
@@ -4308,7 +4353,7 @@ public:
         size_t estimatedBlocks = originalFileSize > 0 ?
             (originalFileSize + chunkSize - 1) / chunkSize : 0;
 
-        fprintf(stderr, "Decompressing%s: %s\n",
+        VLOG(NORMAL, "Decompressing%s: %s\n",
                 testMode ? " (test)" : "",
                 inputFile.c_str());
         VLOG(VERBOSE, "  %.2f MB source  |  block size %zu KB  |  ~%zu blocks\n",
@@ -4508,7 +4553,7 @@ public:
                 totalBytesWritten += res.data.size();
                 nextBlockToWrite++;
 
-                if (g_verbosity < DEBUG && estimatedBlocks > 10) {
+                if (g_verbosity == NORMAL && estimatedBlocks > 10) {
                     size_t denom = std::max(estimatedBlocks, nextBlockToWrite);
                     std::string written = formatBytes(totalBytesWritten);
                     fprintf(stderr, "\rDecompressing%s: %3zu%%  %s%s",
@@ -4555,7 +4600,7 @@ public:
                     "          ");  // Clear any progress debris
             
             if (testMode) {
-                fprintf(stderr, "Test OK: %s\n", inputFile.c_str());
+                VLOG(NORMAL, "Test OK: %s\n", inputFile.c_str());
             }
             
             VLOG(VERBOSE, "Throughput: %.2f MB/s\n", 
@@ -4637,19 +4682,31 @@ public:
      * Parse command line arguments
      */
     bool parseArguments(int argc, char* argv[]) {
-        const char* short_opts = "cdfhkT:tvVzZ123456789";
+        // Check if program name starts with "un" (e.g., ungzl4)
+        // If so, auto-enable decompression mode (lz4-compatible behavior)
+        if (argc > 0 && argv[0] != nullptr) {
+            const char* progName = strrchr(argv[0], '/');
+            progName = progName ? progName + 1 : argv[0];  // Get basename
+            if (strlen(progName) >= 2 && progName[0] == 'u' && progName[1] == 'n') {
+                decompress = true;
+                VLOG(VERBOSE, "Auto-enabled decompression mode (program name: %s)\n", progName);
+            }
+        }
+        
+        const char* short_opts = "cdfhkqT:tvVzZ123456789";
         const struct option long_opts[] = {
             {"stdout", no_argument, nullptr, 'c'},
             {"to-stdout", no_argument, nullptr, 'c'},
             {"decompress", no_argument, nullptr, 'd'},
             {"uncompress", no_argument, nullptr, 'd'},
             {"force", no_argument, nullptr, 'f'},
-            {"help", no_argument, nullptr, 'h'},
+            {"help", no_argument, nullptr, 2000},  // --help shows full help
             {"keep", no_argument, nullptr, 'k'},
+            {"quiet", no_argument, nullptr, 'q'},
             {"threads", required_argument, nullptr, 'T'},
             {"test", no_argument, nullptr, 't'},
             {"verbose", no_argument, nullptr, 'v'},
-            {"version", no_argument, nullptr, 'V'},
+            {"version", no_argument, nullptr, 2001},  // --version shows full version
             {"fast", no_argument, nullptr, '1'},
             {"best", no_argument, nullptr, '9'},
             {"cpu-only", no_argument, nullptr, 1001},
@@ -4682,7 +4739,7 @@ public:
                     forceOverwrite = true;
                     break;
                 case 'h':
-                    printHelp();
+                    printShortHelp();
                     return false;
                 case 'k':
                     keepOriginal = true;
@@ -4691,11 +4748,14 @@ public:
                     testMode = true;
                     decompress = true;
                     break;
+                case 'q':
+                    g_verbosity = QUIET;
+                    break;
                 case 'v':
                     g_verbosity++;
                     break;
                 case 'V':
-                    printVersion();
+                    printShortVersion();
                     return false;
                 case 'T':
                     {
@@ -4761,10 +4821,10 @@ public:
                     disableEarlyRead = true;
                     VLOG(DEBUG, "Early reader disabled\n");
                     break;
-                case 'z':   // -z / --force-compress: always write compressed
+                case 'z':   // -z: force compression mode (ignore .lz4 extension)
                 case 'Z':
-                    forceCompress = true;
-                    VLOG(DEBUG, "Force compress enabled (always write compressed output)\n");
+                    forceMode = true;
+                    VLOG(DEBUG, "Force compression mode enabled\n");
                     break;
                 case 1007:  // --hc-level N: explicitly set HC level 1-12
                     {
@@ -4777,6 +4837,12 @@ public:
                         hcLevel = (int)hlv;
                     }
                     break;
+                case 2000:  // --help: show full help
+                    printHelp();
+                    return false;
+                case 2001:  // --version: show full version
+                    printVersion();
+                    return false;
                 default:
                     fprintf(stderr, "Try 'gzl4 --help' for more information.\n");
                     return false;
@@ -4815,6 +4881,24 @@ public:
             return false;
         }
         
+        // Auto-detect decompression mode based on .lz4 extension (lz4-compatible behavior)
+        // User can override with -d (decompress) or -z (force compress)
+        bool hasLz4Extension = (inputFile.size() > 4 && 
+                                 inputFile.substr(inputFile.size() - 4) == ".lz4");
+        
+        if (!decompress && !forceMode && hasLz4Extension) {
+            // Auto-switch to decompression mode
+            decompress = true;
+            VLOG(VERBOSE, "Auto-detected decompression mode (input has .lz4 extension)\n");
+        } else if (!decompress && forceMode && hasLz4Extension) {
+            // User wants to compress a .lz4 file - warn but allow it
+            fprintf(stderr, "Warning: Compressing .lz4 file (use -z to override auto-detection)\n");
+            fprintf(stderr, "         Output will be: %s.lz4\n", inputFile.c_str());
+        } else if (!decompress && !forceMode && !hasLz4Extension) {
+            // Normal compression of non-.lz4 file
+            VLOG(DEBUG, "Compression mode\n");
+        }
+        
         // Determine output file name
         if (stdoutMode) {
             outputFile = "-";
@@ -4830,18 +4914,61 @@ public:
         }
         
         // -t (test) mode: never writes output, so skip all output file checks
-        // -z (force compress): always write compressed data regardless of size
         if (!testMode && !forceOverwrite && !stdoutMode && stat(outputFile.c_str(), &st) == 0) {
             fprintf(stderr, "Error: Output file already exists: %s\n", outputFile.c_str());
             fprintf(stderr, "Use -f to force overwrite\n");
             return false;
         }
         
+        // When using -f to overwrite, use a .tmp file for safety
+        // On successful completion, we'll rename .tmp to the final name
+        if (forceOverwrite && !stdoutMode && !testMode) {
+            tempOutputFile = outputFile + ".tmp";
+            VLOG(NORMAL, "Using temporary file for safe overwrite: %s\n", tempOutputFile.c_str());
+        }
+        
         return true;
     }
     
     /*
-     * Print help message
+     * Print short help message (-h)
+     */
+    void printShortHelp() {
+        std::cout << R"(gzl4 )" << VERSION << R"( - Multi-Backend LZ4 Compression Tool
+
+Usage: gzl4 [OPTION]... [FILE]
+
+Common options:
+  -c            write to stdout
+  -d            decompress
+  -f            force overwrite
+  -h            show this help (use --help for full details)
+  -k            keep original files
+  -q            quiet mode
+  -t            test integrity
+  -v            verbose (-vv, -vvv for more)
+  -z            force compression mode
+  -1 to -9      compression level (default: -9)
+  -V            show version (use --version for full details)
+
+Program name behavior:
+  ungzl4        Auto-enables decompression mode (-d implied)
+                Use -z to force compression despite "un" prefix
+
+Examples:
+  gzl4 file.tar              # compress to file.tar.lz4
+  gzl4 -d file.tar.lz4       # decompress to file.tar
+  gzl4 file.tar.lz4          # auto-detects decompression
+  gzl4 -z file.tar.lz4       # compress again to file.tar.lz4.lz4
+  cat file | gzl4 > out.lz4  # pipe mode
+  ungzl4 file.tar.lz4        # decompress (same as gzl4 -d)
+
+For complete documentation, use --help
+)";
+    }
+    
+    /*
+     * Print full help message (--help)
      */
     void printHelp() {
         std::cout << "gzl4 " << VERSION << R"( - Multi-Backend LZ4 Compression Tool
@@ -4852,12 +4979,17 @@ Options:
   -c, --stdout         write to standard output, keep original files
   -d, --decompress     decompress (default is to compress)
   -f, --force          force overwrite of output file
-  -h, --help           display this help and exit
+  -h                   display short help (-h)
+      --help           display this complete help and exit
   -k, --keep           keep (don't delete) input files
+  -q, --quiet          quiet mode: only errors are output (verbosity level 0)
   -t, --test           test compressed file integrity (never requires -f)
-  -z, --force-compress always write compressed output, even if larger than input
+  -z, --force-compress force compression mode (ignore .lz4 extension auto-detection)
+                       Note: gzl4 auto-detects decompression when input ends with .lz4
+                       Use -z to compress .lz4 files (creates .lz4.lz4)
   -T N, --threads N    CPU thread count (default: auto-detect all cores)
-  -v                   verbose output (-vv, -vvv for more detail)
+  -v                   verbose output: -v (level 2), -vv (level 3), -vvv (level 4/debug)
+                       Default is level 1 (progress and completion messages)
 
 Compression levels:
   -1 .. -9             LZ4 fast compression (default: -9 = 4MB chunks)
@@ -4939,7 +5071,14 @@ Pipe examples:
     }
 
     /*
-     * Print version information
+     * Print short version information (-V)
+     */
+    void printShortVersion() {
+        std::cout << "gzl4 " << VERSION << std::endl;
+    }
+    
+    /*
+     * Print full version information (--version)
      */
     void printVersion() {
         std::cout << "gzl4 " << VERSION << R"( - Multi-Backend LZ4 Compression Tool
@@ -4985,11 +5124,32 @@ Architecture:
 
 Pipes and special modes:
   stdin/stdout:  Use "-" or auto-detect via isatty() checks
+                 No arguments: compress stdin to stdout (if stdout not a tty)
+  Auto-detect:   Files ending with .lz4 are automatically decompressed
+                 Use -z to override and compress them (creates .lz4.lz4)
   -t (test):     Verify integrity without writing (never requires -f)
-  -z (force):    Always write compressed data (Note: may not reduce size on
-                 random/incompressible data; lz4 tool shows same behavior)
+  -q (quiet):    Suppress all non-error output (useful in scripts/pipes)
 
 Changelog:
+  v3.19.0  SAFE FILE REPLACEMENT & UNGZL4 SUPPORT: -f now uses .tmp files with atomic rename on
+           success, protecting original from corruption if interrupted; SIGINT/SIGTERM cleanup temp
+           files; program name detection: "ungzl4" auto-enables decompression (-z overrides); two-
+           tier help: -h shows brief syntax, --help shows full documentation; -V shows version,
+           --version shows full details; all temp file operations reported at normal verbosity
+  v3.18.0  LZ4-COMPATIBLE -z FLAG: Fixed -z to work like standard lz4 tool; -z now forces
+           compression mode (ignores .lz4 extension auto-detection), allowing .lz4.lz4 files;
+           removed incorrect "force compressed output even if larger" behavior; always stores
+           smaller version (compressed or original); auto-detects decompression when input ends
+           with .lz4; warns when compressing .lz4 files without -z; matches lz4 CLI behavior
+  v3.17.1  UNIFIED VERBOSITY SYSTEM: Refactored verbosity into single 5-level system (0-4);
+           removed separate g_quiet flag and QLOG macro; -q sets level 0 (errors only), default
+           is level 1 (normal progress), -v/-vv/-vvv increment to 2/3/4; simpler, more standard
+           architecture; all output uses single VLOG macro; easier to maintain and extend
+  v3.17.0  QUIET MODE & PIPE CONVENIENCE: Added -q/--quiet flag to suppress all non-error
+           output (useful in scripts/pipes); proper EXIT_SUCCESS/EXIT_FAILURE return codes
+           on all paths; no-argument invocation automatically assumes pipe mode (stdin to
+           stdout) if stdout is not a tty, otherwise shows help; QLOG macro for conditional
+           output based on quiet flag
   v3.16.4  REFINED TEST MODE OUTPUT: Removed "Testing: <filename>" start line; progress
            and completion messages now show "Decompressing (test):" when in test mode;
            cleaner, more consistent output across all decompression modes
@@ -5059,6 +5219,24 @@ Changelog:
      * Main processing entry point
      */
     bool run(int argc, char* argv[]) {
+        // Setup signal handlers for cleanup
+        setupSignalHandlers();
+        
+        // If no arguments provided, assume pipe mode (stdin -> stdout)
+        // but only if stdout is not a terminal
+        if (argc == 1) {
+            if (isatty(STDOUT_FILENO)) {
+                // stdout is a terminal - show help instead
+                printHelp();
+                return false;
+            }
+            // Assume pipe mode: compress stdin to stdout
+            inputFile = "-";
+            outputFile = "-";
+            stdoutMode = true;
+            keepOriginal = true;
+        }
+        
         // Pre-process argv to convert -10, -11, -12 into --hc-level N
         preprocessArgv(argc, argv);
         
@@ -5122,9 +5300,22 @@ Changelog:
             cudaDeviceSynchronize();
         }
 
+        // On success, rename temp file to final name (if using temp file)
+        if (success && !tempOutputFile.empty()) {
+            success = renameTempToFinal();
+        }
+        
+        // On failure, cleanup temp file
+        if (!success) {
+            cleanupTempFile();
+        }
+
         return success;
     }
 };
+
+// Initialize static member
+GZL4Compressor* GZL4Compressor::g_instance = nullptr;
 
 /*
  * Main entry point
