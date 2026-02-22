@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.19.7";
+constexpr const char* VERSION = "3.20.0";
 
 // Compression backend modes
 enum class BackendMode {
@@ -1097,24 +1097,25 @@ public:
     bool start(const std::string& filename, XXH::State* xxh) {
         outputFile = filename;
         xxhState = xxh;
-        
-        // Open file with O_APPEND since header was already written by main thread
-        // File already exists with header, we're appending compressed blocks
-        outputFd = open(filename.c_str(), O_WRONLY | O_APPEND, 0644);
-        if (outputFd < 0) {
-            fprintf(stderr, "Error opening output file %s: %s\n", 
-                    filename.c_str(), strerror(errno));
-            return false;
-        }
-        
+
         // Allocate write staging buffer once
         writeBuf.resize(WRITE_BUF_SIZE);
         writeBufUsed = 0;
 
-        // Hint to kernel that we'll be writing sequentially
-        posix_fadvise(outputFd, 0, 0, POSIX_FADV_SEQUENTIAL);
-        
-        VLOG(VERBOSE, "AsyncWriter: opened %s for appending blocks\n", filename.c_str());
+        if (filename == "-") {
+            outputFd = STDOUT_FILENO;
+            VLOG(VERBOSE, "AsyncWriter: writing blocks to stdout\n");
+        } else {
+            // Open file with O_APPEND since header was already written by main thread
+            outputFd = open(filename.c_str(), O_WRONLY | O_APPEND, 0644);
+            if (outputFd < 0) {
+                fprintf(stderr, "Error opening output file %s: %s\n", 
+                        filename.c_str(), strerror(errno));
+                return false;
+            }
+            posix_fadvise(outputFd, 0, 0, POSIX_FADV_SEQUENTIAL);
+            VLOG(VERBOSE, "AsyncWriter: opened %s for appending blocks\n", filename.c_str());
+        }
         
         shouldStop.store(false);
         writerThread = std::thread(&AsyncWriter::writerLoop, this);
@@ -1169,8 +1170,7 @@ public:
             writerThread.join();
         }
         
-        if (outputFd >= 0) {
-            // Sync to disk before closing
+        if (outputFd >= 0 && outputFd != STDOUT_FILENO) {
             fsync(outputFd);
             close(outputFd);
             outputFd = -1;
@@ -2286,26 +2286,30 @@ public:
             headerBuffer.assign(headerStr.begin(), headerStr.end());
         }
         
-        // Open output and write header
-        int outputFd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (outputFd < 0) {
-            fprintf(stderr, "Error: Cannot create output file: %s\n", getActualOutputPath());
-            return false;
+        // Open output and write header (stdout or file)
+        {
+            int outputFd = stdoutMode ? STDOUT_FILENO
+                                      : open(getActualOutputPath(),
+                                             O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (outputFd < 0) {
+                fprintf(stderr, "Error: Cannot create output file: %s\n", getActualOutputPath());
+                return false;
+            }
+            ssize_t written = ::write(outputFd, headerBuffer.data(), headerBuffer.size());
+            if (written != (ssize_t)headerBuffer.size()) {
+                fprintf(stderr, "Error writing header\n");
+                if (!stdoutMode) close(outputFd);
+                return false;
+            }
+            if (!stdoutMode) close(outputFd);
         }
-        ssize_t written = ::write(outputFd, headerBuffer.data(), headerBuffer.size());
-        if (written != (ssize_t)headerBuffer.size()) {
-            fprintf(stderr, "Error writing header\n");
-            close(outputFd);
-            return false;
-        }
-        close(outputFd);
         
         // Initialize content checksum
         XXH::State xxhState(XXH32_SEED);
         
         // Start async writer
         AsyncWriter asyncWriter;
-        if (!asyncWriter.start(getActualOutputPath(), &xxhState)) {
+        if (!asyncWriter.start(stdoutMode ? "-" : getActualOutputPath(), &xxhState)) {
             fprintf(stderr, "Error: Failed to start async writer\n");
             return false;
         }
@@ -2433,30 +2437,30 @@ public:
             if (progressThread.joinable()) progressThread.join();
         }
         
-        // Write footer
-        outputFd = open(getActualOutputPath(), O_WRONLY | O_APPEND);
-        if (outputFd >= 0) {
-            uint32_t endMark = 0;
-            ssize_t bytesWritten = ::write(outputFd, &endMark, 4);
-            if (bytesWritten != 4) {
-                fprintf(stderr, "Error writing end mark\n");
+        // Write footer (end mark + checksum)
+        {
+            int footerFd = stdoutMode ? STDOUT_FILENO
+                                      : open(getActualOutputPath(), O_WRONLY | O_APPEND);
+            if (footerFd >= 0) {
+                uint32_t endMark = 0;
+                ssize_t bytesWritten = ::write(footerFd, &endMark, 4);
+                if (bytesWritten != 4)
+                    fprintf(stderr, "Error writing end mark\n");
+
+                uint32_t contentChecksum = xxhState.digest();
+                uint8_t checksumBuf[4] = {
+                    (uint8_t)(contentChecksum),
+                    (uint8_t)(contentChecksum >> 8),
+                    (uint8_t)(contentChecksum >> 16),
+                    (uint8_t)(contentChecksum >> 24)
+                };
+                bytesWritten = ::write(footerFd, checksumBuf, 4);
+                if (bytesWritten != 4)
+                    fprintf(stderr, "Error writing checksum\n");
+
+                if (!stdoutMode) { fsync(footerFd); close(footerFd); }
+                VLOG(VERBOSE, "Computed content checksum: 0x%08X\n", contentChecksum);
             }
-            
-            uint32_t contentChecksum = xxhState.digest();
-            uint8_t checksumBuf[4];
-            checksumBuf[0] = contentChecksum & 0xFF;
-            checksumBuf[1] = (contentChecksum >> 8) & 0xFF;
-            checksumBuf[2] = (contentChecksum >> 16) & 0xFF;
-            checksumBuf[3] = (contentChecksum >> 24) & 0xFF;
-            bytesWritten = ::write(outputFd, checksumBuf, 4);
-            if (bytesWritten != 4) {
-                fprintf(stderr, "Error writing checksum\n");
-            }
-            
-            fsync(outputFd);
-            close(outputFd);
-            
-            VLOG(VERBOSE, "Computed content checksum: 0x%08X\n", contentChecksum);
         }
         
         // Stop async reader
@@ -2482,8 +2486,7 @@ public:
         VLOG(VERBOSE, "  Uncompressed blocks: %zu / %zu (%.1f%%)\n",
              chunksExpanded, numChunks, 100.0 * chunksExpanded / numChunks);
         
-        // Remove original if not keeping
-        if (!keepOriginal) {
+        if (!keepOriginal && !stdoutMode) {
             if (unlink(inputFile.c_str()) != 0) {
                 fprintf(stderr, "Warning: Could not remove input file: %s\n",
                         inputFile.c_str());
@@ -2673,18 +2676,21 @@ public:
         }
         
         // Open output file and write header synchronously
-        int outputFd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (outputFd < 0) {
-            fprintf(stderr, "Error: Cannot create output file: %s\n", getActualOutputPath());
-            return false;
+        {
+            int hdrFd = stdoutMode ? STDOUT_FILENO
+                                   : open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (hdrFd < 0) {
+                fprintf(stderr, "Error: Cannot create output file: %s\n", getActualOutputPath());
+                return false;
+            }
+            ssize_t written = ::write(hdrFd, headerBuffer.data(), headerBuffer.size());
+            if (written != (ssize_t)headerBuffer.size()) {
+                fprintf(stderr, "Error writing header: %s\n", strerror(errno));
+                if (!stdoutMode) close(hdrFd);
+                return false;
+            }
+            if (!stdoutMode) close(hdrFd);
         }
-        ssize_t written = ::write(outputFd, headerBuffer.data(), headerBuffer.size());
-        if (written != (ssize_t)headerBuffer.size()) {
-            fprintf(stderr, "Error writing header: %s\n", strerror(errno));
-            close(outputFd);
-            return false;
-        }
-        close(outputFd);
         
         // Initialize content checksum with streaming state
         XXH::State xxhState(XXH32_SEED);
@@ -2951,37 +2957,31 @@ public:
         freeAllSlots();   // GPU memory freed after writer done (parallel with footer write)
         
         // Now append footer synchronously (end mark + checksum)
-        outputFd = open(getActualOutputPath(), O_WRONLY | O_APPEND);
-        if (outputFd < 0) {
-            fprintf(stderr, "Error reopening file for footer: %s\n", strerror(errno));
-            return false;
+        {
+            int footerFd = stdoutMode ? STDOUT_FILENO
+                                      : open(getActualOutputPath(), O_WRONLY | O_APPEND);
+            if (footerFd < 0) {
+                fprintf(stderr, "Error reopening file for footer: %s\n", strerror(errno));
+                return false;
+            }
+            uint32_t endMark = 0;
+            if (::write(footerFd, &endMark, 4) != 4)
+                fprintf(stderr, "Error writing end mark: %s\n", strerror(errno));
+
+            uint32_t contentChecksum = xxhState.digest();
+            uint8_t checksumBuf[4] = {
+                (uint8_t)(contentChecksum),
+                (uint8_t)(contentChecksum >> 8),
+                (uint8_t)(contentChecksum >> 16),
+                (uint8_t)(contentChecksum >> 24)
+            };
+            if (::write(footerFd, checksumBuf, 4) != 4)
+                fprintf(stderr, "Error writing checksum: %s\n", strerror(errno));
+
+            if (!stdoutMode) { fsync(footerFd); close(footerFd); }
+            VLOG(VERBOSE, "Computed content checksum: 0x%08X (from %zu bytes)\n",
+                 contentChecksum, xxhState.totalLen);
         }
-        
-        // Write end mark (4 zero bytes)
-        uint32_t endMark = 0;
-        ssize_t bytesWritten = ::write(outputFd, &endMark, 4);
-        if (bytesWritten != 4) {
-            fprintf(stderr, "Error writing end mark: %s\n", strerror(errno));
-        }
-        
-        // Write content checksum
-        uint32_t contentChecksum = xxhState.digest();
-        uint8_t checksumBuf[4];
-        checksumBuf[0] = contentChecksum & 0xFF;
-        checksumBuf[1] = (contentChecksum >> 8) & 0xFF;
-        checksumBuf[2] = (contentChecksum >> 16) & 0xFF;
-        checksumBuf[3] = (contentChecksum >> 24) & 0xFF;
-        bytesWritten = ::write(outputFd, checksumBuf, 4);
-        if (bytesWritten != 4) {
-            fprintf(stderr, "Error writing checksum: %s\n", strerror(errno));
-        }
-        
-        fsync(outputFd);
-        close(outputFd);
-        
-        VLOG(VERBOSE, "Computed content checksum: 0x%08X (from %zu bytes)\n", 
-             contentChecksum, xxhState.totalLen);
-        VLOG(DEBUG, "Wrote LZ4 footer: end mark + checksum 0x%08X\n", contentChecksum);
         
         auto endTime = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
@@ -3014,8 +3014,7 @@ public:
              gpus.size(), gpus.size() == 1 ? "" : "s",
              finalSlots, finalSlots == 1 ? "" : "s");
         
-        // Remove original file if not keeping
-        if (!keepOriginal) {
+        if (!keepOriginal && !stdoutMode) {
             if (unlink(inputFile.c_str()) != 0) {
                 fprintf(stderr, "Warning: Could not remove input file: %s\n", 
                         inputFile.c_str());
@@ -3190,12 +3189,15 @@ public:
                 fprintf(stderr,"Error: Failed to write LZ4 frame header\n"); return false;
             }
             std::string hstr = hs.str();
-            int fd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd = stdoutMode ? STDOUT_FILENO
+                                : open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) { fprintf(stderr,"Error: Cannot create output file\n"); return false; }
             if (::write(fd, hstr.data(), hstr.size()) != (ssize_t)hstr.size()) {
-                fprintf(stderr,"Error writing header\n"); close(fd); return false;
+                fprintf(stderr,"Error writing header\n");
+                if (!stdoutMode) close(fd);
+                return false;
             }
-            close(fd);
+            if (!stdoutMode) close(fd);
         }
 
         XXH::State xxhState(XXH32_SEED);
@@ -3477,7 +3479,8 @@ public:
 
         // Write end mark and checksum
         {
-            int fd = open(getActualOutputPath(), O_WRONLY | O_APPEND);
+            int fd = stdoutMode ? STDOUT_FILENO
+                                : open(getActualOutputPath(), O_WRONLY | O_APPEND);
             if (fd >= 0) {
                 uint32_t endMark = 0;
                 if (::write(fd, &endMark, 4) != 4)
@@ -3487,7 +3490,7 @@ public:
                                   (uint8_t)(cs>>16), (uint8_t)(cs>>24) };
                 if (::write(fd, cb, 4) != 4)
                     fprintf(stderr, "Error writing checksum\n");
-                fsync(fd); close(fd);
+                if (!stdoutMode) { fsync(fd); close(fd); }
                 VLOG(VERBOSE, "Content checksum: 0x%08X\n", cs);
             }
         }
@@ -3514,7 +3517,7 @@ public:
              cpuChunkCount.load(), 100.0*cpuChunkCount.load()/numChunks);
         VLOG(VERBOSE, "  Write: %.2f s\n", asyncWriter.getWriteTime());
 
-        if (!keepOriginal) {
+        if (!keepOriginal && !stdoutMode) {
             if (unlink(inputFile.c_str()) != 0)
                 fprintf(stderr, "Warning: Could not remove input file: %s\n",
                         inputFile.c_str());
@@ -3639,9 +3642,15 @@ public:
      * LZ4_decompress_safe() automatically (Error 12 triggers the fallback).
      */
     bool decompressFileGPU() {
-        VLOG(NORMAL, "Decompressing (GPU+fallback, %zu GPU%s): %s -> %s\n",
-                gpus.size(), gpus.size() == 1 ? "" : "s",
-                inputFile.c_str(), outputFile.c_str());
+        if (testMode) {
+            VLOG(NORMAL, "Testing (GPU+fallback, %zu GPU%s): %s\n",
+                    gpus.size(), gpus.size() == 1 ? "" : "s",
+                    inputFile.c_str());
+        } else {
+            VLOG(NORMAL, "Decompressing (GPU+fallback, %zu GPU%s): %s -> %s\n",
+                    gpus.size(), gpus.size() == 1 ? "" : "s",
+                    inputFile.c_str(), outputFile.c_str());
+        }
         
         
         // Open input file with direct I/O
@@ -4170,8 +4179,8 @@ public:
                 size_t pct = originalFileSize > 0
                     ? totalBytesWritten * 100 / originalFileSize : 0;
                 std::string ws = formatBytes(totalBytesWritten);
-                fprintf(stderr, "\rDecompressing%s: %3zu%%  %s written%s",
-                        testMode ? " (test)" : "",
+                fprintf(stderr, "\r%s: %3zu%%  %s%s",
+                        testMode ? "Testing" : "Decompressing",
                         pct, ws.c_str(), "          ");
                 fflush(stderr);
             }
@@ -4197,7 +4206,7 @@ public:
             totalBytesWritten += blk.data.size();
             results.erase(it);
             nextBlockToWrite++;
-            if (g_verbosity == NORMAL && estimatedBlocks > 10) {
+            if (!testMode && g_verbosity == NORMAL && estimatedBlocks > 10) {
                 size_t pct = originalFileSize > 0
                     ? totalBytesWritten * 100 / originalFileSize : 0;
                 std::string ws = formatBytes(totalBytesWritten);
@@ -4211,7 +4220,16 @@ public:
         auto endTime  = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
-        if (g_verbosity == NORMAL && estimatedBlocks > 10) fprintf(stderr, "\n");
+        // Force a final 100% update, then let the completion \r overwrite it
+        if (g_verbosity == NORMAL && estimatedBlocks > 10) {
+            std::string ts = formatBytes(originalFileSize);
+            if (testMode)
+                fprintf(stderr, "\rTesting: 100%%  %s%s", ts.c_str(), "          ");
+            else
+                fprintf(stderr, "\rWriting: 100%%  [%s / %s]%s",
+                        ts.c_str(), ts.c_str(), "          ");
+            fflush(stderr);
+        }
         
         // ── Verify content checksum ───────────────────────────────────────────
         // LZ4 frame layout: ... [block data] [end-mark = 0x00000000] [checksum 4B]
@@ -4241,17 +4259,12 @@ public:
             double ratio = compressedSize > 0 ? (100.0 * compressedSize / totalBytesWritten) : 0.0;
             std::string outputSize = formatBytes(totalBytesWritten);
             
-            // Overwrite progress line with completion message
-            VLOG(NORMAL, "\rDecompression (test) complete (GPU+fallback, %zu GPU%s): %s in %.2f s%s\n",
+            VLOG(NORMAL, "\rTest complete (GPU+fallback, %zu GPU%s): %s in %.2f s%s\n",
                     gpus.size(), gpus.size() == 1 ? "" : "s",
                     outputSize.c_str(), duration.count() / 1000.0,
-                    "          ");  // Clear any progress debris
-            
-            if (checksumOk) {
-                VLOG(NORMAL, "Test OK: %s\n", inputFile.c_str());
-            } else {
-                VLOG(NORMAL, "Test FAILED: %s (checksum mismatch)\n", inputFile.c_str());
-            }
+                    "          ");
+            VLOG(NORMAL, checksumOk ? "Test OK: %s\n" : "Test FAILED: %s (checksum mismatch)\n",
+                    inputFile.c_str());
             VLOG(VERBOSE, "  Compressed:   %.2f MB\n", compressedSize / (1024.0*1024.0));
             VLOG(VERBOSE, "  Uncompressed: %.2f MB  (ratio %.2f%%)\n",
                  totalBytesWritten / (1024.0*1024.0), ratio);
@@ -4267,7 +4280,7 @@ public:
                     "%s in %.2f s%s\n",
                     gpus.size(), gpus.size() == 1 ? "" : "s",
                     outputSize.c_str(), duration.count() / 1000.0,
-                    "          ");  // Clear any progress debris
+                    "          ");
             VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
             VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
                  gpuBlocks.load(), cpuFallbackBlocks.load(),
@@ -4362,9 +4375,15 @@ public:
         size_t chunkSize        = static_cast<size_t>(1) << (8 + 2 * desc.blockMaxSize);
         size_t estimatedBlocks  = (originalFileSize + chunkSize - 1) / chunkSize;
 
-        VLOG(NORMAL, "Decompressing (hybrid, %zu GPU%s + CPU): %s -> %s\n",
-                gpus.size(), gpus.size() == 1 ? "" : "s",
-                inputFile.c_str(), outputFile.c_str());
+        if (testMode) {
+            VLOG(NORMAL, "Testing (hybrid, %zu GPU%s + CPU): %s\n",
+                    gpus.size(), gpus.size() == 1 ? "" : "s",
+                    inputFile.c_str());
+        } else {
+            VLOG(NORMAL, "Decompressing (hybrid, %zu GPU%s + CPU): %s -> %s\n",
+                    gpus.size(), gpus.size() == 1 ? "" : "s",
+                    inputFile.c_str(), outputFile.c_str());
+        }
         VLOG(VERBOSE, "  %.2f MB  |  block size %zu KB  |  ~%zu blocks\n",
              originalFileSize / (1024.0*1024.0), chunkSize/1024, estimatedBlocks);
 
@@ -4719,8 +4738,8 @@ public:
                     ? totalBytesWritten * 100 / originalFileSize : 0;
                 std::string gpuStr = formatBytes(gpuBlocks.load() * chunkSize);
                 std::string cpuStr = formatBytes(cpuBlocks.load() * chunkSize);
-                fprintf(stderr, "\rDecompressing%s: %3zu%%  GPU: %s  CPU: %s%s",
-                        testMode ? " (test)" : "",
+                fprintf(stderr, "\r%s: %3zu%%  GPU: %s  CPU: %s%s",
+                        testMode ? "Testing" : "Decompressing",
                         pct, gpuStr.c_str(), cpuStr.c_str(), "          ");
                 fflush(stderr);
             }
@@ -4757,7 +4776,7 @@ public:
                 if (!flushedAny)
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 // Rate-limit progress to ~150ms (every 150 iterations of 1ms sleep)
-                if (g_verbosity == NORMAL && estimatedBlocks > 10 && (++drainIter % 150) == 1) {
+                if (!testMode && g_verbosity == NORMAL && estimatedBlocks > 10 && (++drainIter % 150) == 1) {
                     size_t pct = originalFileSize > 0
                         ? totalBytesWritten * 100 / originalFileSize : 0;
                     std::string ws = formatBytes(totalBytesWritten);
@@ -4772,7 +4791,21 @@ public:
 
         auto endTime  = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-        if (g_verbosity == NORMAL && estimatedBlocks > 10) fprintf(stderr, "\n");
+
+        // Force a final 100% update so the completion \r always has something clean to overwrite
+        if (g_verbosity == NORMAL && estimatedBlocks > 10) {
+            std::string ts = formatBytes(originalFileSize);
+            if (testMode) {
+                std::string gpuStr = formatBytes(gpuBlocks.load() * chunkSize);
+                std::string cpuStr = formatBytes(cpuBlocks.load() * chunkSize);
+                fprintf(stderr, "\rTesting: 100%%  GPU: %s  CPU: %s%s",
+                        gpuStr.c_str(), cpuStr.c_str(), "          ");
+            } else {
+                fprintf(stderr, "\rWriting: 100%%  [%s / %s]%s",
+                        ts.c_str(), ts.c_str(), "          ");
+            }
+            fflush(stderr);
+        }
 
         // ── Verify content checksum ───────────────────────────────────────────
         // Cursor sits right after the 0x00000000 end-mark  checksum is next 4 bytes.
@@ -4794,12 +4827,10 @@ public:
         std::string outputSize = formatBytes(totalBytesWritten);
         
         if (testMode) {
-            // Overwrite progress line with completion message
-            VLOG(NORMAL, "\rDecompression (test) complete (hybrid, %zu GPU%s): %s in %.2f s%s\n",
+            VLOG(NORMAL, "\rTest complete (hybrid, %zu GPU%s): %s in %.2f s%s\n",
                     gpus.size(), gpus.size()==1?"":"s",
                     outputSize.c_str(), duration.count()/1000.0,
-                    "          ");  // Clear any progress debris
-            
+                    "          ");
             VLOG(NORMAL, csOk ? "Test OK: %s\n" : "Test FAILED: %s (checksum mismatch)\n",
                     inputFile.c_str());
             VLOG(VERBOSE, "  %.2f MB in %.2f s  (%.2f MB/s)\n",
@@ -4809,7 +4840,7 @@ public:
                     "%s in %.2f s%s\n",
                     gpus.size(), gpus.size()==1?"":"s",
                     outputSize.c_str(), duration.count()/1000.0,
-                    "          ");  // Clear any progress debris
+                    "          ");
             VLOG(NORMAL, "  GPU: %zu blocks (%.1f%%)  CPU: %zu blocks (%.1f%%)  pass-through: %zu\n",
                     gpuBlocks.load(), 100.0 * gpuBlocks.load() / nextBlockToWrite,
                     cpuBlocks.load(), 100.0 * cpuBlocks.load() / nextBlockToWrite,
@@ -4869,32 +4900,38 @@ public:
         size_t estimatedBlocks = originalFileSize > 0 ?
             (originalFileSize + chunkSize - 1) / chunkSize : 0;
 
-        VLOG(NORMAL, "Decompressing%s: %s\n",
-                testMode ? " (test)" : "",
-                inputFile.c_str());
+        size_t numWorkers = (cpuThreads > 0) ? cpuThreads :
+                            std::thread::hardware_concurrency();
+        if (numWorkers == 0) numWorkers = 4;
+
+        if (testMode) {
+            VLOG(NORMAL, "Testing (CPU, %zu thread%s): %s\n",
+                    numWorkers, numWorkers == 1 ? "" : "s",
+                    inputFile.c_str());
+        } else {
+            VLOG(NORMAL, "Decompressing (CPU, %zu thread%s): %s -> %s\n",
+                    numWorkers, numWorkers == 1 ? "" : "s",
+                    inputFile.c_str(), outputFile.c_str());
+        }
         VLOG(VERBOSE, "  %.2f MB source  |  block size %zu KB  |  ~%zu blocks\n",
              originalFileSize/(1024.0*1024.0), chunkSize/1024, estimatedBlocks);
+        VLOG(VERBOSE, "CPU decompression: %zu worker threads\n", numWorkers);
 
         // Open output file (or null for test mode)
         int outputFd = -1;
         if (!testMode) {
-            std::string outPath = outputFile.empty() ?
-                inputFile.substr(0, inputFile.size() - 4) : outputFile;
-            int flags = O_WRONLY | O_CREAT | O_LARGEFILE;
-            if (!forceOverwrite) flags |= O_EXCL; else flags |= O_TRUNC;
-            outputFd = ::open(outPath.c_str(), flags, 0644);
-            if (outputFd < 0) {
-                fprintf(stderr, "Error opening output '%s': %s\n",
-                        outPath.c_str(), strerror(errno));
-                close(inputFd); return false;
+            if (stdoutMode) {
+                outputFd = STDOUT_FILENO;
+            } else {
+                outputFd = ::open(getActualOutputPath(),
+                                  O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, 0644);
+                if (outputFd < 0) {
+                    fprintf(stderr, "Error opening output '%s': %s\n",
+                            getActualOutputPath(), strerror(errno));
+                    close(inputFd); return false;
+                }
             }
         }
-
-        // ── thread counts ──────────────────────────────────────────────
-        size_t numWorkers = (cpuThreads > 0) ? cpuThreads :
-                            std::thread::hardware_concurrency();
-        if (numWorkers == 0) numWorkers = 4;
-        VLOG(VERBOSE, "CPU decompression: %zu worker threads\n", numWorkers);
 
         // ── shared block queue (reader → workers) ──────────────────────
         struct RawBlock {
@@ -5072,8 +5109,8 @@ public:
                 if (g_verbosity == NORMAL && estimatedBlocks > 10) {
                     size_t denom = std::max(estimatedBlocks, nextBlockToWrite);
                     std::string written = formatBytes(totalBytesWritten);
-                    fprintf(stderr, "\rDecompressing%s: %3zu%%  %s%s",
-                            testMode ? " (test)" : "",
+                    fprintf(stderr, "\r%s: %3zu%%  %s%s",
+                            testMode ? "Testing" : "Decompressing",
                             (100 * nextBlockToWrite) / denom, written.c_str(),
                             "          ");
                     fflush(stderr);
@@ -5100,7 +5137,7 @@ public:
         for (auto& w : workers) w.join();
 
         close(inputFd);
-        if (outputFd >= 0) { fsync(outputFd); close(outputFd); }
+        if (outputFd >= 0 && outputFd != STDOUT_FILENO) { fsync(outputFd); close(outputFd); }
 
         auto elapsed = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - startTime).count();
@@ -5110,8 +5147,8 @@ public:
             std::string outputSize = formatBytes(totalBytesWritten.load());
             
             // Overwrite progress line with completion message
-            fprintf(stderr, "\rDecompression%s complete (CPU, %zu thread%s): %s in %.2f s%s\n",
-                    testMode ? " (test)" : "",
+            fprintf(stderr, "\r%s (CPU, %zu thread%s): %s in %.2f s%s\n",
+                    testMode ? "Test complete" : "Decompression complete",
                     numWorkers, numWorkers==1?"":"s", outputSize.c_str(), elapsed,
                     "          ");  // Clear any progress debris
             
@@ -5603,16 +5640,36 @@ Architecture:
   Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
-  v3.19.5  --batch-size now works in decompression (both --gpu-only and --hybrid):
-           each N_STREAMS slot now holds slotCapacity blocks per nvCOMP batched call;
-           Error 12 (nvcompErrorInvalidValue, raw LZ4 format) is named explicitly in
-           VERBOSE log and falls back to LZ4_decompress_safe per block; --hybrid
-           decompressor now uses full N_STREAMS + slotCapacity slot-ring (previously
-           used single-stream single-block loop, ignoring --streams-per-gpu entirely);
-           "Compression level N: LZ4 fast" message suppressed during decompression
-           (chunk size comes from LZ4 frame header, not the level flag); "Initial
-           batch estimate" log similarly suppressed during decompression; VRAM
-           report now shows "N streams x SC blocks/batch, ~X MB VRAM"; version bump
+  v3.19.9  CONSISTENT TEST MODE (-t) OUTPUT: all three decompression backends
+           now show "Decompressing (test, <backend>): <infile>" with no arrow to
+           the output file; "Writing:" drain phase suppressed in test mode;
+           garbled residual characters from line-length mismatch fixed; CPU
+           opening line now includes thread count matching completion format
+  v3.19.8  STDOUT PIPELINE FIXES: all three compressors now write LZ4 header,
+           blocks, and footer to stdout in pipe mode; AsyncWriter handles stdout
+           correctly (no open("-"), no fsync(stdout), no close(stdout));
+           decompressFileCPU guards fsync/close against STDOUT_FILENO; all three
+           compressors guard unlink(inputFile) with !stdoutMode; writeBuf
+           allocation restored to AsyncWriter::start() (regression from v3.19.5)
+  v3.19.7  DECOMPRESSOR WRITE PROGRESS: GPU-only and hybrid now track bytes
+           written (output side) rather than blocks read; final drain shows
+           "Writing: N%  [X / Y]" for GPU-only and hybrid; hybrid live progress
+           shows live GPU/CPU byte split; hybrid completion shows GPU/CPU block
+           counts with percentages at normal verbosity (matching compression)
+  v3.19.6  DECOMPRESSOR CHUNK SIZE FROM FRAME HEADER: suppressed misleading
+           "Compression level N: LZ4 fast" log during decompression (chunk size
+           comes from the LZ4 frame header, not the level flag); all three
+           decompressors print "N MB | block size N KB | ~N blocks" at -v from
+           the parsed frame header; GPU-only decompressor now uses the same
+           single-line format as hybrid and CPU
+  v3.19.5  BATCHED GPU DECOMPRESSION + --hybrid STREAMS FIX: --batch-size now
+           controls nvCOMP batch size during decompression for both --gpu-only
+           and --hybrid; each stream slot holds SC blocks per nvCOMP call with
+           strided contiguous device buffers; Error 12 / nvcompErrorInvalidValue
+           (raw LZ4 format) named in verbose log with per-block CPU fallback;
+           --hybrid ported to full N_STREAMS x SC slot-ring (was single-stream,
+           silently ignoring --streams-per-gpu); -f rename now silent at normal
+           verbosity, shown as "Renaming: src -> dst" at -v and above
   v3.19.4  FAST --gpu-only DECOMPRESSION + --streams-per-gpu TUNING: decompressor
            uses N_STREAMS independent streams (default 32 single GPU, 16 for 2-4
            GPUs, 8 for 5+), each with batch_size=1 per nvCOMP call to avoid
