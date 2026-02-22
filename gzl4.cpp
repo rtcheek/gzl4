@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.22.0";
+constexpr const char* VERSION = "3.23.0";
 
 // Compression backend modes
 enum class BackendMode {
@@ -3803,7 +3803,7 @@ public:
         struct DecompSlot {
             cudaStream_t    stream         = nullptr;
             uint8_t*        d_comp         = nullptr;   // SC * maxCompSize
-            uint8_t*        d_decomp       = nullptr;   // SC * chunkSize
+            uint8_t*        d_decomp       = nullptr;   // SC * chunkSize  (device)
             void*           d_temp         = nullptr;   // SC * tempBytes
             void**          d_inPtr        = nullptr;   // [SC] ptrs into d_comp
             void**          d_outPtr       = nullptr;   // [SC] ptrs into d_decomp
@@ -3814,6 +3814,7 @@ public:
             size_t*         h_inSizes      = nullptr;   // pinned [SC] staging
             size_t*         h_actualSize   = nullptr;   // pinned [SC]
             nvcompStatus_t* h_status       = nullptr;   // pinned [SC]
+            uint8_t*        h_decomp       = nullptr;   // pinned mirror of d_decomp
             bool            inFlight       = false;
             size_t          batchCount     = 0;         // blocks dispatched this round
             std::vector<size_t> blockIdxs;              // [batchCount]
@@ -3846,6 +3847,7 @@ public:
                 if (cudaMallocHost(&sl.h_inSizes,    SC * sizeof(size_t))              != cudaSuccess) break;
                 if (cudaMallocHost(&sl.h_actualSize, SC * sizeof(size_t))              != cudaSuccess) break;
                 if (cudaMallocHost(&sl.h_status,     SC * sizeof(nvcompStatus_t))      != cudaSuccess) break;
+                if (cudaMallocHost(&sl.h_decomp,     SC * chunkSize)                   != cudaSuccess) break;
 
                 // Pre-fill invariant pointer arrays (never change between batches):
                 //   d_inPtr[i]      → d_comp   + i * maxCompSize
@@ -3937,11 +3939,11 @@ public:
                             out.gpuPath = false;
                             cpuFallbackBlocks++;
                         } else {
-                            // GPU succeeded
+                            // GPU succeeded  data already in pinned h_decomp
                             out.data.resize(actualOut);
-                            cudaMemcpy(out.data.data(),
-                                       sl.d_decomp + j * chunkSize,
-                                       actualOut, cudaMemcpyDeviceToHost);
+                            memcpy(out.data.data(),
+                                   sl.h_decomp + j * chunkSize,
+                                   actualOut);
                             out.gpuPath = true;
                             gpuBlocks++;
                             VLOG(VERY_VERBOSE, "Block %zu: GPU ok (%zu bytes)\n",
@@ -4011,6 +4013,10 @@ public:
                                         cudaMemcpyDeviceToHost, sl.stream);
                         cudaMemcpyAsync(sl.h_status, sl.d_status,
                                         sl.batchCount * sizeof(nvcompStatus_t),
+                                        cudaMemcpyDeviceToHost, sl.stream);
+                        // Async D→H of decompressed data  overlaps with next batch fill
+                        cudaMemcpyAsync(sl.h_decomp, sl.d_decomp,
+                                        sl.batchCount * chunkSize,
                                         cudaMemcpyDeviceToHost, sl.stream);
                     }
                     sl.inFlight = true;
@@ -4086,6 +4092,7 @@ public:
                 if (sl.h_inSizes)    cudaFreeHost(sl.h_inSizes);
                 if (sl.h_actualSize) cudaFreeHost(sl.h_actualSize);
                 if (sl.h_status)     cudaFreeHost(sl.h_status);
+                if (sl.h_decomp)     cudaFreeHost(sl.h_decomp);
             }
         };
 
@@ -4568,7 +4575,7 @@ public:
             struct HDecompSlot {
                 cudaStream_t    stream       = nullptr;
                 uint8_t*        d_comp       = nullptr;
-                uint8_t*        d_decomp     = nullptr;
+                uint8_t*        d_decomp     = nullptr;  // device output
                 void*           d_temp       = nullptr;
                 void**          d_inPtr      = nullptr;
                 void**          d_outPtr     = nullptr;
@@ -4579,6 +4586,7 @@ public:
                 size_t*         h_inSizes    = nullptr;
                 size_t*         h_actualSize = nullptr;
                 nvcompStatus_t* h_status     = nullptr;
+                uint8_t*        h_decomp     = nullptr;  // pinned host mirror of d_decomp
                 bool            inFlight     = false;
                 size_t          batchCount   = 0;
                 std::vector<size_t> blockIdxs;
@@ -4618,9 +4626,11 @@ public:
                 if (ok) tryAlloc(cudaMallocHost(&sl.h_inSizes,    SC * sizeof(size_t)),  "h_inSizes");
                 if (ok) tryAlloc(cudaMallocHost(&sl.h_actualSize, SC * sizeof(size_t)),  "h_actualSize");
                 if (ok) tryAlloc(cudaMallocHost(&sl.h_status, SC * sizeof(nvcompStatus_t)), "h_status");
+                if (ok) tryAlloc(cudaMallocHost(&sl.h_decomp,     SC * chunkSize),           "h_decomp");
 
                 if (!ok) {
                     // Free whatever was partially allocated for this slot
+                    if (sl.h_decomp)     cudaFreeHost(sl.h_decomp);
                     if (sl.h_status)     cudaFreeHost(sl.h_status);
                     if (sl.h_actualSize) cudaFreeHost(sl.h_actualSize);
                     if (sl.h_inSizes)    cudaFreeHost(sl.h_inSizes);
@@ -4648,15 +4658,18 @@ public:
                 cudaMemcpy(sl.d_outPtr,     hOutPtrs.data(), SC * sizeof(void*),  cudaMemcpyHostToDevice);
                 cudaMemcpy(sl.d_outBufSize, hOutBuf.data(),  SC * sizeof(size_t), cudaMemcpyHostToDevice);
                 slots.push_back(std::move(sl));
-                VLOG(DEBUG, "GPU%zu: slot %zu ok  cumulative %.0f MB VRAM\n",
-                     gpuIdx, si, slots.size() * perStreamVRAM / (1024.0*1024.0));
+                VLOG(DEBUG, "GPU%zu: slot %zu ok  VRAM %.0f MB  pinned %.0f MB\n",
+                     gpuIdx, si,
+                     slots.size() * perStreamVRAM / (1024.0*1024.0),
+                     slots.size() * SC * chunkSize / (1024.0*1024.0));
             }
 
             const size_t allocatedSlots = slots.size();
             VLOG(VERBOSE, "Hybrid GPU%zu: %zu/%zu streams × %zu blocks, "
-                 "~%.0f MB VRAM\n",
+                 "~%.0f MB VRAM + %.0f MB pinned host\n",
                  gpuIdx, allocatedSlots, N_STREAMS_H, SC,
-                 allocatedSlots * perStreamVRAM / (1024.0*1024.0));
+                 allocatedSlots * perStreamVRAM / (1024.0*1024.0),
+                 allocatedSlots * SC * chunkSize / (1024.0*1024.0));
 
             if (allocatedSlots == 0) {
                 fprintf(stderr,
@@ -4707,10 +4720,12 @@ public:
                         out.data.resize(r);
                         cpuBlocks++;
                     } else {
+                        // D→H already completed async on the stream before
+                        // cudaStreamSynchronize returned  just memcpy from pinned.
                         out.data.resize(actualOut);
-                        cudaMemcpy(out.data.data(),
-                                   sl.d_decomp + j * chunkSize,
-                                   actualOut, cudaMemcpyDeviceToHost);
+                        memcpy(out.data.data(),
+                               sl.h_decomp + j * chunkSize,
+                               actualOut);
                         gpuBlocks++;
                         VLOG(DEBUG, "GPU%zu block %zu: ok (%zu B)\n",
                              gpuIdx, sl.blockIdxs[j], actualOut);
@@ -4756,11 +4771,21 @@ public:
                     for (size_t j = 0; j < sl.batchCount; j++) sl.h_status[j] = apiSt;
                     cudaStreamSynchronize(sl.stream);
                 } else {
+                    // Async D→H: per-block metadata
                     cudaMemcpyAsync(sl.h_actualSize, sl.d_actualSize,
                                     sl.batchCount * sizeof(size_t),
                                     cudaMemcpyDeviceToHost, sl.stream);
                     cudaMemcpyAsync(sl.h_status, sl.d_status,
                                     sl.batchCount * sizeof(nvcompStatus_t),
+                                    cudaMemcpyDeviceToHost, sl.stream);
+                    // Async D→H: decompressed data for the whole batch.
+                    // Transfers all SC*chunkSize bytes; collectSlot uses
+                    // h_actualSize[j] to know how many bytes per block are valid.
+                    // This races ahead on the stream while the GPU worker is
+                    // busy filling the next batch, so by the time collectSlot
+                    // calls cudaStreamSynchronize the data is already in host RAM.
+                    cudaMemcpyAsync(sl.h_decomp, sl.d_decomp,
+                                    sl.batchCount * chunkSize,
                                     cudaMemcpyDeviceToHost, sl.stream);
                 }
                 sl.inFlight = true;
@@ -4811,6 +4836,7 @@ public:
                 if (sl.h_inSizes)    cudaFreeHost(sl.h_inSizes);
                 if (sl.h_actualSize) cudaFreeHost(sl.h_actualSize);
                 if (sl.h_status)     cudaFreeHost(sl.h_status);
+                if (sl.h_decomp)     cudaFreeHost(sl.h_decomp);
             }
         };  // end gpuWorker lambda
 
@@ -5796,6 +5822,17 @@ Architecture:
   Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
+  v3.23.0  Perf #1: pinned host output staging (h_decomp) for both
+           decompressFileGPU and decompressFileHybrid. Each slot now allocates
+           SC*chunkSize bytes of pinned host memory as a mirror of d_decomp.
+           dispatchSlot queues an async D→H of the full batch output on the same
+           stream immediately after nvCOMP, so the transfer overlaps with the
+           next batch being filled. collectSlot replaces the synchronous
+           cudaMemcpy with a plain memcpy from pinned RAM  eliminating the
+           CUDA driver's internal bounce-buffer and the blocking D→H stall.
+           Both compression paths (compressFileGPU, compressFileHybrid) already
+           had this optimization via PreallocSlot.h_output; decompression now
+           matches.
   v3.22.0  Hybrid decompression fixes: VRAM-aware stream auto-sizing (50% of
            free VRAM cap prevents OOM hang); goto-free GPU worker with per-slot
            CUDA error logging and graceful re-routing to CPU queue on alloc fail;
