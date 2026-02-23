@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.23.2";
+constexpr const char* VERSION = "3.23.3";
 
 // Compression backend modes
 enum class BackendMode {
@@ -2348,11 +2348,13 @@ public:
             auto readEnd = std::chrono::high_resolution_clock::now();
             timeReading += std::chrono::duration<double>(readEnd - readStart).count();
             
-            // PHASE 2: Collect results and enqueue for writing
+            // PHASE 2: Collect results and enqueue for writing.
+            // waitForResult blocks on cpuPool's resultCV  wakes immediately when
+            // the next in-order result is posted, no polling sleep needed.
             auto compressStart = std::chrono::high_resolution_clock::now();
             
             CPUCompressionPool::CompressResult result;
-            while (cpuPool.getResult(nextChunkToWrite, result)) {
+            while (cpuPool.waitForResult(nextChunkToWrite, result, 5)) {
                 // Always pass both compressed and original data to writeTask
                 // writeTask uses originalChunks for checksum and uncompressible fallback
                 std::vector<std::vector<uint8_t>> compressedChunks;
@@ -2396,11 +2398,7 @@ public:
                         progress, cpuBytes.c_str(), "          ");  // padding
                 fflush(stderr);
             }
-            
-            // Small sleep if waiting for results
-            if (nextChunkToWrite < chunksSubmitted) {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-            }
+            // No sleep needed  waitForResult handles blocking efficiently
         }
 
 // Commenting out the following line to allow the writer to overwrite the compression progress.	
@@ -2865,9 +2863,17 @@ public:
                     slot.hasPending = true;
                 }
                 
-                // If no activity this iteration, sleep briefly to avoid busy-waiting
+                // If no activity (all slots in-flight, reader exhausted), block
+                // on the first pending stream instead of spinning or sleeping.
+                // cudaStreamSynchronize yields to the OS until the GPU finishes 
+                // no CPU cycles wasted, no up-to-100µs discovery latency.
                 if (!anyActivity) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    for (int si = 0; si < nSlots; si++) {
+                        if (slots[si].hasPending) {
+                            cudaStreamSynchronize(slots[si].stream);
+                            break;
+                        }
+                    }
                 }
                 
                 // Exit when reader finished AND all slots are idle
@@ -4554,6 +4560,7 @@ public:
 
         // ── Shared state ──────────────────────────────────────────────────────
         std::mutex                    resultMutex;
+        std::condition_variable       resultCV;     // notified whenever a result is posted
         std::map<size_t, DecompBlock> results;
         std::atomic<bool>             decompError{false};
         std::atomic<size_t>           gpuBlocks{0}, cpuBlocks{0};
@@ -4648,6 +4655,7 @@ public:
                         results[rb.idx] = std::move(out);
                     }
                     blocksDone++;
+                    resultCV.notify_one();
                     nPass++;
                     VLOG(DEBUG, "Dispatcher: block %zu pass-through (%u B)\n",
                          blockIdx, bs);
@@ -4671,6 +4679,7 @@ public:
             gpuWorkQueue.close();
             cpuWorkQueue.close();
             dispatcherDone.store(true);
+            resultCV.notify_all();  // wake writer for termination check
             VLOG(DEBUG, "Dispatcher: done. total=%zu  gpu=%zu cpu=%zu pass=%zu  "
                  "queues closed\n", blockIdx, nGpu, nCpu, nPass);
         });
@@ -4848,6 +4857,7 @@ public:
                     { std::lock_guard<std::mutex> lk(resultMutex);
                       results[sl.blockIdxs[j]] = std::move(out); }
                     blocksDone++;
+                    resultCV.notify_one();
                     blocksProc++;
                 }
                 return true;
@@ -4986,6 +4996,7 @@ public:
                   results[block.idx] = std::move(out); }
                 cpuBlocks++;
                 blocksDone++;
+                resultCV.notify_one();
                 processed++;
             }
             VLOG(DEBUG, "CPU worker %zu: done (processed=%zu)\n", tidx, processed);
@@ -5040,8 +5051,14 @@ public:
                 break;
             }
 
-            if (!flushedAny)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (!flushedAny) {
+                std::unique_lock<std::mutex> lk(resultMutex);
+                resultCV.wait_for(lk, std::chrono::milliseconds(5), [&]{
+                    return results.count(nextBlockToWrite) > 0
+                        || decompError.load()
+                        || (dispatcherDone.load() && blocksDone.load() >= totalBlocks.load());
+                });
+            }
 
             // DEBUG heartbeat every ~2 s
             if (++dbgIter % 2000 == 0) {
@@ -5936,6 +5953,19 @@ Architecture:
   Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
+  v3.23.3  Perf: eliminated all polling sleeps from hot paths:
+           (1) CPU compressor: getResult()+sleep_for(100µs) replaced with
+               waitForResult() which blocks on cpuPool's existing resultCV 
+               wakes immediately when next in-order result is posted.
+           (2) GPU compressor worker: sleep_for(100µs) when all slots in-flight
+               replaced with cudaStreamSynchronize() on oldest pending stream 
+               yields to OS until GPU finishes, zero CPU cycles wasted.
+           (3) Hybrid decompressor writer: sleep_for(1ms) replaced with
+               resultCV.wait_for(5ms); resultCV added to shared state;
+               notify_one() added in all three result-posting sites (dispatcher
+               pass-through, GPU worker collectSlot, CPU worker) plus
+               notify_all() when dispatcher sets dispatcherDone.
+           Only progress-display sleeps remain (150ms/200ms rate limiters).
   v3.23.2  Perf: two fixes for decompressFileGPU based on diagnostic data:
            (1) N_STREAMS hardcoded (32/16/8) replaced with VRAM-aware formula
                identical to --hybrid: cap at 50% free VRAM AND cap total pinned
