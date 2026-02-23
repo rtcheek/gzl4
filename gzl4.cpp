@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.23.0";
+constexpr const char* VERSION = "3.23.2";
 
 // Compression backend modes
 enum class BackendMode {
@@ -3733,11 +3733,13 @@ public:
 
         std::mutex                  resultMutex;
         std::map<size_t, DecompBlock> results;    // blockIdx → decompressed
+        std::condition_variable     resultCV;     // notified whenever a result is posted
         std::atomic<size_t>         blocksQueued{0};
         std::atomic<size_t>         blocksDone{0};
         std::atomic<bool>           readDone{false};
         std::atomic<bool>           decompError{false};
         std::atomic<size_t>         gpuBlocks{0}, cpuFallbackBlocks{0};
+        std::atomic<size_t>         totalBlocks{0};  // set by reader once end-mark seen
 
         // ── Block queue for GPU workers ────────────────────────────────────────
         struct RawBlock {
@@ -3776,21 +3778,51 @@ public:
         // Tune with --streams-per-gpu N and --batch-size SC.
 
         // N_STREAMS: number of concurrent GPU decompression streams.
-        // Controlled by --streams-per-gpu.  If the user didn't explicitly set it
-        // (pipelineDepth was auto-tuned for compression to 4), use a decompression-
-        // specific default: 32 for single GPU, 16 for 2-4 GPUs, 8 for 5+ GPUs.
-        // More streams = more blocks in flight simultaneously = better GPU utilisation.
-        // Each stream uses ~12 MB VRAM (at 4 MB chunk size), so 32 streams = ~384 MB.
+        // Previously hardcoded (32 for 1 GPU, 16 for 2-4, 8 for 5+), which
+        // ignored the actual VRAM available and  critically  pinned host memory.
+        //
+        // Each slot requires:
+        //   VRAM : SC × (maxCompSize + chunkSize + tempBytes)  ≈ SC × 3 × chunkSize
+        //   host : SC × chunkSize  (pinned h_decomp buffer, non-pageable RAM)
+        //
+        // At SC=64, chunkSize=4MB: 768 MB VRAM + 256 MB pinned per stream.
+        // With 32 streams: 24 GB VRAM + 8 GB pinned.  The 8 GB of pinned
+        // memory crowds out the OS page cache used by write(), measurably
+        // slowing output even though the GPU never stalls.
+        //
+        // Fix: mirror hybrid's formula  cap at 50% of free VRAM, then also
+        // cap the total pinned allocation at 4 GB (a comfortable ceiling on
+        // most systems while leaving the page cache largely intact).
         size_t N_STREAMS;
         if (pipelineDepth > 0) {
             // User explicitly set --streams-per-gpu  honour it exactly
             N_STREAMS = (size_t)pipelineDepth;
-        } else if (gpus.size() == 1) {
-            N_STREAMS = 32;
-        } else if (gpus.size() <= 4) {
-            N_STREAMS = 16;
+            VLOG(DEBUG, "N_STREAMS = %zu (user --streams-per-gpu)\n", N_STREAMS);
         } else {
-            N_STREAMS = 8;
+            const size_t maxComp_g     = chunkSize + (chunkSize / 255) + 16;
+            const size_t perStreamVRAM = slotCapacity * (maxComp_g + chunkSize + chunkSize);
+            const size_t perStreamPin  = slotCapacity * chunkSize;   // h_decomp pinned per stream
+            const size_t pinnedCap     = 4ULL * 1024 * 1024 * 1024; // 4 GB ceiling
+
+            // VRAM cap: 50% of free on GPU 0 (same as hybrid), ceiling 32
+            size_t freeVRAM    = gpus[0].availableMemory;
+            size_t autoByVRAM  = (freeVRAM / 2) / perStreamVRAM;
+            if (autoByVRAM < 1)  autoByVRAM = 1;
+            if (autoByVRAM > 32) autoByVRAM = 32;
+
+            // Pinned memory cap: don't allocate more than pinnedCap bytes of h_decomp
+            size_t autoByPin = pinnedCap / perStreamPin;
+            if (autoByPin < 1)  autoByPin = 1;
+            if (autoByPin > 32) autoByPin = 32;
+
+            N_STREAMS = std::min(autoByVRAM, autoByPin);
+
+            VLOG(DEBUG, "N_STREAMS auto: freeVRAM=%.1f GB  perStreamVRAM=%.0f MB  "
+                 "perStreamPin=%.0f MB  byVRAM=%zu  byPin=%zu  -> %zu\n",
+                 freeVRAM / (1024.0*1024.0*1024.0),
+                 perStreamVRAM / (1024.0*1024.0),
+                 perStreamPin  / (1024.0*1024.0),
+                 autoByVRAM, autoByPin, N_STREAMS);
         }
         VLOG(VERBOSE, "GPU decompressor: %zu streams per GPU%s, batch-size %zu\n",
              N_STREAMS, pipelineDepth > 0 ? " (user-specified)" : " (auto)",
@@ -3875,9 +3907,10 @@ public:
                 VLOG(VERBOSE, "GPU%zu: allocated %zu/%zu decompression slots (VRAM limited)\n",
                      gpuIdx, allocatedSlots, N_STREAMS);
             } else {
-                VLOG(VERBOSE, "GPU%zu: %zu streams × %zu blocks/batch, ~%.0f MB VRAM\n",
+                VLOG(VERBOSE, "GPU%zu: %zu streams × %zu blocks/batch, ~%.0f MB VRAM + ~%.0f MB pinned\n",
                      gpuIdx, N_STREAMS, SC,
-                     N_STREAMS * SC * (maxCompSize + chunkSize + tempBytes) / (1024.0*1024.0));
+                     N_STREAMS * SC * (maxCompSize + chunkSize + tempBytes) / (1024.0*1024.0),
+                     N_STREAMS * SC * chunkSize / (1024.0*1024.0));
             }
 
             {
@@ -3955,6 +3988,7 @@ public:
                             results[sl.blockIdxs[j]] = std::move(out);
                         }
                         blocksDone++;
+                        resultCV.notify_one();  // wake writer immediately
                     }
                     return true;
                 };
@@ -4053,6 +4087,7 @@ public:
                                 results[block.idx] = std::move(out);
                             }
                             blocksDone++;
+                            resultCV.notify_one();  // wake writer immediately
                             continue;
                         }
                         batch.push_back(std::move(block));
@@ -4102,87 +4137,154 @@ public:
         for (size_t g = 0; g < gpus.size(); g++)
             workerThreads.emplace_back(gpuWorker, g);
 
-        // ── Reader: parse LZ4 frame blocks and enqueue ─────────────────────────
-        size_t nextBlockToRead  = 0;
-        size_t nextBlockToWrite = 0;
+        // ── Reader thread: parse LZ4 frame, enqueue blocks ────────────────────
+        // Runs concurrently with the writer loop below and the GPU worker threads.
+        // Previously the main thread did read→enqueue→write serially: while it was
+        // reading the next block the GPU workers starved for work, and while it was
+        // writing the results map filled.  Moving reads here gives true overlap.
+        std::atomic<int64_t>  readUs{0};   // diagnostic: time inside ::read()
+        size_t nextBlockToWrite  = 0;
         size_t totalBytesWritten = 0;
         auto   startTime = std::chrono::high_resolution_clock::now();
 
-        while (!decompError) {
-            uint32_t blockSize32 = 0;
-            ssize_t  nr = ::read(inputFd, &blockSize32, 4);
-            if (nr == 0) break;  // clean EOF
-            if (nr != 4) {
-                fprintf(stderr, "Error: truncated block-size field at block %zu\n",
-                        nextBlockToRead);
-                decompError = true; break;
+        std::thread readerThread([&]() {
+            size_t blockIdx = 0;
+            while (!decompError) {
+                uint32_t blockSize32 = 0;
+                auto rt0 = std::chrono::steady_clock::now();
+                ssize_t nr = ::read(inputFd, &blockSize32, 4);
+                readUs.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - rt0).count());
+                if (nr == 0) break;  // clean EOF
+                if (nr != 4) {
+                    fprintf(stderr, "Error: truncated block-size field at block %zu\n",
+                            blockIdx);
+                    decompError = true; break;
+                }
+
+                // LZ4 end mark
+                if (blockSize32 == 0) { estimatedBlocks = blockIdx; break; }
+
+                bool isUncomp    = (blockSize32 & 0x80000000u) != 0;
+                uint32_t blockSize = blockSize32 & 0x7FFFFFFFu;
+
+                if (blockSize > 128u * 1024 * 1024) {
+                    fprintf(stderr, "Error: implausibly large block %u at block %zu\n",
+                            blockSize, blockIdx);
+                    decompError = true; break;
+                }
+
+                std::vector<uint8_t> raw(blockSize);
+                {
+                    auto rt1 = std::chrono::steady_clock::now();
+                    if (::read(inputFd, raw.data(), blockSize) != (ssize_t)blockSize) {
+                        fprintf(stderr, "Error: truncated block data at block %zu\n",
+                                blockIdx);
+                        decompError = true; break;
+                    }
+                    readUs.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - rt1).count());
+                }
+
+                VLOG(DEBUG, "Reader: block %zu size=%u isUncomp=%d\n",
+                     blockIdx, blockSize, (int)isUncomp);
+
+                RawBlock rb;
+                rb.idx      = blockIdx;
+                rb.origSize = chunkSize;
+                if (isUncomp)
+                    rb.rawData  = std::move(raw);
+                else
+                    rb.compData = std::move(raw);
+                blocksQueued++;
+                {
+                    std::lock_guard<std::mutex> lk(blockQueueMutex);
+                    blockQueue.push(std::move(rb));
+                }
+                blockQueueCV.notify_one();
+                blockIdx++;
             }
+            // Store total count so the writer knows when all blocks are accounted for
+            totalBlocks.store(blockIdx);
+            readDone = true;
+            blockQueueCV.notify_all();
+            resultCV.notify_all();  // wake writer for termination check
+            VLOG(DEBUG, "Reader: done, totalBlocks=%zu\n", blockIdx);
+        });
 
-            // LZ4 end mark
-            if (blockSize32 == 0) { estimatedBlocks = nextBlockToRead; break; }
+        // ── Writer loop (main thread): drain results map and write in order ────
+        // Termination: readDone && blocksDone >= totalBlocks (all blocks processed).
+        // Using blocksDone (incremented by GPU workers after each block) avoids
+        // racing on nextBlockToWrite vs pass-through blocks handled by workers.
+        int64_t writeUs    = 0;
+        int64_t waitUs     = 0;
+        size_t  drainCalls = 0;
+        size_t  drainBlocks= 0;
+        size_t  maxPending = 0;
+        size_t  dbgIter    = 0;
 
-            bool isUncomp = (blockSize32 & 0x80000000u) != 0;
-            uint32_t blockSize = blockSize32 & 0x7FFFFFFFu;
-
-            if (blockSize > 128u * 1024 * 1024) {
-                fprintf(stderr, "Error: implausibly large block %u at block %zu\n",
-                        blockSize, nextBlockToRead);
-                decompError = true; break;
-            }
-
-            std::vector<uint8_t> raw(blockSize);
-            if (::read(inputFd, raw.data(), blockSize) != (ssize_t)blockSize) {
-                fprintf(stderr, "Error: truncated block data at block %zu\n",
-                        nextBlockToRead);
-                decompError = true; break;
-            }
-
-            VLOG(DEBUG, "Block %zu: size=%u isUncomp=%d\n",
-                 nextBlockToRead, blockSize, (int)isUncomp);
-
-            RawBlock rb;
-            rb.idx      = nextBlockToRead++;
-            rb.origSize = chunkSize;
-            if (isUncomp) {
-                rb.rawData  = std::move(raw);  // pass-through
-                // compData stays empty  worker will see this and skip GPU
-            } else {
-                rb.compData = std::move(raw);
-            }
-            blocksQueued++;
-            VLOG(VERY_VERBOSE, "Reader: queued block %zu  compSize=%u  isUncomp=%d\n",
-                 rb.idx, blockSize, (int)isUncomp);
-
-            {
-                std::lock_guard<std::mutex> lk(blockQueueMutex);
-                blockQueue.push(std::move(rb));
-            }
-            blockQueueCV.notify_one();
-
-            // ── Writer: flush completed sequential blocks while reading ─────────
-            // Interleave writing with reading so memory doesn't pile up.
+        while (true) {
+            bool flushedAny = false;
             while (!decompError) {
                 std::lock_guard<std::mutex> lk(resultMutex);
                 auto it = results.find(nextBlockToWrite);
                 if (it == results.end()) break;
-
                 auto& blk = it->second;
                 xxhState.update(blk.data.data(), blk.data.size());
                 if (outputFd >= 0) {
+                    auto wt0 = std::chrono::steady_clock::now();
                     if (::write(outputFd, blk.data.data(), blk.data.size())
                             != (ssize_t)blk.data.size()) {
                         fprintf(stderr, "Error: write failed at block %zu\n",
                                 nextBlockToWrite);
                         decompError = true;
                     }
+                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - wt0).count();
                 }
                 totalBytesWritten += blk.data.size();
                 results.erase(it);
                 nextBlockToWrite++;
+                flushedAny = true;
+            }
+            if (flushedAny) {
+                drainCalls++;
+                // (drainBlocks accounting done separately below  blocks counted individually)
+                size_t pending = 0;
+                { std::lock_guard<std::mutex> lk(resultMutex); pending = results.size(); }
+                if (pending > maxPending) maxPending = pending;
+            }
+            drainBlocks = nextBlockToWrite;
+
+            if (decompError) break;
+
+            // Termination check  same logic as hybrid dispatcher
+            size_t tb = totalBlocks.load();
+            size_t bd = blocksDone.load();
+            if (readDone.load() && tb > 0 && bd >= tb) {
+                VLOG(DEBUG, "Writer: done  totalBlocks=%zu  blocksDone=%zu  written=%zu\n",
+                     tb, bd, nextBlockToWrite);
+                break;
             }
 
-            // Progress display  show bytes written (output side, not read side)
-            if (g_verbosity == NORMAL && estimatedBlocks > 10) {
+            if (!flushedAny) {
+                // Wait efficiently for the next result rather than polling every 1ms.
+                // resultCV is notified by the GPU worker immediately after each
+                // blocksDone++  this eliminates the up-to-1ms discovery latency
+                // that previously accumulated to 3.8s of stall time.
+                std::unique_lock<std::mutex> lk(resultMutex);
+                auto wt0 = std::chrono::steady_clock::now();
+                resultCV.wait_for(lk, std::chrono::milliseconds(5), [&]{
+                    return results.count(nextBlockToWrite) > 0
+                        || decompError.load()
+                        || (readDone.load() && blocksDone.load() >= totalBlocks.load());
+                });
+                waitUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - wt0).count();
+            }
+
+            // Progress display
+            if (g_verbosity == NORMAL && estimatedBlocks > 10 && ++dbgIter % 4 == 0) {
                 size_t pct = originalFileSize > 0
                     ? totalBytesWritten * 100 / originalFileSize : 0;
                 std::string ws = formatBytes(totalBytesWritten);
@@ -4193,12 +4295,13 @@ public:
             }
         }
 
-        // ── Signal workers that reading is done, then join ─────────────────────
-        readDone = true;
+        // ── Join reader and GPU workers ────────────────────────────────────────
+        readerThread.join();
+        readDone = true;           // ensure set in error-exit paths
         blockQueueCV.notify_all();
         for (auto& t : workerThreads) t.join();
 
-        // ── Final writer flush for any remaining in-order results ──────────────
+        // ── Final drain (should be empty; defensive) ──────────────────────────
         while (!decompError) {
             std::lock_guard<std::mutex> lk(resultMutex);
             auto it = results.find(nextBlockToWrite);
@@ -4206,9 +4309,12 @@ public:
             auto& blk = it->second;
             xxhState.update(blk.data.data(), blk.data.size());
             if (outputFd >= 0) {
+                auto wt0 = std::chrono::steady_clock::now();
                 if (::write(outputFd, blk.data.data(), blk.data.size())
                         != (ssize_t)blk.data.size())
                     fprintf(stderr, "Warning: write error in final flush\n");
+                writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - wt0).count();
             }
             totalBytesWritten += blk.data.size();
             results.erase(it);
@@ -4292,6 +4398,15 @@ public:
             VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
                  gpuBlocks.load(), cpuFallbackBlocks.load(),
                  nextBlockToWrite - gpuBlocks.load() - cpuFallbackBlocks.load());
+            VLOG(VERBOSE, "  Timing breakdown:\n");
+            VLOG(VERBOSE, "    read(compressed):  %6.3f s\n",  readUs.load()  / 1e6);
+            VLOG(VERBOSE, "    write(decomp out): %6.3f s  (%zu calls, avg %.2f ms each)\n",
+                 writeUs / 1e6, nextBlockToWrite,
+                 writeUs / 1e3 / std::max(size_t(1), nextBlockToWrite));
+            VLOG(VERBOSE, "    wait(result stall):%6.3f s\n",  waitUs / 1e6);
+            VLOG(VERBOSE, "    drain efficiency:  %.2f blocks/call  (high-water pending: %zu)\n",
+                 drainCalls > 0 ? (double)drainBlocks / drainCalls : 0.0,
+                 maxPending);
         }
         
         // Remove compressed file if not keeping
@@ -4601,7 +4716,6 @@ public:
 
             for (size_t si = 0; si < N_STREAMS_H; si++) {
                 HDecompSlot sl;
-                cudaError_t e;
                 bool ok = true;
                 auto tryAlloc = [&](cudaError_t err, const char* what) {
                     if (err != cudaSuccess) {
@@ -5822,6 +5936,26 @@ Architecture:
   Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
+  v3.23.2  Perf: two fixes for decompressFileGPU based on diagnostic data:
+           (1) N_STREAMS hardcoded (32/16/8) replaced with VRAM-aware formula
+               identical to --hybrid: cap at 50% free VRAM AND cap total pinned
+               h_decomp at 4 GB.  At SC=64, chunkSize=4MB the old 32-stream
+               default allocated 8 GB of pinned host memory, crowding out the
+               OS page cache used by write() and showing up as unexpectedly slow
+               write() syscalls.  Expected ~10 streams (same as hybrid auto).
+           (2) Writer loop 1ms poll replaced with resultCV.wait_for(5ms).
+               GPU workers now call resultCV.notify_one() after every blocksDone++
+               so the writer wakes immediately when a result is ready instead of
+               discovering it up to 1ms later.  Previously accumulated 3.8s of
+               wait time in 1ms sleep increments.
+  v3.23.1  Perf: decompressFileGPU  dedicated reader thread so disk reads and
+           disk writes run concurrently instead of serially on the main thread.
+           Previously: read block → enqueue → drain results → write → repeat.
+           Now: reader thread reads/enqueues; main thread is pure writer (mirrors
+           --hybrid dispatcher architecture). Diagnostics showed GPU never stalls
+           (waitUs≈0), write consumes 24% of runtime, results pile 256 blocks deep
+            confirming the bottleneck was serial read/write serialisation. Also
+           retains -v timing breakdown: read/write/wait/drain-efficiency.
   v3.23.0  Perf #1: pinned host output staging (h_decomp) for both
            decompressFileGPU and decompressFileHybrid. Each slot now allocates
            SC*chunkSize bytes of pinned host memory as a mirror of d_decomp.
