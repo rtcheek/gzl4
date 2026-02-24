@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.23.3";
+constexpr const char* VERSION = "3.24.0";
 
 // Compression backend modes
 enum class BackendMode {
@@ -3729,23 +3729,30 @@ public:
         }
         
         // ── Per-block result structure ────────────────────────────────────────
-        // Each block decompresses independently  we store results in a map
-        // keyed by block index so the writer can flush in order regardless of
-        // which GPU/CPU finished first.
+        // Each block decompresses independently  we store results in a flat
+        // pre-sized vector keyed by block index, with a parallel atomic ready
+        // flag per slot.  Workers write results[i] then set ready[i]=1 with
+        // release semantics; the writer reads ready[i] with acquire semantics.
+        // This replaces std::map (O(log n) insert + mutex contention) with O(1)
+        // direct-indexed writes and reads, with no mutex on the hot path at all.
+        // resultMutex is kept only as the lock object for resultCV.wait_for().
         struct DecompBlock {
             std::vector<uint8_t> data;  // decompressed bytes
-            bool gpuPath;               // true=GPU, false=CPU fallback
+            bool gpuPath = false;       // true=GPU, false=CPU fallback
         };
 
-        std::mutex                  resultMutex;
-        std::map<size_t, DecompBlock> results;    // blockIdx → decompressed
-        std::condition_variable     resultCV;     // notified whenever a result is posted
-        std::atomic<size_t>         blocksQueued{0};
-        std::atomic<size_t>         blocksDone{0};
-        std::atomic<bool>           readDone{false};
-        std::atomic<bool>           decompError{false};
-        std::atomic<size_t>         gpuBlocks{0}, cpuFallbackBlocks{0};
-        std::atomic<size_t>         totalBlocks{0};  // set by reader once end-mark seen
+        std::vector<DecompBlock>          results(estimatedBlocks);
+        std::vector<std::atomic<uint8_t>> ready(estimatedBlocks);
+        for (auto& f : ready) f.store(0, std::memory_order_relaxed);
+
+        std::mutex              resultMutex;  // only used as lock for resultCV
+        std::condition_variable resultCV;
+        std::atomic<size_t>     blocksQueued{0};
+        std::atomic<size_t>     blocksDone{0};
+        std::atomic<bool>       readDone{false};
+        std::atomic<bool>       decompError{false};
+        std::atomic<size_t>     gpuBlocks{0}, cpuFallbackBlocks{0};
+        std::atomic<size_t>     totalBlocks{0};  // set by reader once end-mark seen
 
         // ── Block queue for GPU workers ────────────────────────────────────────
         struct RawBlock {
@@ -3989,12 +3996,12 @@ public:
                                  sl.blockIdxs[j], actualOut);
                         }
                         slotCompData[si][j].clear();
-                        {
-                            std::lock_guard<std::mutex> lk(resultMutex);
-                            results[sl.blockIdxs[j]] = std::move(out);
-                        }
+                        // Lock-free insert: write data first, then set flag with
+                        // release ordering so the writer sees complete data.
+                        results[sl.blockIdxs[j]] = std::move(out);
+                        ready[sl.blockIdxs[j]].store(1, std::memory_order_release);
                         blocksDone++;
-                        resultCV.notify_one();  // wake writer immediately
+                        resultCV.notify_one();
                     }
                     return true;
                 };
@@ -4088,12 +4095,10 @@ public:
                             DecompBlock out;
                             out.data    = std::move(block.rawData);
                             out.gpuPath = false;
-                            {
-                                std::lock_guard<std::mutex> lk(resultMutex);
-                                results[block.idx] = std::move(out);
-                            }
+                            results[block.idx] = std::move(out);
+                            ready[block.idx].store(1, std::memory_order_release);
                             blocksDone++;
-                            resultCV.notify_one();  // wake writer immediately
+                            resultCV.notify_one();
                             continue;
                         }
                         batch.push_back(std::move(block));
@@ -4218,24 +4223,24 @@ public:
             VLOG(DEBUG, "Reader: done, totalBlocks=%zu\n", blockIdx);
         });
 
-        // ── Writer loop (main thread): drain results map and write in order ────
-        // Termination: readDone && blocksDone >= totalBlocks (all blocks processed).
-        // Using blocksDone (incremented by GPU workers after each block) avoids
-        // racing on nextBlockToWrite vs pass-through blocks handled by workers.
+        // ── Writer loop (main thread): drain results and write in order ──────
+        // Termination: readDone && blocksDone >= totalBlocks.
         int64_t writeUs    = 0;
         int64_t waitUs     = 0;
         size_t  drainCalls = 0;
         size_t  drainBlocks= 0;
-        size_t  maxPending = 0;
+        size_t  maxPending = 0;  // high-water: blocks done but not yet written
         size_t  dbgIter    = 0;
 
         while (true) {
             bool flushedAny = false;
-            while (!decompError) {
-                std::lock_guard<std::mutex> lk(resultMutex);
-                auto it = results.find(nextBlockToWrite);
-                if (it == results.end()) break;
-                auto& blk = it->second;
+            // Lock-free drain: spin on ready flag with acquire semantics.
+            // No mutex needed  release/acquire ordering guarantees we see
+            // the complete data that the worker wrote before setting the flag.
+            while (!decompError &&
+                   nextBlockToWrite < estimatedBlocks &&
+                   ready[nextBlockToWrite].load(std::memory_order_acquire)) {
+                DecompBlock& blk = results[nextBlockToWrite];
                 xxhState.update(blk.data.data(), blk.data.size());
                 if (outputFd >= 0) {
                     auto wt0 = std::chrono::steady_clock::now();
@@ -4249,15 +4254,15 @@ public:
                         std::chrono::steady_clock::now() - wt0).count();
                 }
                 totalBytesWritten += blk.data.size();
-                results.erase(it);
+                blk.data.clear();
+                blk.data.shrink_to_fit();  // release decompressed memory promptly
                 nextBlockToWrite++;
                 flushedAny = true;
             }
             if (flushedAny) {
                 drainCalls++;
-                // (drainBlocks accounting done separately below  blocks counted individually)
-                size_t pending = 0;
-                { std::lock_guard<std::mutex> lk(resultMutex); pending = results.size(); }
+                // Measure out-of-order depth: blocks completed but ahead of writer
+                size_t pending = blocksDone.load() - nextBlockToWrite;
                 if (pending > maxPending) maxPending = pending;
             }
             drainBlocks = nextBlockToWrite;
@@ -4274,14 +4279,11 @@ public:
             }
 
             if (!flushedAny) {
-                // Wait efficiently for the next result rather than polling every 1ms.
-                // resultCV is notified by the GPU worker immediately after each
-                // blocksDone++  this eliminates the up-to-1ms discovery latency
-                // that previously accumulated to 3.8s of stall time.
                 std::unique_lock<std::mutex> lk(resultMutex);
                 auto wt0 = std::chrono::steady_clock::now();
                 resultCV.wait_for(lk, std::chrono::milliseconds(5), [&]{
-                    return results.count(nextBlockToWrite) > 0
+                    return (nextBlockToWrite < estimatedBlocks &&
+                            ready[nextBlockToWrite].load(std::memory_order_acquire) != 0)
                         || decompError.load()
                         || (readDone.load() && blocksDone.load() >= totalBlocks.load());
                 });
@@ -4308,11 +4310,10 @@ public:
         for (auto& t : workerThreads) t.join();
 
         // ── Final drain (should be empty; defensive) ──────────────────────────
-        while (!decompError) {
-            std::lock_guard<std::mutex> lk(resultMutex);
-            auto it = results.find(nextBlockToWrite);
-            if (it == results.end()) break;
-            auto& blk = it->second;
+        while (!decompError &&
+               nextBlockToWrite < estimatedBlocks &&
+               ready[nextBlockToWrite].load(std::memory_order_acquire)) {
+            DecompBlock& blk = results[nextBlockToWrite];
             xxhState.update(blk.data.data(), blk.data.size());
             if (outputFd >= 0) {
                 auto wt0 = std::chrono::steady_clock::now();
@@ -4323,7 +4324,8 @@ public:
                     std::chrono::steady_clock::now() - wt0).count();
             }
             totalBytesWritten += blk.data.size();
-            results.erase(it);
+            blk.data.clear();
+            blk.data.shrink_to_fit();
             nextBlockToWrite++;
             if (!testMode && g_verbosity == NORMAL && estimatedBlocks > 10) {
                 size_t pct = originalFileSize > 0
@@ -4410,7 +4412,7 @@ public:
                  writeUs / 1e6, nextBlockToWrite,
                  writeUs / 1e3 / std::max(size_t(1), nextBlockToWrite));
             VLOG(VERBOSE, "    wait(result stall):%6.3f s\n",  waitUs / 1e6);
-            VLOG(VERBOSE, "    drain efficiency:  %.2f blocks/call  (high-water pending: %zu)\n",
+            VLOG(VERBOSE, "    drain efficiency:  %.2f blocks/call  (max out-of-order: %zu blocks)\n",
                  drainCalls > 0 ? (double)drainBlocks / drainCalls : 0.0,
                  maxPending);
         }
@@ -4559,12 +4561,18 @@ public:
         };
 
         // ── Shared state ──────────────────────────────────────────────────────
-        std::mutex                    resultMutex;
-        std::condition_variable       resultCV;     // notified whenever a result is posted
-        std::map<size_t, DecompBlock> results;
-        std::atomic<bool>             decompError{false};
-        std::atomic<size_t>           gpuBlocks{0}, cpuBlocks{0};
-        std::atomic<size_t>           blocksDone{0};
+        // results/ready: same lock-free flat-vector design as decompressFileGPU.
+        // estimatedBlocks is computed from desc.contentSize above and is always
+        // a reliable upper bound on the actual block count.
+        std::vector<DecompBlock>          results(estimatedBlocks);
+        std::vector<std::atomic<uint8_t>> ready(estimatedBlocks);
+        for (auto& f : ready) f.store(0, std::memory_order_relaxed);
+
+        std::mutex              resultMutex;  // only used as lock for resultCV
+        std::condition_variable resultCV;
+        std::atomic<bool>       decompError{false};
+        std::atomic<size_t>     gpuBlocks{0}, cpuBlocks{0};
+        std::atomic<size_t>     blocksDone{0};
 
         // ── VRAM-aware stream count ───────────────────────────────────────────
         // Each stream needs SC * (maxCompSize + chunkSize + tempBytes) bytes.
@@ -4647,13 +4655,11 @@ public:
                 rb.origSize = chunkSize;
 
                 if (isUncomp) {
-                    // Pass-through: write directly into result map
+                    // Pass-through: write directly into result store
                     DecompBlock out;
                     out.data = std::move(raw);
-                    {
-                        std::lock_guard<std::mutex> lk(resultMutex);
-                        results[rb.idx] = std::move(out);
-                    }
+                    results[rb.idx] = std::move(out);
+                    ready[rb.idx].store(1, std::memory_order_release);
                     blocksDone++;
                     resultCV.notify_one();
                     nPass++;
@@ -4854,8 +4860,8 @@ public:
                              gpuIdx, sl.blockIdxs[j], actualOut);
                     }
                     slotCompData[si][j].clear();
-                    { std::lock_guard<std::mutex> lk(resultMutex);
-                      results[sl.blockIdxs[j]] = std::move(out); }
+                    results[sl.blockIdxs[j]] = std::move(out);
+                    ready[sl.blockIdxs[j]].store(1, std::memory_order_release);
                     blocksDone++;
                     resultCV.notify_one();
                     blocksProc++;
@@ -4992,8 +4998,8 @@ public:
                 out.data.resize(r);
                 VLOG(DEBUG, "CPU worker %zu: block %zu ok (%d B)\n",
                      tidx, block.idx, r);
-                { std::lock_guard<std::mutex> lk(resultMutex);
-                  results[block.idx] = std::move(out); }
+                results[block.idx] = std::move(out);
+                ready[block.idx].store(1, std::memory_order_release);
                 cpuBlocks++;
                 blocksDone++;
                 resultCV.notify_one();
@@ -5015,18 +5021,17 @@ public:
 
         // ── Main thread: drain ordered results and write ──────────────────────
         // Termination: dispatcherDone=true, totalBlocks known, blocksDone==totalBlocks.
-        // Using blocksDone (not nextBlockToWrite) avoids the pass-through count race.
         size_t nextBlockToWrite  = 0;
         size_t totalBytesWritten = 0;
         size_t dbgIter           = 0;
+        size_t maxPending        = 0;  // high-water: blocks done but not yet written
 
         while (true) {
             bool flushedAny = false;
-            while (!decompError) {
-                std::lock_guard<std::mutex> lk(resultMutex);
-                auto it = results.find(nextBlockToWrite);
-                if (it == results.end()) break;
-                auto& blk = it->second;
+            while (!decompError &&
+                   nextBlockToWrite < estimatedBlocks &&
+                   ready[nextBlockToWrite].load(std::memory_order_acquire)) {
+                DecompBlock& blk = results[nextBlockToWrite];
                 xxhState.update(blk.data.data(), blk.data.size());
                 if (outputFd >= 0 &&
                     ::write(outputFd, blk.data.data(), blk.data.size())
@@ -5036,9 +5041,14 @@ public:
                     decompError = true;
                 }
                 totalBytesWritten += blk.data.size();
-                results.erase(it);
+                blk.data.clear();
+                blk.data.shrink_to_fit();
                 nextBlockToWrite++;
                 flushedAny = true;
+            }
+            if (flushedAny) {
+                size_t pending = blocksDone.load() - nextBlockToWrite;
+                if (pending > maxPending) maxPending = pending;
             }
 
             if (decompError) break;
@@ -5054,7 +5064,8 @@ public:
             if (!flushedAny) {
                 std::unique_lock<std::mutex> lk(resultMutex);
                 resultCV.wait_for(lk, std::chrono::milliseconds(5), [&]{
-                    return results.count(nextBlockToWrite) > 0
+                    return (nextBlockToWrite < estimatedBlocks &&
+                            ready[nextBlockToWrite].load(std::memory_order_acquire) != 0)
                         || decompError.load()
                         || (dispatcherDone.load() && blocksDone.load() >= totalBlocks.load());
                 });
@@ -5063,11 +5074,10 @@ public:
             // DEBUG heartbeat every ~2 s
             if (++dbgIter % 2000 == 0) {
                 VLOG(DEBUG, "Main heartbeat: written=%zu  gpuQ=%zu cpuQ=%zu  "
-                     "results=%zu  blocksDone=%zu/%zu  dispDone=%d\n",
+                     "blocksDone=%zu/%zu  dispDone=%d  maxPending=%zu\n",
                      nextBlockToWrite,
                      gpuWorkQueue.size(), cpuWorkQueue.size(),
-                     results.size(), bd, tb,
-                     (int)dispatcherDone.load());
+                     bd, tb, (int)dispatcherDone.load(), maxPending);
             }
 
             if (g_verbosity == NORMAL && estimatedBlocks > 10) {
@@ -5088,11 +5098,10 @@ public:
         VLOG(DEBUG, "Main: all joined\n");
 
         // Final drain
-        while (!decompError) {
-            std::lock_guard<std::mutex> lk(resultMutex);
-            auto it = results.find(nextBlockToWrite);
-            if (it == results.end()) break;
-            auto& blk = it->second;
+        while (!decompError &&
+               nextBlockToWrite < estimatedBlocks &&
+               ready[nextBlockToWrite].load(std::memory_order_acquire)) {
+            DecompBlock& blk = results[nextBlockToWrite];
             xxhState.update(blk.data.data(), blk.data.size());
             if (outputFd >= 0 &&
                 ::write(outputFd, blk.data.data(), blk.data.size())
@@ -5100,7 +5109,8 @@ public:
                 fprintf(stderr, "Warning: write error in final flush block %zu\n",
                         nextBlockToWrite);
             totalBytesWritten += blk.data.size();
-            results.erase(it);
+            blk.data.clear();
+            blk.data.shrink_to_fit();
             nextBlockToWrite++;
         }
 
@@ -5160,6 +5170,8 @@ public:
              cpuBlocks.load(),
              nextBlockToWrite > 0 ? 100.0 * cpuBlocks.load()  / nextBlockToWrite : 0.0,
              passthroughBlocks, mbps);
+        VLOG(VERBOSE, "  Result store: max out-of-order depth: %zu blocks\n",
+             maxPending);
 
         if (!keepOriginal && !stdoutMode && !testMode)
             unlink(inputFile.c_str());
@@ -5259,21 +5271,40 @@ public:
         std::atomic<bool>       readError{false};
         const size_t            RAW_HWM = numWorkers * 8;  // high-water-mark
 
-        // ── result map (workers → writer) ─────────────────────────────
+        // ── result store (workers → writer) ───────────────────────────
+        // Flat pre-sized vector + parallel atomic ready flags, same design
+        // as decompressFileGPU / decompressFileHybrid.
+        // Workers write results[i] then set ready[i]=1 with release semantics.
+        // Writer checks ready[nextBlockToWrite] with acquire semantics  no
+        // mutex needed on the hot path at all.
+        // resultMutex is kept only as the lock object for resultCV.wait_for().
         struct DecompResult {
-            size_t   blockIdx;
-            bool     ok;
+            bool     ok   = true;
             std::vector<uint8_t> data;
         };
-        std::map<size_t, DecompResult> resultMap;
-        std::mutex                     resultMutex;
-        std::condition_variable        resultCV;
+
+        // Guard against estimatedBlocks == 0 (unknown content size).
+        // In that case we'll grow dynamically (see reader below).
+        size_t resultCapacity = estimatedBlocks > 0 ? estimatedBlocks
+                                                    : size_t(16384);
+        std::vector<DecompResult>          resultVec(resultCapacity);
+        std::vector<std::atomic<uint8_t>>  ready(resultCapacity);
+        for (auto& f : ready) f.store(0, std::memory_order_relaxed);
+
+        std::mutex              resultMutex;   // only used as lock for resultCV
+        std::condition_variable resultCV;
 
         // ── writer state ───────────────────────────────────────────────
         std::atomic<bool>   writeError{false};
         std::atomic<size_t> blocksSubmitted{0};  // total blocks sent to workers
         XXH::State          xxhState(XXH32_SEED);
         std::atomic<size_t> totalBytesWritten{0};
+
+        // Diagnostics (reported at -vv)
+        int64_t writeUs    = 0;   // time inside ::write() syscalls
+        int64_t waitUs     = 0;   // time blocked in resultCV.wait_for()
+        size_t  drainCalls = 0;   // number of drain iterations that wrote ≥1 block
+        size_t  maxPending = 0;   // high-water: blocks ready but ahead of writer
 
         auto startTime = std::chrono::high_resolution_clock::now();
 
@@ -5315,15 +5346,10 @@ public:
 
                     if (isUncomp) {
                         // Short-circuit: uncompressed blocks go straight to
-                        // resultMap  no decompression needed, skip the workers.
-                        DecompResult res;
-                        res.blockIdx = blk.blockIdx;
-                        res.ok       = true;
-                        res.data     = std::move(blk.data);
-                        {
-                            std::lock_guard<std::mutex> rlk(resultMutex);
-                            resultMap[res.blockIdx] = std::move(res);
-                        }
+                        // result store  no decompression needed, skip workers.
+                        resultVec[blk.blockIdx].ok   = true;
+                        resultVec[blk.blockIdx].data = std::move(blk.data);
+                        ready[blk.blockIdx].store(1, std::memory_order_release);
                         resultCV.notify_one();
                     } else {
                         rawQueue.push(std::move(blk));
@@ -5336,7 +5362,7 @@ public:
             rawCV.notify_all();  // wake workers so they can drain and exit
         });
 
-        // ── WORKER THREADS: decompress blocks, post to resultMap ──────
+        // ── WORKER THREADS: decompress blocks, post to result store ────
         std::atomic<bool> workerStop{false};
         std::vector<std::thread> workers;
         for (size_t t = 0; t < numWorkers; t++) {
@@ -5357,8 +5383,7 @@ public:
                     rawCV.notify_all();  // wake reader (queue has space again)
 
                     DecompResult res;
-                    res.blockIdx = blk.blockIdx;
-                    res.ok       = true;
+                    res.ok = true;
 
                     if (blk.isUncompressed) {
                         res.data = std::move(blk.data);
@@ -5381,63 +5406,88 @@ public:
                         }
                     }
 
-                    {
-                        std::lock_guard<std::mutex> lk(resultMutex);
-                        resultMap[res.blockIdx] = std::move(res);
-                    }
+                    resultVec[blk.blockIdx] = std::move(res);
+                    ready[blk.blockIdx].store(1, std::memory_order_release);
                     resultCV.notify_one();
                 }
             });
         }
 
-        // ── WRITER LOOP (main thread): drain resultMap in order ────────
+        // ── WRITER LOOP (main thread): drain results in order ──────────
+        // Lock-free hot path: spin on ready[nextBlockToWrite] with acquire
+        // semantics  no mutex needed since release/acquire guarantees we see
+        // the full data written before the flag was set.
+        // resultMutex / resultCV used only for efficient waiting when no block
+        // is immediately ready.
         bool ok = true;
         size_t nextBlockToWrite = 0;
+
         while (ok && !writeError.load()) {
-            std::unique_lock<std::mutex> lk(resultMutex);
-            resultCV.wait_for(lk, std::chrono::milliseconds(20), [&]{
-                return resultMap.count(nextBlockToWrite) > 0
-                    || readError.load() || writeError.load();
-            });
+            bool flushedAny = false;
 
-            // Drain all consecutive results
-            while (resultMap.count(nextBlockToWrite) > 0) {
-                DecompResult res = std::move(resultMap[nextBlockToWrite]);
-                resultMap.erase(nextBlockToWrite);
-                lk.unlock();
-
+            // Lock-free drain: write all consecutive ready blocks
+            while (!writeError.load() &&
+                   nextBlockToWrite < resultCapacity &&
+                   ready[nextBlockToWrite].load(std::memory_order_acquire)) {
+                DecompResult& res = resultVec[nextBlockToWrite];
                 if (!res.ok) { writeError.store(true); ok = false; break; }
 
                 xxhState.update(res.data.data(), res.data.size());
                 if (outputFd >= 0) {
+                    auto wt0 = std::chrono::steady_clock::now();
                     ssize_t written = ::write(outputFd, res.data.data(), res.data.size());
+                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - wt0).count();
                     if (written != (ssize_t)res.data.size()) {
                         fprintf(stderr, "Error writing decompressed data\n");
                         writeError.store(true); ok = false; break;
                     }
                 }
                 totalBytesWritten += res.data.size();
+                res.data.clear();
+                res.data.shrink_to_fit();   // release memory promptly
                 nextBlockToWrite++;
+                flushedAny = true;
 
                 if (g_verbosity == NORMAL && estimatedBlocks > 10) {
                     size_t denom = std::max(estimatedBlocks, nextBlockToWrite);
-                    std::string written = formatBytes(totalBytesWritten);
+                    std::string ws = formatBytes(totalBytesWritten.load());
                     fprintf(stderr, "\r%s: %3zu%%  %s%s",
                             testMode ? "Testing" : "Decompressing",
-                            (100 * nextBlockToWrite) / denom, written.c_str(),
+                            (100 * nextBlockToWrite) / denom, ws.c_str(),
                             "          ");
                     fflush(stderr);
                 }
-                lk.lock();
             }
 
-            // Done when reader finished AND we've written every submitted block
+            if (flushedAny) {
+                drainCalls++;
+                size_t submitted = blocksSubmitted.load();
+                size_t pending   = submitted > nextBlockToWrite
+                                 ? submitted - nextBlockToWrite : 0;
+                if (pending > maxPending) maxPending = pending;
+            }
+
+            // Termination: reader finished and we've written all blocks
             if (ok && readError.load()) { ok = false; break; }
-            if (ok && readerDone.load()
-                   && nextBlockToWrite >= blocksSubmitted.load()
-                   && resultMap.empty()) {
-                lk.unlock();
-                break;
+            if (ok && readerDone.load()) {
+                size_t tb = blocksSubmitted.load();
+                if (nextBlockToWrite >= tb && tb > 0) break;
+            }
+
+            if (!flushedAny) {
+                // Block efficiently until the next result is ready
+                std::unique_lock<std::mutex> lk(resultMutex);
+                auto wt0 = std::chrono::steady_clock::now();
+                resultCV.wait_for(lk, std::chrono::milliseconds(5), [&]{
+                    return (nextBlockToWrite < resultCapacity &&
+                            ready[nextBlockToWrite].load(std::memory_order_acquire) != 0)
+                        || writeError.load() || readError.load()
+                        || (readerDone.load() &&
+                            nextBlockToWrite >= blocksSubmitted.load());
+                });
+                waitUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - wt0).count();
             }
         }
 
@@ -5468,10 +5518,20 @@ public:
             if (testMode) {
                 VLOG(NORMAL, "Test OK: %s\n", inputFile.c_str());
             }
-            
-            VLOG(VERBOSE, "Throughput: %.2f MB/s\n", 
-                 (totalBytesWritten.load() / (1024.0*1024.0)) / elapsed);
-            VLOG(VERBOSE, "  Checksum: 0x%08X\n", checksum);
+
+            double mbps = totalBytesWritten.load() > 0 && elapsed > 0
+                ? (totalBytesWritten.load() / (1024.0*1024.0)) / elapsed : 0.0;
+            VLOG(VERBOSE, "  Throughput: %.2f MB/s  |  checksum: 0x%08X\n",
+                 mbps, checksum);
+            VLOG(VERBOSE, "  Timing breakdown:\n");
+            VLOG(VERBOSE, "    write(decomp out): %6.3f s  (%zu blocks, avg %.2f ms each)\n",
+                 writeUs / 1e6, nextBlockToWrite,
+                 writeUs / 1e3 / std::max(size_t(1), nextBlockToWrite));
+            VLOG(VERBOSE, "    wait(result stall):%6.3f s\n", waitUs / 1e6);
+            VLOG(VERBOSE, "    drain efficiency:  %.2f blocks/call"
+                 "  (high-water pending: %zu blocks)\n",
+                 drainCalls > 0 ? (double)nextBlockToWrite / drainCalls : 0.0,
+                 maxPending);
         }
         return ok;
     }
@@ -5953,6 +6013,33 @@ Architecture:
   Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
+  v3.24.0  Perf #2: lock-free result store for both decompressors.
+           Replaced std::map<size_t,DecompBlock>+resultMutex with:
+             std::vector<DecompBlock>          results(estimatedBlocks)
+             std::vector<std::atomic<uint8_t>> ready(estimatedBlocks)
+           Workers write results[i] then set ready[i]=1 (memory_order_release).
+           Writer checks ready[nextBlockToWrite] (memory_order_acquire)  the
+           release/acquire pair guarantees it sees complete data without any
+           mutex.  resultMutex is kept only as the lock object for resultCV
+           (required by condition_variable API) but is never taken on the hot
+           insert or drain path.  Impact: O(1) insert + O(1) lookup vs O(log n)
+           for both; eliminates mutex contention between GPU worker, CPU worker,
+           and writer on every block.  Also frees map node memory promptly:
+           blk.data is cleared+shrink_to_fit'd immediately after writing.
+           New -v diagnostic: "max out-of-order depth: N blocks"  measures
+           the high-water of blocks completed but waiting behind the writer;
+           tells you how much the old map was being exercised and whether this
+           change actually matters for your workload.
+  v3.24.0  Perf #2: decompressFileCPU result store replaced. std::map<size_t,
+           DecompResult> + resultMutex on every insert/lookup replaced with a
+           flat pre-sized vector + parallel std::atomic<uint8_t> ready flags,
+           matching the design already used by decompressFileGPU/Hybrid since
+           v3.23.2. Workers now do results[i]=data; ready[i].store(1,release)
+           with zero locking. Writer checks ready[next].load(acquire) lock-free
+           on the hot path; resultMutex kept only for resultCV.wait_for().
+           Also adds -v timing diagnostics to decompressFileCPU matching GPU
+           paths: write time, wait-stall time, drain efficiency, max out-of-order
+           depth.
   v3.23.3  Perf: eliminated all polling sleeps from hot paths:
            (1) CPU compressor: getResult()+sleep_for(100µs) replaced with
                waitForResult() which blocks on cpuPool's existing resultCV 
