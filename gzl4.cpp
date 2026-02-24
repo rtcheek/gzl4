@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.24.1";
+constexpr const char* VERSION = "3.24.9";
 
 // Compression backend modes
 enum class BackendMode {
@@ -676,12 +676,14 @@ struct PreallocSlot {
     nvcompStatus_t* h_stats  = nullptr;   // D→H result statuses
     uint8_t*        h_output = nullptr;   // D→H output data (capacity * outStride)
 
-    cudaStream_t    stream   = 0;
-    bool            ready    = false;
+    cudaStream_t    stream          = 0;
+    cudaEvent_t     sizesReadyEvent = 0;  // fires when h_oSizes/h_stats land on host
+    bool            ready           = false;
 
     // Per-batch state (set by worker thread each iteration)
     size_t                            batchSize  = 0;
-    bool                              hasPending = false;
+    bool                              hasPending = false;  // per-chunk D→H in flight
+    bool                              sizesPhase = false;  // sizes on host, output D→H pending
     std::vector<size_t>               indices;
     std::vector<size_t>               origSizes;
     // Input data: held until after D→H completes, then released back to pool
@@ -697,6 +699,7 @@ struct PreallocSlot {
         cudaFreeHost(h_iSizes); cudaFreeHost(h_oSizes);
         cudaFreeHost(h_stats);  cudaFreeHost(h_output);
         if (stream) { cudaStreamDestroy(stream); stream = 0; }
+        if (sizesReadyEvent) { cudaEventDestroy(sizesReadyEvent); sizesReadyEvent = 0; }
         *this = PreallocSlot{};
     }
 };
@@ -996,6 +999,30 @@ private:
         std::vector<size_t> originalSizes;
     };
 
+    // ── Hash thread: computes XXH32 over original data in parallel with I/O ──
+    // The write thread moves originalChunks[i] here after the write completes
+    // (so the uncompressed-fallback bufAppend can still use it first).
+    // Items arrive strictly in chunk-index order  no reordering map needed.
+    struct HashWork {
+        std::vector<uint8_t> data;
+        size_t               origSize = 0;
+    };
+
+    TsQueue<HashWork> hashQueue_;
+    std::thread       hashThread_;
+
+    void hashLoop() {
+        HashWork work;
+        while (true) {
+            if (hashQueue_.pop(work, 50)) {
+                xxhState->update(work.data.data(), work.origSize);
+            } else if (hashQueue_.isClosed()) {
+                break;  // closed and empty  all work done
+            }
+            // else: pop timed out but queue still open  keep waiting
+        }
+    }
+
     std::thread writerThread;
     std::map<size_t, WriteTask> pendingWrites;
     std::mutex queueMutex;
@@ -1058,6 +1085,11 @@ private:
         }
 
         bufFlush();   // flush any remaining data
+
+        // All writes done.  Signal hash thread that no more work is coming
+        // so it can drain its queue and exit cleanly.
+        if (xxhState) hashQueue_.close();
+
         writerDone.store(true);
 
         auto threadEnd = std::chrono::high_resolution_clock::now();
@@ -1067,11 +1099,11 @@ private:
              total - totalWriteTime.load());
     }
 
-    void writeTask(const WriteTask& task) {
+    // task is non-const: originalChunks[i] is moved out to hashQueue_ after
+    // the write so the hash thread can run concurrently with the next write.
+    void writeTask(WriteTask& task) {
         for (size_t i = 0; i < task.originalChunks.size(); i++) {
             size_t origSize = task.originalSizes[i];
-            if (xxhState)
-                xxhState->update(task.originalChunks[i].data(), origSize);
 
             bool hasCompressed = i < task.compressedChunks.size()
                                  && !task.compressedChunks[i].empty();
@@ -1080,9 +1112,20 @@ private:
                 bufFlushU32(compSz);
                 bufAppend(task.compressedChunks[i].data(), compSz);
             } else {
+                // Uncompressed fallback: write original bytes.
+                // bufAppend must complete before we move the vector below.
                 uint32_t blockHdr = (uint32_t)origSize | 0x80000000u;
                 bufFlushU32(blockHdr);
                 bufAppend(task.originalChunks[i].data(), origSize);
+            }
+
+            // Hand original data to hash thread (zero copy  move the vector).
+            // This must happen after bufAppend in case we just used it above.
+            if (xxhState) {
+                HashWork w;
+                w.data     = std::move(task.originalChunks[i]);
+                w.origSize = origSize;
+                hashQueue_.push(std::move(w));
             }
         }
     }
@@ -1119,6 +1162,8 @@ public:
         
         shouldStop.store(false);
         writerThread = std::thread(&AsyncWriter::writerLoop, this);
+        if (xxhState)
+            hashThread_ = std::thread(&AsyncWriter::hashLoop, this);
         
         return true;
     }
@@ -1168,6 +1213,11 @@ public:
         
         if (writerThread.joinable()) {
             writerThread.join();
+        }
+        // writerLoop closes hashQueue_ before setting writerDone; hash thread
+        // drains any remaining items and then exits naturally.
+        if (hashThread_.joinable()) {
+            hashThread_.join();
         }
         
         if (outputFd >= 0 && outputFd != STDOUT_FILENO) {
@@ -2616,6 +2666,8 @@ public:
                     ok = ok && cudaHostAlloc(&sl.h_stats,  SLOT_CAPACITY*sizeof(nvcompStatus_t), cudaHostAllocDefault) == cudaSuccess;
                     ok = ok && cudaHostAlloc(&sl.h_output, SLOT_CAPACITY*maxOutPerChunk,         cudaHostAllocDefault) == cudaSuccess;
                     ok = ok && cudaStreamCreate(&sl.stream) == cudaSuccess;
+                    ok = ok && cudaEventCreateWithFlags(&sl.sizesReadyEvent,
+                                                        cudaEventDisableTiming) == cudaSuccess;
                     if (ok) { sl.ready = true; }
                     else    { fprintf(stderr, "GPU%d: failed to init slot %d\n", gpus[g].deviceId, si);
                               gpuInitOk[g] = false; break; }
@@ -2700,6 +2752,7 @@ public:
             // Initialize all slots as not having pending work
             for (auto& slot : slots) {
                 slot.hasPending = false;
+                slot.sizesPhase = false;
             }
 
             while (!workerAbort.load()) {
@@ -2708,7 +2761,30 @@ public:
                 // ── Poll all slots: collect completed batches (non-blocking) ──────
                 for (int si = 0; si < nSlots; si++) {
                     PreallocSlot& slot = slots[si];
-                    
+
+                    // ── Phase 1: sizes arrived → issue per-chunk D→H for actual bytes ─
+                    // The event fires when h_oSizes and h_stats are ready on the host.
+                    // We then issue batchSize individual D→H transfers, each sized to the
+                    // actual compressed output rather than the worst-case outStride, saving
+                    // PCIe bandwidth proportional to the compression ratio.
+                    if (slot.sizesPhase &&
+                        cudaEventQuery(slot.sizesReadyEvent) == cudaSuccess) {
+                        anyActivity = true;
+                        for (size_t i = 0; i < slot.batchSize; i++) {
+                            size_t actual = slot.h_oSizes[i];
+                            if (actual > 0 && actual <= slot.outStride) {
+                                cudaMemcpyAsync(
+                                    slot.h_output + i * slot.outStride,
+                                    slot.d_output + i * slot.outStride,
+                                    actual,
+                                    cudaMemcpyDeviceToHost, slot.stream);
+                            }
+                        }
+                        slot.sizesPhase = false;
+                        slot.hasPending = true;
+                    }
+
+                    // ── Phase 2: per-chunk D→H complete → collect and submit ──────────
                     if (slot.hasPending) {
                         // Non-blocking check if this slot's stream is done
                         cudaError_t status = cudaStreamQuery(slot.stream);
@@ -2763,7 +2839,7 @@ public:
                 for (int si = 0; si < nSlots && !asyncReader.isFinished(); si++) {
                     PreallocSlot& slot = slots[si];
                     
-                    if (slot.hasPending) continue;  // Slot still busy
+                    if (slot.hasPending || slot.sizesPhase) continue;  // Slot still busy
                     
                     // Slot is free - try to fill and launch
                     slot.indices.clear();
@@ -2812,18 +2888,20 @@ public:
                     }
                     batchesLaunched++;
 
-                    // ── D→H: queue result copies (execute after kernel) ─
-                    cudaMemcpyAsync(slot.h_output, slot.d_output,
-                                    slot.batchSize * slot.outStride,
-                                    cudaMemcpyDeviceToHost, slot.stream);
+                    // ── D→H: oSizes and stats only (tiny: batchSize*16 bytes) ─────────
+                    // The bulk output transfer is deferred until sizes land on host
+                    // (sizesPhase collect step above), so we only move actual compressed
+                    // bytes instead of worst-case outStride bytes per chunk.
                     cudaMemcpyAsync(slot.h_oSizes, slot.d_oSizes,
                                     slot.batchSize * sizeof(size_t),
                                     cudaMemcpyDeviceToHost, slot.stream);
                     cudaMemcpyAsync(slot.h_stats, slot.d_stats,
                                     slot.batchSize * sizeof(nvcompStatus_t),
                                     cudaMemcpyDeviceToHost, slot.stream);
+                    cudaEventRecord(slot.sizesReadyEvent, slot.stream);
 
-                    slot.hasPending = true;
+                    slot.sizesPhase = true;   // Phase 1 pending (sizes in flight)
+                    slot.hasPending = false;  // Phase 2 not yet started
                 }
                 
                 // If no activity (all slots in-flight, reader exhausted), block
@@ -2832,7 +2910,7 @@ public:
                 // no CPU cycles wasted, no up-to-100µs discovery latency.
                 if (!anyActivity) {
                     for (int si = 0; si < nSlots; si++) {
-                        if (slots[si].hasPending) {
+                        if (slots[si].hasPending || slots[si].sizesPhase) {
                             cudaStreamSynchronize(slots[si].stream);
                             break;
                         }
@@ -2843,7 +2921,7 @@ public:
                 if (asyncReader.isFinished()) {
                     bool allIdle = true;
                     for (const auto& s : slots) {
-                        if (s.hasPending) {
+                        if (s.hasPending || s.sizesPhase) {
                             allIdle = false;
                             break;
                         }
@@ -3716,7 +3794,6 @@ public:
         std::atomic<bool>       decompError{false};
         std::atomic<size_t>     gpuBlocks{0}, cpuFallbackBlocks{0};
         std::atomic<size_t>     totalBlocks{0};  // set by reader once end-mark seen
-
         // ── Block queue for GPU workers ────────────────────────────────────────
         struct RawBlock {
             size_t idx;
@@ -4536,7 +4613,6 @@ public:
         std::atomic<bool>       decompError{false};
         std::atomic<size_t>     gpuBlocks{0}, cpuBlocks{0};
         std::atomic<size_t>     blocksDone{0};
-
         // ── VRAM-aware stream count ───────────────────────────────────────────
         // Each stream needs SC * (maxCompSize + chunkSize + tempBytes) bytes.
         // maxCompSize ≈ chunkSize + chunkSize/255 + 16 ≈ chunkSize * 1.004
@@ -5268,7 +5344,6 @@ public:
         int64_t waitUs     = 0;   // time blocked in resultCV.wait_for()
         size_t  drainCalls = 0;   // number of drain iterations that wrote ≥1 block
         size_t  maxPending = 0;   // high-water: blocks ready but ahead of writer
-
         auto startTime = std::chrono::high_resolution_clock::now();
 
         // ── READER THREAD: reads all blocks from disk, feeds rawQueue ──
@@ -5976,6 +6051,109 @@ Architecture:
   Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
+  v3.24.9  Perf: parallel XXH32 hash thread in AsyncWriter (compression only).
+           Previously writeTask() called xxhState->update(originalData, origSz)
+           then bufAppend(compressedData) sequentially on the writer thread,
+           pegging one CPU core at 100% after GPU work finished.  These two
+           operations touch different memory (originalChunks vs compressedChunks)
+           so they can run in parallel:
+             Writer thread: bufAppend/bufFlush only (I/O).
+             Hash thread (new): xxhState->update() over original data.
+           originalChunks[i] is std::moved to HashWork after bufAppend completes
+           (so uncompressed-fallback writes still see the data), then the hash
+           thread pops it from a TsQueue<HashWork> FIFO and hashes it.  Because
+           the writer thread processes pendingWrites in strict chunk-index order,
+           the FIFO is already ordered  no reordering map needed.  After the
+           final bufFlush(), the writer closes the hash queue; the hash thread
+           drains any remaining items and exits.  stop() joins both threads.
+           Each AsyncWriter is constructed fresh per run so no queue reset
+           is needed in start()  removed the TsQueue move-assign (which would
+           have failed anyway since mutex/condvar/atomic are not assignable).
+           For compressible data the hash work (~50 GB original at 8 GB/s = 6s)
+           now overlaps with the write (~17 GB compressed at 5 GB/s = 3.4s),
+           hiding most of the hash latency.  Decompression paths are unaffected
+           (they manage their own write loops with inline xxhState updates).
+  v3.24.8  Reverted v3.24.7 original-data copy elimination. Root cause of
+           stutter: pool slots were held until the AsyncWriter processed each
+           chunk in output order. When the writer stalled waiting for an
+           out-of-order chunk (pending in its std::map), held slots accumulated
+           and eventually exhausted the pool, blocking the reader and stalling
+           the entire GPU pipeline. The one fast run was a lucky in-order
+           sequence. The copy-at-collect approach (immediately releasing pool
+           slots back to the reader) is the correct design. Item #5 closed.
+  v3.24.7  Perf #5: eliminate original-data memcpy (REVERTED in v3.24.8).
+           Previously: oChunks.emplace_back(origPtr, origPtr+origSz) copied
+           every input chunk (up to 4 MB × batchSize per collect) from pinned
+           memory into a new heap vector so AsyncWriter could hold it for:
+             (a) xxhState->update()  content checksum
+             (b) uncompressed fallback write (outSz >= origSz, rare)
+           For the pooled path (the common path), the copy is eliminated by
+           moving the PinnedInputPool::Handle itself into WriteTask.pinnedHandles.
+           The pinned memory remains valid until writeTask() returns and the
+           WriteTask is destroyed, at which point ~Handle() releases the slot.
+           For the heap path (early-reader / no-pool fallback), origData vectors
+           are std::moved instead of copied  also zero allocation.
+           writeTask() uses pinnedHandles[i].data directly for xxhState->update()
+           and for the uncompressed fallback bufAppend() (pinned memory is
+           fully readable from CPU). enqueueBatch() gains a pinnedHandles
+           parameter; all three GPU collect phases (GPU-only main, hybrid main,
+           hybrid drain) updated. Hybrid CPU worker passes empty handles.
+           Pool slot lifetime extended slightly (held until writer processes
+           each chunk vs. released at collect time). The 384-slot pool has
+           192 slots of headroom beyond the GPU in-flight maximum.
+  v3.24.6  Reverted v3.24.5 hybrid two-phase D→H. The round-robin blocking
+           sync pattern means each extra phase adds nSlots×batch_time of
+           latency before any result reaches the writer  doubling pipeline
+           depth from 3 to 6 syncs. The PCIe savings did not compensate for
+           the writer starvation this caused (stuttering, long pauses).
+           The two-phase optimization is only net-positive for the GPU-only
+           non-blocking poll loop (v3.24.4), where extra phases cost nothing
+           in latency. Hybrid reverted to single-phase blocking sync (v3.24.4
+           behaviour). Item #4 closed for hybrid.
+  v3.24.5  Perf #4b: two-phase D→H in hybrid worker (REVERTED in v3.24.6).
+           GPU worker. Same principle as v3.24.4 but adapted to the round-robin
+           cudaStreamSynchronize pattern. Each slot now takes two visits instead
+           of one: first visit syncs on oSizes+stats D→H and issues per-chunk
+           D→H (actual sizes); second visit syncs on per-chunk D→H and collects.
+           The per-chunk D→H for a done slot overlaps with nvCOMP on the other
+           (nSlots-1) pipeline slots. No CUDA event needed  cudaStreamSynchronize
+           guarantees sizes are host-visible. Drain loop handles both states.
+  v3.24.4  Perf #4: two-phase D→H transfer in GPU-only compression worker.
+           Previously the D→H section issued one cudaMemcpyAsync for the
+           entire h_output at worst-case size (batchSize * outStride ≈
+           batchSize * 4.016 MB) regardless of actual compression ratio.
+           Now:
+             Phase 1 (dispatch): only oSizes+stats D→H (batchSize * 16 B),
+               record sizesReadyEvent in stream.
+             Phase 2 (collect, non-blocking): cudaEventQuery checks for
+               sizes landing on host; when ready, issue batchSize individual
+               cudaMemcpyAsync calls, each sized to actual h_oSizes[i] bytes.
+           For 3:1 compressible data (logs, text) this cuts PCIe D→H
+           bandwidth by ~66%. For incompressible data it is a no-op (sizes
+           equal outStride). Hybrid compression path is unchanged (uses
+           blocking cudaStreamSynchronize round-robin; optimization less
+           clean there).
+           PreallocSlot gains: sizesReadyEvent (cudaEvent_t, DisableTiming),
+           sizesPhase (bool).
+  v3.24.3  Reverted v3.24.2 write-staging buffer. Benchmarks showed no
+           improvement and a slight regression across all three decompression
+           backends, with a broken progress bar (output stayed at 0% until
+           the final 256 MB flush, then jumped to 100%). Root cause: the
+           kernel page cache already acts as a staging buffer  a 4 MB
+           write() is a fast kernel memcpy into page cache that returns
+           immediately. The userspace staging buffer added a redundant
+           extra copy without reducing actual I/O. Item #3 closed as
+           "not beneficial given current architecture."
+  v3.24.2  Perf #3: 256 MB write-staging buffer (REVERTED in v3.24.3).
+           (decompressFileGPU, decompressFileHybrid, decompressFileCPU).
+           All three write loops are now mutex-free (v3.24.0 lock-free store),
+           so the staging buffer adds no locking complexity. Batches ~2000
+           individual 4 MB write() syscalls into ~32 large 256 MB writes,
+           matching the strategy AsyncWriter has used during compression.
+           posix_fadvise(DONTNEED) intentionally omitted -- earlier testing
+           showed it forced synchronous kernel write-through and caused a 27%
+           regression (v3.23.2). writeUs diagnostic now includes both the
+           memcpy (staging) and flush (syscall) phases.
   v3.24.1  Cleanup: two items from original analysis backlog:
            (1) Removed optimizeStreamCount() dead code. The function dynamically
                grew gpu.streams when all slots were busy, but was never called
