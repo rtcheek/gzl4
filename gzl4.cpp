@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.24.0";
+constexpr const char* VERSION = "3.24.1";
 
 // Compression backend modes
 enum class BackendMode {
@@ -2193,43 +2193,6 @@ public:
         cudaFree(state.d_statuses);
         
         return true;
-    }
-    
-    /*
-     * Dynamically adjust stream count based on GPU utilization
-     */
-    void optimizeStreamCount() {
-        static auto lastCheck = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - lastCheck).count() < 2.0) return;
-        lastCheck = now;
-
-        for (auto& gpu : gpus) {
-            cudaSetDevice(gpu.deviceId);
-
-            size_t busySlots = 0;
-            for (auto& stream : gpu.streams)
-                if (cudaStreamQuery(stream) == cudaErrorNotReady) busySlots++;
-
-            float util = gpu.streams.empty() ? 0.0f :
-                         (float)busySlots / gpu.streams.size();
-
-            VLOG(VERBOSE, "GPU%d: %zu/%zu slots active (%.0f%%)  optBatch=%zu\n",
-                 gpu.deviceId, busySlots, gpu.streams.size(),
-                 util * 100, gpu.optimalBatch);
-
-            // If all slots are busy and we haven't reached the hardware-detected
-            // pipeline depth cap (2× pipelineDepth for extra double-buffering), add one.
-            size_t maxSlots = static_cast<size_t>(gpu.pipelineDepth) * 2;
-            if (util >= 1.0f && gpu.streams.size() < maxSlots) {
-                cudaStream_t s;
-                if (cudaStreamCreate(&s) == cudaSuccess) {
-                    gpu.streams.push_back(s);
-                    VLOG(VERBOSE, "GPU%d: saturated - grew to %zu slots (hw pipeline=%d)\n",
-                         gpu.deviceId, gpu.streams.size(), gpu.pipelineDepth);
-                }
-            }
-        }
     }
     
     /*
@@ -5356,10 +5319,10 @@ public:
                     }
                     blocksSubmitted++;
                 }
-                rawCV.notify_all();
+                rawCV.notify_one();  // one block pushed: wake one worker
             }
             readerDone.store(true);
-            rawCV.notify_all();  // wake workers so they can drain and exit
+            rawCV.notify_all();  // wake ALL workers so they can drain and exit
         });
 
         // ── WORKER THREADS: decompress blocks, post to result store ────
@@ -5380,7 +5343,7 @@ public:
                         blk = std::move(rawQueue.front());
                         rawQueue.pop();
                     }
-                    rawCV.notify_all();  // wake reader (queue has space again)
+                    rawCV.notify_one();  // one slot freed: wake reader if back-pressured
 
                     DecompResult res;
                     res.ok = true;
@@ -6013,6 +5976,18 @@ Architecture:
   Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
+  v3.24.1  Cleanup: two items from original analysis backlog:
+           (1) Removed optimizeStreamCount() dead code. The function dynamically
+               grew gpu.streams when all slots were busy, but was never called
+               after the hybrid rewrite. Also had a non-reentrant static local
+               (lastCheck) that would have broken multi-GPU use.
+           (2) decompressFileCPU rawCV.notify_all() → notify_one() on hot paths.
+               Two sites woke all numWorkers threads unnecessarily:
+               - after reader pushes one block to rawQueue (only one worker
+                 needed)
+               - after a worker pops one block (only reader needs waking for
+                 back-pressure). The two shutdown/termination notify_all() calls
+               are kept: they need to wake all threads.
   v3.24.0  Perf #2: lock-free result store for both decompressors.
            Replaced std::map<size_t,DecompBlock>+resultMutex with:
              std::vector<DecompBlock>          results(estimatedBlocks)
