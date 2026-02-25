@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.24.9";
+constexpr const char* VERSION = "3.24.12";
 
 // Compression backend modes
 enum class BackendMode {
@@ -3747,7 +3747,32 @@ public:
         size_t originalFileSize = desc.contentSize;
         size_t chunkSize = static_cast<size_t>(1) << (8 + 2 * desc.blockMaxSize);
         size_t estimatedBlocks = (originalFileSize + chunkSize - 1) / chunkSize;
-        
+
+        // ── Vector capacity guard ─────────────────────────────────────────────
+        // desc.contentSize is the UNCOMPRESSED size written at compression time.
+        // If that doesn't match reality (e.g. this is a re-compressed file and
+        // the stored size is the compressed size), estimatedBlocks may be far
+        // too low  causing OOB writes into results/ready and premature writer
+        // termination when nextBlockToWrite hits estimatedBlocks before all
+        // blocks are processed.  Fix: stat the compressed input and take the
+        // larger of the two estimates.  compressedSize/chunkSize is always an
+        // overestimate of actual block count (each block header is ≥4 bytes),
+        // so this is a safe ceiling.
+        size_t compressedFileSize = 0;
+        {
+            struct stat cst;
+            if (fstat(inputFd, &cst) == 0 && (size_t)cst.st_size > 0) {
+                compressedFileSize = (size_t)cst.st_size;
+                size_t compBlocks = (compressedFileSize + chunkSize - 1) / chunkSize + 1;
+                if (compBlocks > estimatedBlocks) {
+                    VLOG(VERBOSE, "  contentSize-based estimate %zu < compressed-file "
+                         "estimate %zu  using larger value for vector capacity\n",
+                         estimatedBlocks, compBlocks);
+                    estimatedBlocks = compBlocks;
+                }
+            }
+        }
+
         VLOG(VERBOSE, "  %.2f MB  |  block size %zu KB  |  ~%zu blocks\n",
              originalFileSize / (1024.0*1024.0), chunkSize / 1024, estimatedBlocks);
         
@@ -4194,6 +4219,7 @@ public:
         // reading the next block the GPU workers starved for work, and while it was
         // writing the results map filled.  Moving reads here gives true overlap.
         std::atomic<int64_t>  readUs{0};   // diagnostic: time inside ::read()
+        std::atomic<size_t>   readBytesRead{0}; // compressed bytes consumed (for Reading: display)
         size_t nextBlockToWrite  = 0;
         size_t totalBytesWritten = 0;
         auto   startTime = std::chrono::high_resolution_clock::now();
@@ -4236,6 +4262,7 @@ public:
                     readUs.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - rt1).count());
                 }
+                readBytesRead.fetch_add(4 + blockSize, std::memory_order_relaxed);
 
                 VLOG(DEBUG, "Reader: block %zu size=%u isUncomp=%d\n",
                      blockIdx, blockSize, (int)isUncomp);
@@ -4269,14 +4296,59 @@ public:
         int64_t waitUs     = 0;
         size_t  drainCalls = 0;
         size_t  drainBlocks= 0;
-        size_t  maxPending = 0;  // high-water: blocks done but not yet written
-        size_t  dbgIter    = 0;
+        size_t  maxPending = 0;
+        auto    lastProgress = std::chrono::steady_clock::now();
+
+        // Progress helper  three display phases:
+        //   Reading:      [ X GB / Y GB ]   while writer has not yet started (pre-warm)
+        //   Decompressing:  ##%  [ X GB / Y GB ]   workers active
+        //   Writing:        ##%  [ X GB / Y GB ]   workers done, draining to disk
+        // Called inside the inner drain loop (every 16 blocks) and after wait_for.
+        auto showProgress = [&]() {
+            if (g_verbosity != NORMAL || estimatedBlocks <= 10) return;
+            // During the drain path, only sample every 16 blocks to keep overhead low.
+            // During the waiting / Reading path (nextBlockToWrite == 0), always check.
+            if (nextBlockToWrite > 0 && (nextBlockToWrite & 15) != 0) return;
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - lastProgress).count() < 200) return;
+            lastProgress = now;
+            size_t tb = totalBlocks.load();
+            size_t knownTotal = tb > 0 ? tb * chunkSize : originalFileSize;
+            if (testMode) {
+                size_t pct = knownTotal > 0
+                    ? std::min(size_t(99), totalBytesWritten * 100 / knownTotal) : 0;
+                std::string ws = formatBytes(totalBytesWritten);
+                std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
+                fprintf(stderr, "\rTesting:       %3zu%%  [ %s / %s ]%s",
+                        pct, ws.c_str(), ts.c_str(), "          ");
+            } else if (nextBlockToWrite == 0) {
+                // No blocks written yet  still reading compressed data / warming up GPU
+                size_t rb = readBytesRead.load(std::memory_order_relaxed);
+                std::string rs = formatBytes(rb);
+                std::string cs = compressedFileSize > 0
+                    ? formatBytes(compressedFileSize) : "?";
+                fprintf(stderr, "\rReading:              [ %s / %s ]%s",
+                        rs.c_str(), cs.c_str(), "          ");
+            } else {
+                bool workersActive = !readDone.load()
+                    || blocksDone.load() < totalBlocks.load();
+                size_t pct = knownTotal > 0
+                    ? std::min(size_t(99), totalBytesWritten * 100 / knownTotal) : 0;
+                std::string ws = formatBytes(totalBytesWritten);
+                std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
+                if (workersActive)
+                    fprintf(stderr, "\rDecompressing: %3zu%%  [ %s / %s ]%s",
+                            pct, ws.c_str(), ts.c_str(), "          ");
+                else
+                    fprintf(stderr, "\rWriting:       %3zu%%  [ %s / %s ]%s",
+                            pct, ws.c_str(), ts.c_str(), "          ");
+            }
+            fflush(stderr);
+        };
 
         while (true) {
             bool flushedAny = false;
-            // Lock-free drain: spin on ready flag with acquire semantics.
-            // No mutex needed  release/acquire ordering guarantees we see
-            // the complete data that the worker wrote before setting the flag.
             while (!decompError &&
                    nextBlockToWrite < estimatedBlocks &&
                    ready[nextBlockToWrite].load(std::memory_order_acquire)) {
@@ -4295,13 +4367,13 @@ public:
                 }
                 totalBytesWritten += blk.data.size();
                 blk.data.clear();
-                blk.data.shrink_to_fit();  // release decompressed memory promptly
+                blk.data.shrink_to_fit();
                 nextBlockToWrite++;
                 flushedAny = true;
+                showProgress();
             }
             if (flushedAny) {
                 drainCalls++;
-                // Measure out-of-order depth: blocks completed but ahead of writer
                 size_t pending = blocksDone.load() - nextBlockToWrite;
                 if (pending > maxPending) maxPending = pending;
             }
@@ -4309,7 +4381,6 @@ public:
 
             if (decompError) break;
 
-            // Termination check  same logic as hybrid dispatcher
             size_t tb = totalBlocks.load();
             size_t bd = blocksDone.load();
             if (readDone.load() && tb > 0 && bd >= tb) {
@@ -4329,17 +4400,7 @@ public:
                 });
                 waitUs += std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - wt0).count();
-            }
-
-            // Progress display
-            if (g_verbosity == NORMAL && estimatedBlocks > 10 && ++dbgIter % 4 == 0) {
-                size_t pct = originalFileSize > 0
-                    ? totalBytesWritten * 100 / originalFileSize : 0;
-                std::string ws = formatBytes(totalBytesWritten);
-                fprintf(stderr, "\r%s: %3zu%%  %s%s",
-                        testMode ? "Testing" : "Decompressing",
-                        pct, ws.c_str(), "          ");
-                fflush(stderr);
+                showProgress();  // also update during wait gaps
             }
         }
 
@@ -4367,28 +4428,22 @@ public:
             blk.data.clear();
             blk.data.shrink_to_fit();
             nextBlockToWrite++;
-            if (!testMode && g_verbosity == NORMAL && estimatedBlocks > 10) {
-                size_t pct = originalFileSize > 0
-                    ? totalBytesWritten * 100 / originalFileSize : 0;
-                std::string ws = formatBytes(totalBytesWritten);
-                std::string ts = formatBytes(originalFileSize);
-                fprintf(stderr, "\rWriting: %3zu%%  [%s / %s]%s",
-                        pct, ws.c_str(), ts.c_str(), "          ");
-                fflush(stderr);
-            }
+            showProgress();
         }
 
         auto endTime  = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
-        // Force a final 100% update, then let the completion \r overwrite it
+        // Final 100% line  overwritten by the completion message on the next line
         if (g_verbosity == NORMAL && estimatedBlocks > 10) {
-            std::string ts = formatBytes(originalFileSize);
+            std::string ws = formatBytes(totalBytesWritten);
+            std::string ts = formatBytes(totalBytesWritten);  // actual output size
             if (testMode)
-                fprintf(stderr, "\rTesting: 100%%  %s%s", ts.c_str(), "          ");
+                fprintf(stderr, "\rTesting:       100%%  [ %s / %s ]%s",
+                        ws.c_str(), ts.c_str(), "          ");
             else
-                fprintf(stderr, "\rWriting: 100%%  [%s / %s]%s",
-                        ts.c_str(), ts.c_str(), "          ");
+                fprintf(stderr, "\rWriting:       100%%  [ %s / %s ]%s",
+                        ws.c_str(), ts.c_str(), "          ");
             fflush(stderr);
         }
         
@@ -4556,6 +4611,22 @@ public:
         size_t chunkSize        = static_cast<size_t>(1) << (8 + 2 * desc.blockMaxSize);
         size_t estimatedBlocks  = (originalFileSize + chunkSize - 1) / chunkSize;
 
+        // ── Vector capacity guard (same as decompressFileGPU) ─────────────────
+        size_t compressedFileSize = 0;
+        {
+            struct stat cst;
+            if (fstat(inputFd, &cst) == 0 && (size_t)cst.st_size > 0) {
+                compressedFileSize = (size_t)cst.st_size;
+                size_t compBlocks = (compressedFileSize + chunkSize - 1) / chunkSize + 1;
+                if (compBlocks > estimatedBlocks) {
+                    VLOG(VERBOSE, "  contentSize-based estimate %zu < compressed-file "
+                         "estimate %zu  using larger value for vector capacity\n",
+                         estimatedBlocks, compBlocks);
+                    estimatedBlocks = compBlocks;
+                }
+            }
+        }
+
         // Determine effective CPU thread count
         size_t effectiveThreads = cpuThreads ? cpuThreads
                                              : std::thread::hardware_concurrency();
@@ -4658,6 +4729,7 @@ public:
         // ── Dispatcher thread: reads blocks from disk, routes GPU-first ─────────
         std::atomic<bool>   dispatcherDone{false};
         std::atomic<size_t> totalBlocks{0};   // set once when end-mark is seen
+        std::atomic<size_t> readBytesRead{0}; // compressed bytes consumed (for Reading: display)
         std::thread dispatcherThread([&]() {
             VLOG(DEBUG, "Dispatcher: started\n");
             size_t blockIdx = 0;
@@ -4688,6 +4760,7 @@ public:
                     fprintf(stderr, "Error: truncated block data at block %zu\n", blockIdx);
                     decompError = true; break;
                 }
+                readBytesRead.fetch_add(4 + bs, std::memory_order_relaxed);
 
                 RawBlock rb;
                 rb.idx      = blockIdx;
@@ -5063,7 +5136,48 @@ public:
         size_t nextBlockToWrite  = 0;
         size_t totalBytesWritten = 0;
         size_t dbgIter           = 0;
-        size_t maxPending        = 0;  // high-water: blocks done but not yet written
+        size_t maxPending        = 0;
+        auto   lastProgress      = std::chrono::steady_clock::now();
+
+        auto showProgress = [&]() {
+            if (g_verbosity != NORMAL || estimatedBlocks <= 10) return;
+            if (nextBlockToWrite > 0 && (nextBlockToWrite & 15) != 0) return;
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - lastProgress).count() < 200) return;
+            lastProgress = now;
+            size_t tb = totalBlocks.load();
+            size_t knownTotal = tb > 0 ? tb * chunkSize : originalFileSize;
+            if (testMode) {
+                size_t pct = knownTotal > 0
+                    ? std::min(size_t(99), totalBytesWritten * 100 / knownTotal) : 0;
+                std::string ws = formatBytes(totalBytesWritten);
+                std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
+                fprintf(stderr, "\rTesting:       %3zu%%  [ %s / %s ]%s",
+                        pct, ws.c_str(), ts.c_str(), "          ");
+            } else if (nextBlockToWrite == 0) {
+                size_t rb = readBytesRead.load(std::memory_order_relaxed);
+                std::string rs = formatBytes(rb);
+                std::string cs = compressedFileSize > 0
+                    ? formatBytes(compressedFileSize) : "?";
+                fprintf(stderr, "\rReading:              [ %s / %s ]%s",
+                        rs.c_str(), cs.c_str(), "          ");
+            } else {
+                bool workersActive = !dispatcherDone.load()
+                    || blocksDone.load() < totalBlocks.load();
+                size_t pct = knownTotal > 0
+                    ? std::min(size_t(99), totalBytesWritten * 100 / knownTotal) : 0;
+                std::string ws = formatBytes(totalBytesWritten);
+                std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
+                if (workersActive)
+                    fprintf(stderr, "\rDecompressing: %3zu%%  [ %s / %s ]%s",
+                            pct, ws.c_str(), ts.c_str(), "          ");
+                else
+                    fprintf(stderr, "\rWriting:       %3zu%%  [ %s / %s ]%s",
+                            pct, ws.c_str(), ts.c_str(), "          ");
+            }
+            fflush(stderr);
+        };
 
         while (true) {
             bool flushedAny = false;
@@ -5084,6 +5198,7 @@ public:
                 blk.data.shrink_to_fit();
                 nextBlockToWrite++;
                 flushedAny = true;
+                showProgress();
             }
             if (flushedAny) {
                 size_t pending = blocksDone.load() - nextBlockToWrite;
@@ -5108,6 +5223,7 @@ public:
                         || decompError.load()
                         || (dispatcherDone.load() && blocksDone.load() >= totalBlocks.load());
                 });
+                showProgress();
             }
 
             // DEBUG heartbeat every ~2 s
@@ -5117,17 +5233,6 @@ public:
                      nextBlockToWrite,
                      gpuWorkQueue.size(), cpuWorkQueue.size(),
                      bd, tb, (int)dispatcherDone.load(), maxPending);
-            }
-
-            if (g_verbosity == NORMAL && estimatedBlocks > 10) {
-                size_t pct = originalFileSize > 0
-                    ? totalBytesWritten * 100 / originalFileSize : 0;
-                std::string gpuStr = formatBytes(gpuBlocks.load() * chunkSize);
-                std::string cpuStr = formatBytes(cpuBlocks.load() * chunkSize);
-                fprintf(stderr, "\r%s: %3zu%%  GPU: %s  CPU: %s%s",
-                        testMode ? "Testing" : "Decompressing",
-                        pct, gpuStr.c_str(), cpuStr.c_str(), "          ");
-                fflush(stderr);
             }
         }
 
@@ -5151,17 +5256,21 @@ public:
             blk.data.clear();
             blk.data.shrink_to_fit();
             nextBlockToWrite++;
+            showProgress();
         }
 
         auto endTime  = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
         if (g_verbosity == NORMAL && estimatedBlocks > 10) {
-            std::string gpuStr = formatBytes(gpuBlocks.load() * chunkSize);
-            std::string cpuStr = formatBytes(cpuBlocks.load() * chunkSize);
-            fprintf(stderr, "\r%s: 100%%  GPU: %s  CPU: %s%s\n",
-                    testMode ? "Testing" : "Decompressing",
-                    gpuStr.c_str(), cpuStr.c_str(), "          ");
+            std::string ws = formatBytes(totalBytesWritten);
+            std::string ts = formatBytes(totalBytesWritten);
+            if (testMode)
+                fprintf(stderr, "\rTesting:       100%%  [ %s / %s ]%s",
+                        ws.c_str(), ts.c_str(), "          ");
+            else
+                fprintf(stderr, "\rWriting:       100%%  [ %s / %s ]%s",
+                        ws.c_str(), ts.c_str(), "          ");
             fflush(stderr);
         }
 
@@ -5310,6 +5419,14 @@ public:
         std::atomic<bool>       readError{false};
         const size_t            RAW_HWM = numWorkers * 8;  // high-water-mark
 
+        // Compressed input file size  used for Reading: progress display.
+        size_t compressedFileSize = 0;
+        {
+            struct stat cst;
+            if (fstat(inputFd, &cst) == 0) compressedFileSize = (size_t)cst.st_size;
+        }
+        std::atomic<size_t> readBytesRead{0};
+
         // ── result store (workers → writer) ───────────────────────────
         // Flat pre-sized vector + parallel atomic ready flags, same design
         // as decompressFileGPU / decompressFileHybrid.
@@ -5373,6 +5490,7 @@ public:
                             blk.blockIdx, bsz, n);
                     readError.store(true); break;
                 }
+                readBytesRead.fetch_add(4 + bsz, std::memory_order_relaxed);
 
                 // Back-pressure: wait if workers are falling behind
                 {
@@ -5459,6 +5577,49 @@ public:
         // is immediately ready.
         bool ok = true;
         size_t nextBlockToWrite = 0;
+        auto   lastProgress     = std::chrono::steady_clock::now();
+
+        // Three-state progress: Reading → Decompressing → Writing
+        auto showProgress = [&]() {
+            if (g_verbosity != NORMAL || estimatedBlocks <= 10) return;
+            if (nextBlockToWrite > 0 && (nextBlockToWrite & 15) != 0) return;
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - lastProgress).count() < 200) return;
+            lastProgress = now;
+            size_t tbw = totalBytesWritten.load();
+            size_t knownTotal = originalFileSize > 0 ? originalFileSize : 0;
+            if (testMode) {
+                size_t pct = knownTotal > 0
+                    ? std::min(size_t(99), tbw * 100 / knownTotal) : 0;
+                std::string ws = formatBytes(tbw);
+                std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
+                fprintf(stderr, "\rTesting:       %3zu%%  [ %s / %s ]%s",
+                        pct, ws.c_str(), ts.c_str(), "          ");
+            } else if (nextBlockToWrite == 0) {
+                size_t rb = readBytesRead.load(std::memory_order_relaxed);
+                std::string rs = formatBytes(rb);
+                std::string cs = compressedFileSize > 0
+                    ? formatBytes(compressedFileSize) : "?";
+                fprintf(stderr, "\rReading:              [ %s / %s ]%s",
+                        rs.c_str(), cs.c_str(), "          ");
+            } else {
+                // "Writing" once reader is done (all decompression work submitted);
+                // "Decompressing" while reader still feeding work to workers.
+                bool readerStillRunning = !readerDone.load();
+                size_t pct = knownTotal > 0
+                    ? std::min(size_t(99), tbw * 100 / knownTotal) : 0;
+                std::string ws = formatBytes(tbw);
+                std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
+                if (readerStillRunning)
+                    fprintf(stderr, "\rDecompressing: %3zu%%  [ %s / %s ]%s",
+                            pct, ws.c_str(), ts.c_str(), "          ");
+                else
+                    fprintf(stderr, "\rWriting:       %3zu%%  [ %s / %s ]%s",
+                            pct, ws.c_str(), ts.c_str(), "          ");
+            }
+            fflush(stderr);
+        };
 
         while (ok && !writeError.load()) {
             bool flushedAny = false;
@@ -5486,16 +5647,7 @@ public:
                 res.data.shrink_to_fit();   // release memory promptly
                 nextBlockToWrite++;
                 flushedAny = true;
-
-                if (g_verbosity == NORMAL && estimatedBlocks > 10) {
-                    size_t denom = std::max(estimatedBlocks, nextBlockToWrite);
-                    std::string ws = formatBytes(totalBytesWritten.load());
-                    fprintf(stderr, "\r%s: %3zu%%  %s%s",
-                            testMode ? "Testing" : "Decompressing",
-                            (100 * nextBlockToWrite) / denom, ws.c_str(),
-                            "          ");
-                    fflush(stderr);
-                }
+                showProgress();
             }
 
             if (flushedAny) {
@@ -5526,6 +5678,7 @@ public:
                 });
                 waitUs += std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - wt0).count();
+                showProgress();
             }
         }
 
@@ -5546,7 +5699,15 @@ public:
         if (ok) {
             uint32_t checksum = xxhState.digest();
             std::string outputSize = formatBytes(totalBytesWritten.load());
-            
+
+            // Final 100% line then overwrite with completion message
+            if (g_verbosity == NORMAL && estimatedBlocks > 10) {
+                std::string ws = formatBytes(totalBytesWritten.load());
+                fprintf(stderr, "\rWriting:       100%%  [ %s / %s ]%s",
+                        ws.c_str(), ws.c_str(), "          ");
+                fflush(stderr);
+            }
+
             // Overwrite progress line with completion message
             fprintf(stderr, "\r%s (CPU, %zu thread%s): %s in %.2f s%s\n",
                     testMode ? "Test complete" : "Decompression complete",
@@ -6051,6 +6212,77 @@ Architecture:
   Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
+  v3.24.12 UX: three-phase progress display for all three decompressors
+           (--gpu-only, --hybrid, --cpu-only).  Previous display was a single
+           label that never changed, used raw block count for pct (wrong for
+           re-compressed files), and gave no visibility into what phase was
+           actually running.  New phases:
+             Reading:       [ X.X GB / Y.Y GB ]
+               Shown while the writer has not yet output its first block.
+               X = compressed bytes consumed so far; Y = compressed file size
+               (from fstat).  Visible during GPU warm-up / CUDA init lag and
+               any pre-decompression reader catch-up period.
+             Decompressing: ##%  [ X.X GB / Y.Y GB ]
+               Shown once writing has started and workers are still active
+               (reader/dispatcher not done yet).  X = uncompressed bytes
+               written; Y = total uncompressed size (totalBlocks*chunkSize
+               once known, else originalFileSize from frame header).
+             Writing:       ##%  [ X.X GB / Y.Y GB ]
+               Shown once all decompression work is submitted/done and the
+               writer is flushing the final ordered stream to disk.
+           All three paths share the same 200 ms rate-limit + every-16-blocks
+           gate (from v3.24.11).  The Reading phase bypasses the 16-block gate
+           so it fires during the wait_for idle periods at block 0.
+           compressedFileSize captured via fstat() in all three paths (GPU-only
+           and hybrid already had the fstat for the vector-capacity guard;
+           CPU-only gets a new fstat call).  readBytesRead atomic added to all
+           three reader/dispatcher threads.  100% completion lines updated to
+           match the new [ X / Y ] format.
+  v3.24.11 Bugfix: progress display appeared frozen then jumped abruptly on
+           both --gpu-only and --hybrid decompression.
+           Two root causes:
+           (1) The progress update was placed AFTER the inner drain loop, not
+               inside it.  The inner loop calls write() on each 4 MB block;
+               at 3 GB/s that's ~1.3 ms/block, so draining 1000 consecutive
+               ready blocks takes ~1.3 s with zero progress updates.  The
+               outer-loop 200 ms rate-limiter never fired because the code
+               never reached it while the inner loop was running.
+           (2) pct was computed from originalFileSize = desc.contentSize, which
+               for a re-compressed file is the compressed size (smaller than
+               the actual output), so pct jumped past 99% early and then sat
+               there.  Fixed to use totalBlocks * chunkSize once the reader
+               has set it (accurate), falling back to originalFileSize only
+               until then.
+           Fix: extracted a showProgress() lambda that checks the clock every
+           16 blocks (cheap modulo gate; clock only hit ~once per 200 ms
+           regardless of speed).  Called from inside the inner drain loop,
+           after wait_for(), and inside the final drain loop.  Applied
+           identically to both decompressFileGPU and decompressFileHybrid.
+           Final-drain progress in GPU-only also fixed (was using a separate
+           fprintf with the wrong pct formula and no rate limiting).
+  v3.24.10 Bugfix: deadlock/hang in --gpu-only and --hybrid decompression when
+           the file's stored contentSize (uncompressed original) is smaller than
+           the actual block count implied by the compressed data.
+           Root cause: results[] and ready[] vectors were pre-allocated to
+             estimatedBlocks = ceil(desc.contentSize / chunkSize)
+           desc.contentSize is the UNCOMPRESSED size  correct for files that
+           were compressed once from raw data. But if the .lz4 file was itself
+           re-compressed (e.g. the 299 GB compressed file that triggered this),
+           contentSize holds the compressed size, which is smaller than the
+           uncompressed output. With estimatedBlocks=71,409 but actual block
+           count=110,735, two things happened:
+             (1) Workers wrote results[71409..110734]  out-of-bounds UB.
+             (2) The writer drain loop checked nextBlockToWrite < estimatedBlocks
+                 and stopped at 71,409. The termination condition (blocksDone >=
+                 totalBlocks) was never reached because all worker threads were
+                 still running and filling blockQueue  the main thread exited
+                 its loop and called join() while the GPU workers were blocked
+                 waiting on blockQueueCV. Classic hang.
+           Fix: after computing estimatedBlocks from contentSize, fstat() the
+           compressed input file and take max(estimatedBlocks,
+           ceil(compressedSize/chunkSize)+1). The compressed-to-block ratio can
+           never exceed 1 block per byte, so this is always a safe upper bound.
+           Applied to both decompressFileGPU and decompressFileHybrid.
   v3.24.9  Perf: parallel XXH32 hash thread in AsyncWriter (compression only).
            Previously writeTask() called xxhState->update(originalData, origSz)
            then bufAppend(compressedData) sequentially on the writer thread,
