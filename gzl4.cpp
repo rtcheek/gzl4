@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.24.12";
+constexpr const char* VERSION = "3.24.23";
 
 // Compression backend modes
 enum class BackendMode {
@@ -87,6 +87,64 @@ enum VerbosityLevel {
 
 // Global verbosity setting (default: NORMAL)
 int g_verbosity = NORMAL;
+
+// ── ANSI color support ────────────────────────────────────────────────────────
+// Detected once at startup: true if stderr is a TTY and $TERM/COLORTERM
+// indicate a color-capable terminal.
+bool g_color = false;
+
+inline void detectColor() {
+    if (!isatty(STDERR_FILENO)) { g_color = false; return; }
+    const char* term      = getenv("TERM");
+    const char* colorterm = getenv("COLORTERM");
+    const char* termProg  = getenv("TERM_PROGRAM");
+    // COLORTERM=truecolor/24bit/yes → definitely supports ANSI colors
+    if (colorterm && (strstr(colorterm, "truecolor") ||
+                      strstr(colorterm, "24bit") ||
+                      strcmp(colorterm, "yes") == 0)) {
+        g_color = true; return;
+    }
+    // Known color-capable TERM values
+    if (term && (strstr(term, "color") || strstr(term, "256") ||
+                 strstr(term, "xterm") || strstr(term, "screen") ||
+                 strstr(term, "tmux")  || strstr(term, "rxvt") ||
+                 strcmp(term, "linux") == 0)) {
+        g_color = true; return;
+    }
+    // Known color-capable TERM_PROGRAM values (macOS Terminal, iTerm2, etc.)
+    if (termProg && (strstr(termProg, "iTerm") ||
+                     strstr(termProg, "Terminal") ||
+                     strstr(termProg, "Hyper") ||
+                     strstr(termProg, "vscode"))) {
+        g_color = true; return;
+    }
+    g_color = false;
+}
+
+// ANSI escape helpers  return empty string when color is disabled.
+// All codes reset with \033[0m so they can't bleed into adjacent text.
+static inline const char* C(const char* code) {
+    // This is only used in fprintf where we need the raw sequence;
+    // use the CG/CR/... macros below for std::string contexts.
+    return g_color ? code : "";
+}
+
+// Color macros for use in fprintf format strings:
+#define CC_RESET    (g_color ? "\033[0m"     : "")
+#define CC_BOLD     (g_color ? "\033[1m"     : "")
+#define CC_DIM      (g_color ? "\033[2m"     : "")
+#define CC_GREEN    (g_color ? "\033[32m"    : "")
+#define CC_BGREEN   (g_color ? "\033[1;32m"  : "")
+#define CC_YELLOW   (g_color ? "\033[33m"    : "")
+#define CC_BYELLOW  (g_color ? "\033[1;33m"  : "")
+#define CC_CYAN     (g_color ? "\033[36m"    : "")
+#define CC_BCYAN    (g_color ? "\033[1;36m"  : "")
+#define CC_BLUE     (g_color ? "\033[34m"    : "")
+#define CC_BBLUE    (g_color ? "\033[1;34m"  : "")
+#define CC_RED      (g_color ? "\033[31m"    : "")
+#define CC_BRED     (g_color ? "\033[1;31m"  : "")
+#define CC_WHITE    (g_color ? "\033[37m"    : "")
+#define CC_BWHITE   (g_color ? "\033[1;37m"  : "")
 
 // Macro for verbosity-aware output
 #define VLOG(level, ...) do { \
@@ -786,35 +844,66 @@ private:
     // Fallback mode: limit queue depth to bound RAM
     size_t           maxQueuedChunks = 0;
 
+    // Read exactly `count` bytes from fd, looping over short reads.
+    // Returns bytes read (may be < count only at EOF/error on pipe).
+    static ssize_t readFull(int fd, void* buf, size_t count) {
+        size_t total = 0;
+        uint8_t* p   = static_cast<uint8_t*>(buf);
+        while (total < count) {
+            ssize_t n = ::read(fd, p + total, count - total);
+            if (n < 0) return (total > 0) ? (ssize_t)total : -1;
+            if (n == 0) break; // EOF
+            total += (size_t)n;
+        }
+        return (ssize_t)total;
+    }
+
     void readerLoop() {
         size_t chunkIndex = 0;
         size_t totalRead  = 0;
         auto   t0         = std::chrono::high_resolution_clock::now();
+        // fileSize==0 means stdin/pipe: read until EOF, chunk size is fixed.
+        const bool pipeMode = (fileSize == 0);
 
-        while (totalRead < fileSize && !shouldStop.load()) {
-            size_t toRead = std::min(chunkSize, fileSize - totalRead);
+        while (!shouldStop.load()) {
+            // For regular files stop at EOF by byte count.
+            // For pipes keep going until ::read() returns 0 (EOF).
+            if (!pipeMode && totalRead >= fileSize) break;
+
+            size_t toRead = pipeMode ? chunkSize
+                                     : std::min(chunkSize, fileSize - totalRead);
             ReadChunk chunk;
             chunk.chunkIndex = chunkIndex;
-            chunk.size       = toRead;
 
             if (pool_) {
                 // ── Pooled path: acquire pinned slot, read directly into it ──
-                // Blocks only if all slots are in use (GPU-paced backpressure).
                 chunk.poolHandle = pool_->acquire();
                 if (!chunk.poolHandle.valid()) break;  // shutdown
-                chunk.poolHandle.size     = toRead;
-                chunk.poolHandle.chunkIdx = chunkIndex;
 
                 auto rs = std::chrono::high_resolution_clock::now();
-                ssize_t n = ::read(inputFd, chunk.poolHandle.data, toRead);
+                // For pipes: read() may return less than chunkSize on last chunk.
+                ssize_t n = pipeMode
+                    ? readFull(inputFd, chunk.poolHandle.data, toRead)
+                    : ::read(inputFd, chunk.poolHandle.data, toRead);
                 auto re = std::chrono::high_resolution_clock::now();
-                if (n != (ssize_t)toRead) {
-                    fprintf(stderr, "Reader: read error chunk %zu: %s\n",
-                            chunkIndex, strerror(errno));
-                    break;
-                }
                 totalReadTime = totalReadTime.load() +
                     std::chrono::duration<double>(re - rs).count();
+                if (pipeMode) {
+                    if (n <= 0) { chunk.poolHandle.release(); break; } // EOF
+                    chunk.poolHandle.size     = (size_t)n;
+                    chunk.poolHandle.chunkIdx = chunkIndex;
+                    chunk.size = (size_t)n;
+                } else {
+                    if (n != (ssize_t)toRead) {
+                        fprintf(stderr, "Reader: read error chunk %zu: %s\n",
+                                chunkIndex, strerror(errno));
+                        chunk.poolHandle.release();
+                        break;
+                    }
+                    chunk.poolHandle.size     = toRead;
+                    chunk.poolHandle.chunkIdx = chunkIndex;
+                    chunk.size = toRead;
+                }
             } else {
                 // ── Fallback: heap allocation with queue-depth cap ────────────
                 {
@@ -827,19 +916,28 @@ private:
                 chunk.heapData.resize(toRead);
 
                 auto rs = std::chrono::high_resolution_clock::now();
-                ssize_t n = ::read(inputFd, chunk.heapData.data(), toRead);
+                ssize_t n = pipeMode
+                    ? readFull(inputFd, chunk.heapData.data(), toRead)
+                    : ::read(inputFd, chunk.heapData.data(), toRead);
                 auto re = std::chrono::high_resolution_clock::now();
-                if (n != (ssize_t)toRead) {
-                    fprintf(stderr, "Reader: read error chunk %zu: %s\n",
-                            chunkIndex, strerror(errno));
-                    break;
-                }
                 totalReadTime = totalReadTime.load() +
                     std::chrono::duration<double>(re - rs).count();
+                if (pipeMode) {
+                    if (n <= 0) break; // EOF
+                    chunk.heapData.resize((size_t)n); // trim to actual bytes read
+                    chunk.size = (size_t)n;
+                } else {
+                    if (n != (ssize_t)toRead) {
+                        fprintf(stderr, "Reader: read error chunk %zu: %s\n",
+                                chunkIndex, strerror(errno));
+                        break;
+                    }
+                    chunk.size = toRead;
+                }
             }
 
-            totalRead  += toRead;
-            bytesRead  += toRead;
+            totalRead  += chunk.size;
+            bytesRead  += chunk.size;
             chunkIndex++;
 
             { std::lock_guard<std::mutex> lk(queueMutex); readQueue.push(std::move(chunk)); }
@@ -884,6 +982,10 @@ private:
             // Stdin pipe  file size unknown, can't pre-advise
             inputFd  = STDIN_FILENO;
             fileSize = 0;
+            // Request 1 MB pipe buffer (default is 64 KB). Larger buffer reduces
+            // context switches between upstream process and our reader thread.
+            // The kernel silently caps this at /proc/sys/fs/pipe-max-size.
+            fcntl(STDIN_FILENO, F_SETPIPE_SZ, 1 << 20);
             VLOG(VERBOSE, "AsyncReader: reading from stdin (pipe)\n");
         } else {
             inputFd = open(filename.c_str(), O_RDONLY);
@@ -953,6 +1055,8 @@ private:
 
     std::vector<uint8_t> writeBuf;   // allocated once at start()
     size_t               writeBufUsed = 0;
+    bool                 isPipe = false;  // true when outputFd is non-seekable
+    size_t               flushSize = WRITE_BUF_SIZE;  // reduced for pipes
 
     // Append bytes to staging buffer, flushing when full
     void bufAppend(const void* data, size_t len) {
@@ -964,7 +1068,7 @@ private:
             writeBufUsed += copy;
             src          += copy;
             len          -= copy;
-            if (writeBufUsed == WRITE_BUF_SIZE) bufFlush();
+            if (writeBufUsed >= flushSize) bufFlush();
         }
     }
 
@@ -980,11 +1084,14 @@ private:
         auto writeEnd   = std::chrono::high_resolution_clock::now();
         if (written != (ssize_t)writeBufUsed)
             fprintf(stderr, "Write error: %s\n", strerror(errno));
-        // Tell kernel to drop these pages  we'll never re-read the output
-        off_t pos = lseek(outputFd, 0, SEEK_CUR);
-        if (pos >= (off_t)writeBufUsed)
-            posix_fadvise(outputFd, pos - writeBufUsed, writeBufUsed, POSIX_FADV_DONTNEED);
         bytesWritten += writeBufUsed;
+        // For regular files: tell kernel to drop output pages (we won't re-read them).
+        // Skip for pipes/stdout where lseek returns -1.
+        if (!isPipe) {
+            off_t pos = lseek(outputFd, 0, SEEK_CUR);
+            if (pos >= (off_t)writeBufUsed)
+                posix_fadvise(outputFd, pos - writeBufUsed, writeBufUsed, POSIX_FADV_DONTNEED);
+        }
         totalWriteTime = totalWriteTime.load() +
             std::chrono::duration<double>(writeEnd - writeStart).count();
         writeBufUsed = 0;
@@ -1147,7 +1254,9 @@ public:
 
         if (filename == "-") {
             outputFd = STDOUT_FILENO;
-            VLOG(VERBOSE, "AsyncWriter: writing blocks to stdout\n");
+            isPipe    = true;
+            flushSize = 4ULL * 1024 * 1024;  // 4 MB for pipes: low latency over throughput
+            VLOG(VERBOSE, "AsyncWriter: writing blocks to stdout (pipe mode, 4 MB flush)\n");
         } else {
             // Open file with O_APPEND since header was already written by main thread
             outputFd = open(filename.c_str(), O_WRONLY | O_APPEND, 0644);
@@ -1157,7 +1266,11 @@ public:
                 return false;
             }
             posix_fadvise(outputFd, 0, 0, POSIX_FADV_SEQUENTIAL);
-            VLOG(VERBOSE, "AsyncWriter: opened %s for appending blocks\n", filename.c_str());
+            // Also check dynamically (e.g. redirected to /dev/null or a fifo)
+            isPipe    = (lseek(outputFd, 0, SEEK_CUR) < 0);
+            flushSize = isPipe ? 4ULL * 1024 * 1024 : WRITE_BUF_SIZE;
+            VLOG(VERBOSE, "AsyncWriter: opened %s for appending blocks%s\n",
+                 filename.c_str(), isPipe ? " (pipe/fifo)" : "");
         }
         
         shouldStop.store(false);
@@ -1531,9 +1644,11 @@ private:
     size_t slotCapacity;      // chunks per GPU slot (--slot-capacity)
     size_t pipelineDepth;     // slots per GPU (--pipeline-depth)
     bool   disableEarlyRead;  // skip early reader (--no-early-read)
+    bool   forceProgress;     // --progress: show progress even when piped
 
     // Started before GPU init so reads overlap with CUDA context creation
     AsyncReader      earlyReader;
+    bool             earlyReaderStarted = false;
     PinnedInputPool  inputPool;    // pinned slots shared between reader + GPU workers
     
 public:
@@ -1553,6 +1668,7 @@ public:
         , slotCapacity(8)                   // "batch size" or "chunks per batch" in UI
         , pipelineDepth(0)                  // 0 = auto-tune, >0 = user override
         , disableEarlyRead(false)
+        , forceProgress(false)
     {}
     
     ~GZL4Compressor() {}
@@ -2249,24 +2365,35 @@ public:
      * Compress a file using CPU-only multi-threaded compression
      */
     bool compressFileCPU() {
-        VLOG(NORMAL, "Compressing (CPU-only): %s -> %s\n",
+        VLOG(NORMAL, "%sCompressing%s (CPU-only): %s -> %s\n",
+                CC_BCYAN, CC_RESET,
                 inputFile.c_str(), outputFile.c_str());
         
         double timeReading = 0, timeCompressing = 0;
         
-        // Get file size
-        struct stat st;
-        if (stat(inputFile.c_str(), &st) != 0) {
-            fprintf(stderr, "Error: Cannot stat input file: %s\n", inputFile.c_str());
-            return false;
+        // Get file size (0 = unknown, e.g. stdin pipe)
+        size_t fileSize = 0;
+        const bool stdinMode = (inputFile == "-");
+        if (!stdinMode) {
+            struct stat st;
+            if (stat(inputFile.c_str(), &st) != 0) {
+                fprintf(stderr, "Error: Cannot stat input file: %s\n", inputFile.c_str());
+                return false;
+            }
+            fileSize = st.st_size;
+            VLOG(VERBOSE, "Input file size: %.2f MB\n", fileSize / (1024.0 * 1024.0));
+        } else {
+            VLOG(VERBOSE, "Input: stdin (size unknown)\n");
         }
-        size_t fileSize = st.st_size;
-        
-        VLOG(VERBOSE, "Input file size: %.2f MB\n", fileSize / (1024.0 * 1024.0));
-        
-        size_t numChunks = (fileSize + chunkSize - 1) / chunkSize;
-        VLOG(VERBOSE, "Processing %zu chunk(s) of size %.2f MB\n", 
-             numChunks, chunkSize / (1024.0 * 1024.0));
+
+        // numChunks is exact for regular files; SIZE_MAX sentinel for stdin 
+        // loop termination is driven by asyncReader.isFinished() in that case.
+        size_t numChunks = fileSize > 0
+            ? (fileSize + chunkSize - 1) / chunkSize
+            : SIZE_MAX;
+        if (!stdinMode)
+            VLOG(VERBOSE, "Processing %zu chunk(s) of size %.2f MB\n",
+                 numChunks, chunkSize / (1024.0 * 1024.0));
         
         // Determine CPU thread count
         size_t effectiveThreads = cpuThreads;
@@ -2337,14 +2464,17 @@ public:
         
         auto startTime = std::chrono::high_resolution_clock::now();
         
-        // Main compression loop
-        while (nextChunkToWrite < numChunks) {
+        // Main compression loop.
+        // For regular files: numChunks is known, loop until all written.
+        // For stdin: numChunks==SIZE_MAX; terminate when reader is done AND
+        // all submitted chunks have been written out.
+        while (nextChunkToWrite < chunksSubmitted || !asyncReader.isFinished()) {
             
             // PHASE 1: Read chunks and submit to CPU pool
             auto readStart = std::chrono::high_resolution_clock::now();
             
             AsyncReader::ReadChunk chunk;
-            while (chunksSubmitted < numChunks && asyncReader.getChunk(chunk)) {
+            while (!asyncReader.isFinished() && asyncReader.getChunk(chunk)) {
                 // Submit to CPU pool
                 cpuPool.submitJob(chunk.chunkIndex, std::move(chunk.heapData), hcLevel);
                 chunksSubmitted++;
@@ -2402,13 +2532,20 @@ public:
             timeCompressing += std::chrono::duration<double>(compressEnd - compressStart).count();
             
             // Progress - show bytes processed
-            if (g_verbosity == NORMAL && numChunks > 10) {
-                size_t bytesProcessed = nextChunkToWrite * chunkSize;
-                if (bytesProcessed > fileSize) bytesProcessed = fileSize;
-                int progress = (100 * nextChunkToWrite) / numChunks;
+            if (g_verbosity == NORMAL && !stdinMode && numChunks > 10) {
+                size_t bytesProcessed = std::min(nextChunkToWrite * chunkSize, fileSize);
+                int progress = (int)((100 * nextChunkToWrite) / numChunks);
                 std::string cpuBytes = formatBytes(bytesProcessed);
-                fprintf(stderr, "\rCompressing: %3d%%  CPU: %s%s", 
-                        progress, cpuBytes.c_str(), "          ");  // padding
+                fprintf(stderr, "\r%sCompressing:%s %s%3d%%%s  %sCPU:%s %s%s%s          ",
+                        CC_BCYAN, CC_RESET,
+                        CC_BYELLOW, progress, CC_RESET,
+                        CC_CYAN, CC_RESET, CC_BLUE, cpuBytes.c_str(), CC_RESET);
+                fflush(stderr);
+            } else if (g_verbosity == NORMAL && stdinMode) {
+                std::string cpuBytes = formatBytes(nextChunkToWrite * chunkSize);
+                fprintf(stderr, "\r%sCompressing:%s  %sCPU:%s %s%s%s          ",
+                        CC_BCYAN, CC_RESET,
+                        CC_CYAN, CC_RESET, CC_BLUE, cpuBytes.c_str(), CC_RESET);
                 fflush(stderr);
             }
             // No sleep needed  waitForResult handles blocking efficiently
@@ -2416,28 +2553,50 @@ public:
 
 // Commenting out the following line to allow the writer to overwrite the compression progress.	
 //        if (g_verbosity == NORMAL && numChunks > 10) { fprintf(stderr, "\n"); }
+
+        // For stdin: set exact chunk count so writer self-exits cleanly.
+        if (stdinMode) asyncWriter.setTotalChunks(nextChunkToWrite);
         
         // Wait for writer to finish with progress display
         {
             std::atomic<bool> stopProgress{false};
             std::thread progressThread;
-            if (g_verbosity == NORMAL && numChunks > 10) {
+            if (g_verbosity == NORMAL && (stdinMode || numChunks > 10)) {
                 progressThread = std::thread([&]() {
                     while (!stopProgress.load()) {
-                        size_t w = asyncWriter.getNextChunkToWrite();
-                        size_t bytesWritten = w * chunkSize;
-                        if (bytesWritten > fileSize) bytesWritten = fileSize;
-                        std::string written = formatBytes(bytesWritten);
-                        std::string total = formatBytes(fileSize);
-                        VLOG(NORMAL, "\rWriting: %3d%%  [%s/%s to disk]%s",
-                                (int)(100 * w / numChunks), written.c_str(), total.c_str(),
-                                "          ");
+                        std::string written = formatBytes(asyncWriter.getBytesWritten());
+                        if (stdinMode) {
+                            VLOG(NORMAL, "\r%sWriting:%s  %s%s%s          ",
+                                    CC_BGREEN, CC_RESET,
+                                    CC_BGREEN, written.c_str(), CC_RESET);
+                        } else {
+                            size_t w = asyncWriter.getNextChunkToWrite();
+                            std::string total = formatBytes(fileSize);
+                            VLOG(NORMAL, "\r%sWriting:%s       %s%3d%%%s  %s[%s %s%s%s / %s%s%s ]%s          ",
+                                    CC_BGREEN, CC_RESET,
+                                    CC_BYELLOW, (int)(100 * w / numChunks), CC_RESET,
+                                    CC_DIM, CC_RESET,
+                                    CC_BGREEN, written.c_str(), CC_RESET,
+                                    CC_WHITE, total.c_str(), CC_RESET,
+                                    CC_DIM);
+                        }
                         fflush(stderr);
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                     }
-                    std::string total = formatBytes(fileSize);
-                    VLOG(NORMAL, "\rWriting: 100%%  [%s/%s to disk]  \n",
-                            total.c_str(), total.c_str());
+                    std::string fb = formatBytes((size_t)asyncWriter.getBytesWritten());
+                    if (stdinMode) {
+                        VLOG(NORMAL, "\r%sWriting:%s  %s%s%s          \n",
+                                CC_BGREEN, CC_RESET, CC_BGREEN, fb.c_str(), CC_RESET);
+                    } else {
+                        std::string total = formatBytes(fileSize);
+                        VLOG(NORMAL, "\r%sWriting:%s       %s100%%%s  %s[%s %s%s%s / %s%s%s ]%s\n",
+                                CC_BGREEN, CC_RESET,
+                                CC_BYELLOW, CC_RESET,
+                                CC_DIM, CC_RESET,
+                                CC_BGREEN, total.c_str(), CC_RESET,
+                                CC_WHITE, total.c_str(), CC_RESET,
+                                CC_DIM);
+                    }
                 });
             }
             
@@ -2481,16 +2640,34 @@ public:
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
         
         double totalBytesWritten = asyncWriter.getBytesWritten();
-        double ratio = 100.0 * totalBytesWritten / fileSize;
-        double throughputMBps = (fileSize / (1024.0 * 1024.0)) / (duration.count() / 1000.0);
+        // For stdin, use output size as denominator (input size unknown)
+        size_t effectiveInputSize = stdinMode
+            ? (size_t)(totalBytesWritten > 0 ? totalBytesWritten / 0.5 : totalBytesWritten)
+            : fileSize;
+        // ratio = compressed/uncompressed; fall back gracefully when stdin
+        double ratio = (!stdinMode && fileSize > 0)
+            ? 100.0 * totalBytesWritten / fileSize : 0.0;
+        double throughputMBps = (!stdinMode && fileSize > 0 && duration.count() > 0)
+            ? (fileSize / (1024.0 * 1024.0)) / (duration.count() / 1000.0)
+            : (totalBytesWritten / (1024.0 * 1024.0)) / (duration.count() / 1000.0);
         
         double cpuReadTime  = asyncReader.getReadTime();
         double cpuWriteTime = asyncWriter.getWriteTime();
 
-        std::string inputSize = formatBytes(fileSize);
+        std::string inputSize  = stdinMode ? "(stdin)" : formatBytes(fileSize);
         std::string outputSize = formatBytes((size_t)totalBytesWritten);
-        VLOG(NORMAL, "Compression complete (CPU-only): %s -> %s (%.2f%%) in %.2f s\n",
-                inputSize.c_str(), outputSize.c_str(), ratio, duration.count() / 1000.0);
+        if (stdinMode)
+            VLOG(NORMAL, "\r%sCompression complete%s (CPU-only): stdin -> %s%s%s in %.2f s\n",
+                    CC_BGREEN, CC_RESET,
+                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    duration.count() / 1000.0);
+        else
+        VLOG(NORMAL, "\r%sCompression complete%s (CPU-only): %s%s%s -> %s%s%s %s(%.2f%%)%s in %.2f s\n",
+                CC_BGREEN, CC_RESET,
+                CC_WHITE, inputSize.c_str(), CC_RESET,
+                CC_WHITE, outputSize.c_str(), CC_RESET,
+                CC_BYELLOW, ratio, CC_RESET,
+                duration.count() / 1000.0);
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
         VLOG(VERBOSE, "  Read:    %.2f s  |  CPU compress (%zu threads): %.2f s  |  Write: %.2f s\n",
              cpuReadTime, effectiveThreads, timeCompressing, cpuWriteTime);
@@ -2516,25 +2693,33 @@ public:
             VLOG(VERBOSE, "  GPU%d: %s  %.1f GB  %zu SMs  %d pipeline slots\n",
                  g.deviceId, g.properties.name,
                  g.totalMemory/(1024.0*1024.0*1024.0), g.smCount, g.pipelineDepth);
-        VLOG(NORMAL, "Compressing (GPU-only, %zu GPU%s): %s -> %s\n",
+        VLOG(NORMAL, "%sCompressing%s (GPU-only, %zu GPU%s): %s -> %s\n",
+                CC_BCYAN, CC_RESET,
                 gpus.size(), gpus.size()==1?"":"s",
                 inputFile.c_str(), outputFile.c_str());
         
-        // Get file size
-        struct stat st;
-        if (stat(inputFile.c_str(), &st) != 0) {
-            fprintf(stderr, "Error: Cannot stat input file: %s\n", inputFile.c_str());
-            return false;
+        // Get file size (0 = unknown, e.g. stdin pipe)
+        const bool stdinMode = (inputFile == "-");
+        size_t fileSize = 0;
+        if (!stdinMode) {
+            struct stat st;
+            if (stat(inputFile.c_str(), &st) != 0) {
+                fprintf(stderr, "Error: Cannot stat input file: %s\n", inputFile.c_str());
+                return false;
+            }
+            fileSize = st.st_size;
+            VLOG(VERBOSE, "Input file size: %.2f MB\n", fileSize / (1024.0 * 1024.0));
+        } else {
+            VLOG(VERBOSE, "Input: stdin (size unknown)\n");
         }
-        size_t fileSize = st.st_size;
-        
-        VLOG(VERBOSE, "Input file size: %.2f MB\n", 
-             fileSize / (1024.0 * 1024.0));
-        
-        // Calculate chunks
-        size_t numChunks = (fileSize + chunkSize - 1) / chunkSize;
-        VLOG(VERBOSE, "Processing %zu chunk(s) of size %.2f MB\n",
-             numChunks, chunkSize / (1024.0 * 1024.0));
+
+        // numChunks is exact for files; SIZE_MAX sentinel for stdin.
+        size_t numChunks = fileSize > 0
+            ? (fileSize + chunkSize - 1) / chunkSize
+            : SIZE_MAX;
+        if (!stdinMode)
+            VLOG(VERBOSE, "Processing %zu chunk(s) of size %.2f MB\n",
+                 numChunks, chunkSize / (1024.0 * 1024.0));
 
         // ── Async reader setup ────────────────────────────────────────────────
         // Prefer the pre-warmed reader started before GPU init in run().
@@ -2544,12 +2729,14 @@ public:
         size_t estBatch    = gpus.empty() ? 64 :
             std::max(size_t(64), static_cast<size_t>(
                 gpus[0].availableMemory * 0.90 / gpus[0].pipelineDepth / (chunkSize * 5)));
-        size_t maxReadQueue = std::min(numChunks, std::max(size_t(256), totalPipelineSlots * estBatch));
+        size_t maxReadQueue = stdinMode
+            ? std::max(size_t(256), totalPipelineSlots * estBatch)
+            : std::min(numChunks, std::max(size_t(256), totalPipelineSlots * estBatch));
 
         AsyncReader localReader;
         AsyncReader* asyncReaderPtr = nullptr;
 
-        if (earlyReader.getFileSize() > 0) {
+        if (earlyReaderStarted) {
             // Use the pre-warmed reader as-is (heap mode)  never restart it.
             // Restarting would re-read from byte 0 while old chunks are still
             // queued, causing duplicate chunk indices and writer deadlock.
@@ -2585,9 +2772,10 @@ public:
         // Skip pool if early reader is active (heap mode)  the pool would sit
         // unused while taking 2-3s to cudaHostAlloc 7GB of pinned memory.
         // Pool is only beneficial for fresh readers (decompression, batch mode).
-        if (!inputPool.numSlots() && earlyReader.getFileSize() == 0) {
-            size_t poolSlots = std::min(numChunks,
-                std::max(size_t(64), 2 * totalPipelineSlots * slotCapacity));
+        if (!inputPool.numSlots() && !earlyReaderStarted) {
+            size_t poolSlots = stdinMode
+                ? std::max(size_t(64), 2 * totalPipelineSlots * slotCapacity)
+                : std::min(numChunks, std::max(size_t(64), 2 * totalPipelineSlots * slotCapacity));
             if (!inputPool.init(poolSlots, chunkSize)) {
                 fprintf(stderr, "Warning: pinned pool alloc failed, using heap\n");
             } else {
@@ -2722,7 +2910,7 @@ public:
         // Start async writer NOW  after slots are ready so writer thread
         // doesn't sit idle waiting for the first chunk during slot init.
         AsyncWriter asyncWriter;
-        if (!asyncWriter.start(getActualOutputPath(), &xxhState)) {
+        if (!asyncWriter.start(stdoutMode ? "-" : getActualOutputPath(), &xxhState)) {
             fprintf(stderr, "Error: Failed to start async writer\n");
             freeAllSlots(); asyncReader.stop(); return false;
         }
@@ -2951,12 +3139,21 @@ public:
         while (activeWorkers.load() > 0) {
             if (g_verbosity == NORMAL && numChunks > 10) {
                 size_t submitted = chunksSubmitted.load();
-                size_t bytesProcessed = submitted * chunkSize;
-                if (bytesProcessed > fileSize) bytesProcessed = fileSize;
-                int progress = (int)(100 * submitted / numChunks);
+                size_t bytesProcessed = stdinMode
+                    ? submitted * chunkSize
+                    : std::min(submitted * chunkSize, fileSize);
                 std::string gpuBytes = formatBytes(bytesProcessed);
-                fprintf(stderr, "\rCompressing: %3d%%  GPU: %s%s", 
-                        progress, gpuBytes.c_str(), "          ");
+                if (stdinMode) {
+                    fprintf(stderr, "\r%sCompressing:%s  %sGPU:%s %s%s%s          ",
+                            CC_BCYAN, CC_RESET,
+                            CC_CYAN, CC_RESET, CC_GREEN, gpuBytes.c_str(), CC_RESET);
+                } else {
+                    int progress = (int)(100 * submitted / numChunks);
+                    fprintf(stderr, "\r%sCompressing:%s %s%3d%%%s  %sGPU:%s %s%s%s          ",
+                            CC_BCYAN, CC_RESET,
+                            CC_BYELLOW, progress, CC_RESET,
+                            CC_CYAN, CC_RESET, CC_GREEN, gpuBytes.c_str(), CC_RESET);
+                }
                 fflush(stderr);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -2964,6 +3161,10 @@ public:
 
         // Join all workers
         for (auto& w : workers) if (w.joinable()) w.join();
+
+        // For stdin: now we know the exact chunk count  tell the writer so it
+        // self-exits cleanly (same as file mode) instead of waiting for stop().
+        if (stdinMode) asyncWriter.setTotalChunks(chunksSubmitted.load());
 
         // ── Writer drain with live progress ───────────────────────────────────
         // asyncWriter.stop() blocks until the writer thread finishes.
@@ -2973,24 +3174,43 @@ public:
         {
             std::atomic<bool> stopProgress{false};
             std::thread progressThread;
-            if (g_verbosity == NORMAL && numChunks > 10) {
+            if (g_verbosity == NORMAL && (stdinMode || numChunks > 10)) {
                 progressThread = std::thread([&]() {
                     while (!stopProgress.load()) {
-                        size_t w = asyncWriter.getNextChunkToWrite();
-                        size_t bytesWritten = w * chunkSize;
-                        if (bytesWritten > fileSize) bytesWritten = fileSize;
-                        std::string written = formatBytes(bytesWritten);
-                        std::string total = formatBytes(fileSize);
-                        VLOG(NORMAL, "\rWriting: %3d%%  [%s/%s to disk]%s",
-                                (int)(100 * w / numChunks), written.c_str(), total.c_str(),
-                                "          ");
+                        // getBytesWritten() is accurate for both files and pipes.
+                        std::string written = formatBytes(asyncWriter.getBytesWritten());
+                        if (stdinMode) {
+                            VLOG(NORMAL, "\r%sWriting:%s  %s%s%s          ",
+                                    CC_BGREEN, CC_RESET,
+                                    CC_BGREEN, written.c_str(), CC_RESET);
+                        } else {
+                            size_t w = asyncWriter.getNextChunkToWrite();
+                            std::string total = formatBytes(fileSize);
+                            VLOG(NORMAL, "\r%sWriting:%s       %s%3d%%%s  %s[%s %s%s%s / %s%s%s ]%s          ",
+                                    CC_BGREEN, CC_RESET,
+                                    CC_BYELLOW, (int)(100 * w / numChunks), CC_RESET,
+                                    CC_DIM, CC_RESET,
+                                    CC_BGREEN, written.c_str(), CC_RESET,
+                                    CC_WHITE, total.c_str(), CC_RESET,
+                                    CC_DIM);
+                        }
                         fflush(stderr);
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                     }
-                    // Final update
-                    std::string total = formatBytes(fileSize);
-                    VLOG(NORMAL, "\rWriting: 100%%  [%s/%s to disk]  \n",
-                            total.c_str(), total.c_str());
+                    std::string fb = formatBytes((size_t)asyncWriter.getBytesWritten());
+                    if (stdinMode) {
+                        VLOG(NORMAL, "\r%sWriting:%s  %s%s%s          \n",
+                                CC_BGREEN, CC_RESET, CC_BGREEN, fb.c_str(), CC_RESET);
+                    } else {
+                        std::string total = formatBytes(fileSize);
+                        VLOG(NORMAL, "\r%sWriting:%s       %s100%%%s  %s[%s %s%s%s / %s%s%s ]%s\n",
+                                CC_BGREEN, CC_RESET,
+                                CC_BYELLOW, CC_RESET,
+                                CC_DIM, CC_RESET,
+                                CC_BGREEN, total.c_str(), CC_RESET,
+                                CC_WHITE, total.c_str(), CC_RESET,
+                                CC_DIM);
+                    }
                 });
             }
 
@@ -3040,19 +3260,34 @@ public:
         asyncReader.stop();
         
         double totalBytesWritten = asyncWriter.getBytesWritten();
-        double ratio = 100.0 * totalBytesWritten / fileSize;
-        double throughputMBps = (fileSize / (1024.0 * 1024.0)) / (duration.count() / 1000.0);
+        double ratio = (!stdinMode && fileSize > 0) ? 100.0 * totalBytesWritten / fileSize : 0.0;
+        double throughputMBps = (!stdinMode && fileSize > 0 && duration.count() > 0)
+            ? (fileSize / (1024.0 * 1024.0)) / (duration.count() / 1000.0)
+            : (totalBytesWritten / (1024.0 * 1024.0)) / (duration.count() / 1000.0);
         
         double asyncReadTime  = asyncReader.getReadTime();
         double asyncWriteTime = asyncWriter.getWriteTime();
 
         size_t finalSlots = 0;
         for (auto& gSlots : gpuSlots) finalSlots += gSlots.size();
-        std::string inputSize = formatBytes(fileSize);
+        std::string inputSize  = stdinMode ? "(stdin)" : formatBytes(fileSize);
         std::string outputSize = formatBytes((size_t)totalBytesWritten);
-        VLOG(NORMAL, "Compression complete (GPU-only, %zu GPU%s / %zu pipeline slots): %s -> %s (%.2f%%) in %.2f s\n",
-                gpus.size(), gpus.size() == 1 ? "" : "s", finalSlots,
-                inputSize.c_str(), outputSize.c_str(), ratio, duration.count() / 1000.0);
+        if (stdinMode)
+            VLOG(NORMAL, "\r%sCompression complete%s (GPU-only, %zu GPU%s / %zu pipeline slots): "
+                    "stdin -> %s%s%s in %.2f s\n",
+                    CC_BGREEN, CC_RESET,
+                    gpus.size(), gpus.size() == 1 ? "" : "s", finalSlots,
+                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    duration.count() / 1000.0);
+        else
+            VLOG(NORMAL, "\r%sCompression complete%s (GPU-only, %zu GPU%s / %zu pipeline slots): "
+                    "%s%s%s -> %s%s%s %s(%.2f%%)%s in %.2f s\n",
+                    CC_BGREEN, CC_RESET,
+                    gpus.size(), gpus.size() == 1 ? "" : "s", finalSlots,
+                    CC_WHITE, inputSize.c_str(), CC_RESET,
+                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    CC_BYELLOW, ratio, CC_RESET,
+                    duration.count() / 1000.0);
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
         VLOG(VERBOSE, "  Read: %.2f s  |  Write: %.2f s\n",
              asyncReadTime, asyncWriteTime);
@@ -3108,21 +3343,28 @@ public:
      * are saturated. As soon as a GPU slot frees up, it pulls the next chunk.
      */
     bool compressFileHybrid() {
-        struct stat st;
-        if (stat(inputFile.c_str(), &st) != 0) {
-            fprintf(stderr, "Error: Cannot stat input file: %s\n", inputFile.c_str());
-            return false;
+        const bool stdinMode = (inputFile == "-");
+        size_t fileSize = 0;
+        if (!stdinMode) {
+            struct stat st;
+            if (stat(inputFile.c_str(), &st) != 0) {
+                fprintf(stderr, "Error: Cannot stat input file: %s\n", inputFile.c_str());
+                return false;
+            }
+            fileSize = st.st_size;
         }
-        size_t fileSize  = st.st_size;
-        size_t numChunks = (fileSize + chunkSize - 1) / chunkSize;
+        size_t numChunks = fileSize > 0
+            ? (fileSize + chunkSize - 1) / chunkSize
+            : SIZE_MAX;
 
         size_t effectiveThreads = cpuThreads ? cpuThreads
                                              : std::thread::hardware_concurrency();
         if (!effectiveThreads) effectiveThreads = 4;
 
-        VLOG(NORMAL, "Compressing (Hybrid, %zu thread%s + %zu GPU%s): %s -> %s\n",
-                effectiveThreads, effectiveThreads==1?"":"s",
+        VLOG(NORMAL, "%sCompressing%s (Hybrid, %zu GPU%s + %zu thread%s): %s -> %s\n",
+                CC_BCYAN, CC_RESET,
                 gpus.size(),      gpus.size()==1?"":"s",
+                effectiveThreads, effectiveThreads==1?"":"s",
                 inputFile.c_str(), outputFile.c_str());
 
         // ── Reader setup ───────────────────────────────────────────────────────
@@ -3131,12 +3373,13 @@ public:
         size_t estBatch = gpus.empty() ? 64 :
             std::max(size_t(64), static_cast<size_t>(
                 gpus[0].availableMemory * 0.90 / gpus[0].pipelineDepth / (chunkSize * 5)));
-        size_t maxReadQueue = std::min(numChunks,
-                              std::max(size_t(256), totalPipelineSlots * estBatch));
+        size_t maxReadQueue = stdinMode
+            ? std::max(size_t(256), totalPipelineSlots * estBatch)
+            : std::min(numChunks, std::max(size_t(256), totalPipelineSlots * estBatch));
 
         AsyncReader  localReader;
         AsyncReader* asyncReaderPtr = nullptr;
-        if (earlyReader.getFileSize() > 0) {
+        if (earlyReaderStarted) {
             asyncReaderPtr = &earlyReader;
         } else {
             bool started = inputPool.numSlots()
@@ -3150,9 +3393,10 @@ public:
         // ── GPU slot setup (same as compressFileGPU) ──────────────────────────
         const size_t SLOT_CAPACITY = slotCapacity;
 
-        if (!inputPool.numSlots() && earlyReader.getFileSize() == 0) {
-            size_t poolSlots = std::min(numChunks,
-                std::max(size_t(64), 2 * totalPipelineSlots * slotCapacity));
+        if (!inputPool.numSlots() && !earlyReaderStarted) {
+            size_t poolSlots = stdinMode
+                ? std::max(size_t(64), 2 * totalPipelineSlots * slotCapacity)
+                : std::min(numChunks, std::max(size_t(64), 2 * totalPipelineSlots * slotCapacity));
             if (!inputPool.init(poolSlots, chunkSize))
                 fprintf(stderr, "Warning: pinned pool alloc failed, using heap\n");
         }
@@ -3254,7 +3498,7 @@ public:
         for (bool ok : gpuInitOk) if (!ok) { slotsOk = false; break; }
 
         AsyncWriter asyncWriter;
-        if (!asyncWriter.start(getActualOutputPath(), &xxhState)) {
+        if (!asyncWriter.start(stdoutMode ? "-" : getActualOutputPath(), &xxhState)) {
             fprintf(stderr,"Error: Failed to start async writer\n");
             freeAllSlots(); asyncReader.stop(); return false;
         }
@@ -3264,7 +3508,7 @@ public:
             return compressFileCPU();
         }
 
-        asyncWriter.setTotalChunks(numChunks);
+        if (!stdinMode) asyncWriter.setTotalChunks(numChunks);
         auto startTime = std::chrono::high_resolution_clock::now();
         std::atomic<size_t> chunksSubmitted{0};
         std::atomic<bool>   workerAbort{false};
@@ -3469,19 +3713,24 @@ public:
         for (size_t t = 0; t < effectiveThreads; t++)
             allWorkers.emplace_back(cpuWorker);
 
-        // Progress display
-        while (chunksSubmitted.load() < numChunks) {
-            if (g_verbosity == NORMAL && numChunks > 10) {
+        // Progress display  for stdin loop until dispatcher drains reader.
+        while (stdinMode ? !dispatcherDone.load() : (chunksSubmitted.load() < numChunks)) {
+            if (g_verbosity == NORMAL && (stdinMode || numChunks > 10)) {
                 size_t done = asyncWriter.getNextChunkToWrite();
-                size_t gpuChunks = gpuChunkCount.load();
-                size_t cpuChunks = cpuChunkCount.load();
-                size_t gpuBytes = gpuChunks * chunkSize;
-                size_t cpuBytes = cpuChunks * chunkSize;
-                std::string gpuStr = formatBytes(gpuBytes);
-                std::string cpuStr = formatBytes(cpuBytes);
-                fprintf(stderr, "\rCompressing: %3zu%%  GPU: %s  CPU: %s%s",
-                        (100 * done) / numChunks,
-                        gpuStr.c_str(), cpuStr.c_str(), "          ");
+                std::string gpuStr = formatBytes(gpuChunkCount.load() * chunkSize);
+                std::string cpuStr = formatBytes(cpuChunkCount.load() * chunkSize);
+                if (stdinMode) {
+                    fprintf(stderr, "\r%sCompressing:%s  %sGPU:%s %s%s%s  %sCPU:%s %s%s%s          ",
+                            CC_BCYAN, CC_RESET,
+                            CC_CYAN, CC_RESET, CC_GREEN, gpuStr.c_str(), CC_RESET,
+                            CC_CYAN, CC_RESET, CC_BLUE,  cpuStr.c_str(), CC_RESET);
+                } else {
+                    fprintf(stderr, "\r%sCompressing:%s %s%3zu%%%s  %sGPU:%s %s%s%s  %sCPU:%s %s%s%s          ",
+                            CC_BCYAN, CC_RESET,
+                            CC_BYELLOW, (100 * done) / numChunks, CC_RESET,
+                            CC_CYAN, CC_RESET, CC_GREEN, gpuStr.c_str(), CC_RESET,
+                            CC_CYAN, CC_RESET, CC_BLUE,  cpuStr.c_str(), CC_RESET);
+                }
                 fflush(stderr);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -3490,6 +3739,9 @@ public:
         dispatcherThread.join();
         for (auto& t : allWorkers) t.join();
 
+        // For stdin: set exact chunk count so writer self-exits cleanly.
+        if (stdinMode) asyncWriter.setTotalChunks(chunksSubmitted.load());
+
 // Removing this to allow the writer to overwrite the Compression progress line.
 //        if (g_verbosity == NORMAL && numChunks > 10) fprintf(stderr, "\n");
         
@@ -3497,23 +3749,44 @@ public:
         {
             std::atomic<bool> stopProgress{false};
             std::thread progressThread;
-            if (g_verbosity == NORMAL && numChunks > 10) {
+            if (g_verbosity == NORMAL && (stdinMode || numChunks > 10)) {
                 progressThread = std::thread([&]() {
                     while (!stopProgress.load()) {
                         size_t w = asyncWriter.getNextChunkToWrite();
                         size_t bytesWritten = w * chunkSize;
-                        if (bytesWritten > fileSize) bytesWritten = fileSize;
+                        if (!stdinMode && bytesWritten > fileSize) bytesWritten = fileSize;
                         std::string written = formatBytes(bytesWritten);
-                        std::string total = formatBytes(fileSize);
-                        VLOG(NORMAL, "\rWriting: %3d%%  [%s/%s to disk]%s",
-                                (int)(100 * w / numChunks), written.c_str(), total.c_str(),
-                                "          ");
+                        if (stdinMode) {
+                            VLOG(NORMAL, "\r%sWriting:%s  %s%s%s          ",
+                                    CC_BGREEN, CC_RESET,
+                                    CC_BGREEN, written.c_str(), CC_RESET);
+                        } else {
+                            std::string total = formatBytes(fileSize);
+                            VLOG(NORMAL, "\r%sWriting:%s       %s%3d%%%s  %s[%s %s%s%s / %s%s%s ]%s          ",
+                                    CC_BGREEN, CC_RESET,
+                                    CC_BYELLOW, (int)(100 * w / numChunks), CC_RESET,
+                                    CC_DIM, CC_RESET,
+                                    CC_BGREEN, written.c_str(), CC_RESET,
+                                    CC_WHITE, total.c_str(), CC_RESET,
+                                    CC_DIM);
+                        }
                         fflush(stderr);
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                     }
-                    std::string total = formatBytes(fileSize);
-                    VLOG(NORMAL, "\rWriting: 100%%  [%s/%s to disk]  \n",
-                            total.c_str(), total.c_str());
+                    if (stdinMode) {
+                        std::string fb = formatBytes((size_t)asyncWriter.getBytesWritten());
+                        VLOG(NORMAL, "\r%sWriting:%s  %s%s%s          \n",
+                                CC_BGREEN, CC_RESET, CC_BGREEN, fb.c_str(), CC_RESET);
+                    } else {
+                        std::string total = formatBytes(fileSize);
+                        VLOG(NORMAL, "\r%sWriting:%s       %s100%%%s  %s[%s %s%s%s / %s%s%s ]%s\n",
+                                CC_BGREEN, CC_RESET,
+                                CC_BYELLOW, CC_RESET,
+                                CC_DIM, CC_RESET,
+                                CC_BGREEN, total.c_str(), CC_RESET,
+                                CC_WHITE, total.c_str(), CC_RESET,
+                                CC_DIM);
+                    }
                 });
             }
             
@@ -3547,21 +3820,39 @@ public:
 
         auto endTime  = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-        double bw = asyncWriter.getBytesWritten();
-        double mbps = (fileSize/(1024.0*1024.0)) / (duration.count()/1000.0);
+        double bw   = asyncWriter.getBytesWritten();
+        double mbps = duration.count() > 0
+            ? (stdinMode ? bw : (double)fileSize) / 1048576.0 / (duration.count()/1000.0)
+            : 0.0;
 
-        std::string inputSize = formatBytes(fileSize);
+        std::string inputSize  = stdinMode ? "(stdin)" : formatBytes(fileSize);
         std::string outputSize = formatBytes((size_t)bw);
-        VLOG(NORMAL, "Compression complete (Hybrid, %zu thread%s + %zu GPU%s): "
-                "%s -> %s (%.2f%%) in %.2f s\n",
-                effectiveThreads, effectiveThreads==1?"":"s",
-                gpus.size(),      gpus.size()==1?"":"s",
-                inputSize.c_str(), outputSize.c_str(),
-                100.0*bw/fileSize, duration.count()/1000.0);
+        if (stdinMode) {
+            VLOG(NORMAL, "\r%sCompression complete%s (Hybrid, %zu GPU%s + %zu thread%s): "
+                    "stdin -> %s%s%s in %.2f s\n",
+                    CC_BGREEN, CC_RESET,
+                    gpus.size(),      gpus.size()==1?"":"s",
+                    effectiveThreads, effectiveThreads==1?"":"s",
+                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    duration.count()/1000.0);
+        } else {
+            VLOG(NORMAL, "\r%sCompression complete%s (Hybrid, %zu GPU%s + %zu thread%s): "
+                    "%s%s%s -> %s%s%s %s(%.2f%%)%s in %.2f s\n",
+                    CC_BGREEN, CC_RESET,
+                    gpus.size(),      gpus.size()==1?"":"s",
+                    effectiveThreads, effectiveThreads==1?"":"s",
+                    CC_WHITE, inputSize.c_str(), CC_RESET,
+                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    CC_BYELLOW, 100.0*bw/fileSize, CC_RESET,
+                    duration.count()/1000.0);
+        }
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
+        size_t totalDone = gpuChunkCount.load() + cpuChunkCount.load();
         VLOG(VERBOSE, "  GPU: %zu chunks (%.1f%%)  CPU: %zu chunks (%.1f%%)\n",
-             gpuChunkCount.load(), 100.0*gpuChunkCount.load()/numChunks,
-             cpuChunkCount.load(), 100.0*cpuChunkCount.load()/numChunks);
+             gpuChunkCount.load(),
+             totalDone > 0 ? 100.0*gpuChunkCount.load()/totalDone : 0.0,
+             cpuChunkCount.load(),
+             totalDone > 0 ? 100.0*cpuChunkCount.load()/totalDone : 0.0);
         VLOG(VERBOSE, "  Write: %.2f s\n", asyncWriter.getWriteTime());
 
         if (!keepOriginal && !stdoutMode) {
@@ -4300,14 +4591,12 @@ public:
         auto    lastProgress = std::chrono::steady_clock::now();
 
         // Progress helper  three display phases:
-        //   Reading:      [ X GB / Y GB ]   while writer has not yet started (pre-warm)
-        //   Decompressing:  ##%  [ X GB / Y GB ]   workers active
-        //   Writing:        ##%  [ X GB / Y GB ]   workers done, draining to disk
+        //   Reading:        [ X GB / Y GB ]              compressed bytes read
+        //   Decompressing:  ##%  [ X GB / Y GB ]  GPU: X  CPU: X
+        //   Writing:        ##%  [ X GB / Y GB ]
         // Called inside the inner drain loop (every 16 blocks) and after wait_for.
         auto showProgress = [&]() {
             if (g_verbosity != NORMAL || estimatedBlocks <= 10) return;
-            // During the drain path, only sample every 16 blocks to keep overhead low.
-            // During the waiting / Reading path (nextBlockToWrite == 0), always check.
             if (nextBlockToWrite > 0 && (nextBlockToWrite & 15) != 0) return;
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -4320,16 +4609,24 @@ public:
                     ? std::min(size_t(99), totalBytesWritten * 100 / knownTotal) : 0;
                 std::string ws = formatBytes(totalBytesWritten);
                 std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
-                fprintf(stderr, "\rTesting:       %3zu%%  [ %s / %s ]%s",
-                        pct, ws.c_str(), ts.c_str(), "          ");
+                fprintf(stderr, "\r%sTesting:%s       %s%3zu%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_BCYAN, CC_RESET,
+                        CC_BYELLOW, pct, CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_BWHITE, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET,
+                        CC_DIM, CC_RESET);
             } else if (nextBlockToWrite == 0) {
-                // No blocks written yet  still reading compressed data / warming up GPU
                 size_t rb = readBytesRead.load(std::memory_order_relaxed);
                 std::string rs = formatBytes(rb);
                 std::string cs = compressedFileSize > 0
                     ? formatBytes(compressedFileSize) : "?";
-                fprintf(stderr, "\rReading:              [ %s / %s ]%s",
-                        rs.c_str(), cs.c_str(), "          ");
+                fprintf(stderr, "\r%sReading:%s              %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_DIM, CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_WHITE, rs.c_str(), CC_RESET,
+                        CC_WHITE, cs.c_str(), CC_RESET,
+                        CC_DIM, CC_RESET);
             } else {
                 bool workersActive = !readDone.load()
                     || blocksDone.load() < totalBlocks.load();
@@ -4337,12 +4634,29 @@ public:
                     ? std::min(size_t(99), totalBytesWritten * 100 / knownTotal) : 0;
                 std::string ws = formatBytes(totalBytesWritten);
                 std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
-                if (workersActive)
-                    fprintf(stderr, "\rDecompressing: %3zu%%  [ %s / %s ]%s",
-                            pct, ws.c_str(), ts.c_str(), "          ");
-                else
-                    fprintf(stderr, "\rWriting:       %3zu%%  [ %s / %s ]%s",
-                            pct, ws.c_str(), ts.c_str(), "          ");
+                if (workersActive) {
+                    std::string gpuStr = formatBytes(gpuBlocks.load() * chunkSize);
+                    std::string cpuStr = formatBytes(cpuFallbackBlocks.load() * chunkSize);
+                    fprintf(stderr,
+                        "\r%sDecompressing:%s %s%3zu%%%s  %s[%s %s%s%s / %s%s%s ]%s"
+                        "  %sGPU:%s %s%s%s  %sCPU:%s %s%s%s%s",
+                        CC_BCYAN, CC_RESET,
+                        CC_BYELLOW, pct, CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_BGREEN, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_CYAN, CC_RESET, CC_GREEN, gpuStr.c_str(), CC_RESET,
+                        CC_CYAN, CC_RESET, CC_BLUE,  cpuStr.c_str(), CC_RESET);
+                } else {
+                    fprintf(stderr, "\r%sWriting:%s       %s%3zu%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                            CC_BGREEN, CC_RESET,
+                            CC_BYELLOW, pct, CC_RESET,
+                            CC_DIM, CC_RESET,
+                            CC_BGREEN, ws.c_str(), CC_RESET,
+                            CC_WHITE, ts.c_str(), CC_RESET,
+                            CC_DIM, CC_RESET);
+                }
             }
             fflush(stderr);
         };
@@ -4437,16 +4751,20 @@ public:
         // Final 100% line  overwritten by the completion message on the next line
         if (g_verbosity == NORMAL && estimatedBlocks > 10) {
             std::string ws = formatBytes(totalBytesWritten);
-            std::string ts = formatBytes(totalBytesWritten);  // actual output size
+            std::string ts = formatBytes(totalBytesWritten);
             if (testMode)
-                fprintf(stderr, "\rTesting:       100%%  [ %s / %s ]%s",
-                        ws.c_str(), ts.c_str(), "          ");
+                fprintf(stderr, "\r%sTesting:%s       %s100%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_BCYAN, CC_RESET, CC_BYELLOW, CC_RESET,
+                        CC_DIM, CC_RESET, CC_BGREEN, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET, CC_DIM, CC_RESET);
             else
-                fprintf(stderr, "\rWriting:       100%%  [ %s / %s ]%s",
-                        ws.c_str(), ts.c_str(), "          ");
+                fprintf(stderr, "\r%sWriting:%s       %s100%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_BGREEN, CC_RESET, CC_BYELLOW, CC_RESET,
+                        CC_DIM, CC_RESET, CC_BGREEN, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET, CC_DIM, CC_RESET);
             fflush(stderr);
         }
-        
+
         // ── Verify content checksum ───────────────────────────────────────────
         // LZ4 frame layout: ... [block data] [end-mark = 0x00000000] [checksum 4B]
         // The read loop breaks immediately after consuming the 0x00000000 end-mark,
@@ -4458,7 +4776,8 @@ public:
             // LZ4 stores checksum little-endian  already correct on x86
             checksumOk = (computedChecksum == storedChecksum);
             if (!checksumOk) {
-                fprintf(stderr, "Warning: Checksum mismatch  file may be corrupted!\n");
+                fprintf(stderr, "%sWarning: Checksum mismatch  file may be corrupted!%s\n",
+                        CC_BRED, CC_RESET);
                 fprintf(stderr, "  Stored:   0x%08X\n", storedChecksum);
                 fprintf(stderr, "  Computed: 0x%08X\n", computedChecksum);
             }
@@ -4474,13 +4793,18 @@ public:
             size_t compressedSize = (stat(inputFile.c_str(), &st) == 0) ? st.st_size : 0;
             double ratio = compressedSize > 0 ? (100.0 * compressedSize / totalBytesWritten) : 0.0;
             std::string outputSize = formatBytes(totalBytesWritten);
-            
+
             VLOG(NORMAL, "\rTest complete (GPU+fallback, %zu GPU%s): %s in %.2f s%s\n",
                     gpus.size(), gpus.size() == 1 ? "" : "s",
                     outputSize.c_str(), duration.count() / 1000.0,
                     "          ");
-            VLOG(NORMAL, checksumOk ? "Test OK: %s\n" : "Test FAILED: %s (checksum mismatch)\n",
-                    inputFile.c_str());
+            if (checksumOk)
+                VLOG(NORMAL, "%sTest OK:%s %s  %sratio:%s %s%.1f%%%s\n",
+                        CC_BGREEN, CC_RESET, inputFile.c_str(),
+                        CC_CYAN, CC_RESET, CC_BYELLOW, ratio, CC_RESET);
+            else
+                VLOG(NORMAL, "%sTest FAILED:%s %s (checksum mismatch)\n",
+                        CC_BRED, CC_RESET, inputFile.c_str());
             VLOG(VERBOSE, "  Compressed:   %.2f MB\n", compressedSize / (1024.0*1024.0));
             VLOG(VERBOSE, "  Uncompressed: %.2f MB  (ratio %.2f%%)\n",
                  totalBytesWritten / (1024.0*1024.0), ratio);
@@ -4492,8 +4816,9 @@ public:
         } else {
             double mbps = (totalBytesWritten / (1024.0*1024.0)) / (duration.count() / 1000.0);
             std::string outputSize = formatBytes(totalBytesWritten);
-            VLOG(NORMAL, "\rDecompression complete (GPU+fallback, %zu GPU%s): "
+            VLOG(NORMAL, "\r%sDecompression complete%s (GPU+fallback, %zu GPU%s): "
                     "%s in %.2f s%s\n",
+                    CC_BGREEN, CC_RESET,
                     gpus.size(), gpus.size() == 1 ? "" : "s",
                     outputSize.c_str(), duration.count() / 1000.0,
                     "          ");
@@ -5153,15 +5478,24 @@ public:
                     ? std::min(size_t(99), totalBytesWritten * 100 / knownTotal) : 0;
                 std::string ws = formatBytes(totalBytesWritten);
                 std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
-                fprintf(stderr, "\rTesting:       %3zu%%  [ %s / %s ]%s",
-                        pct, ws.c_str(), ts.c_str(), "          ");
+                fprintf(stderr, "\r%sTesting:%s       %s%3zu%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_BCYAN, CC_RESET,
+                        CC_BYELLOW, pct, CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_BWHITE, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET,
+                        CC_DIM, CC_RESET);
             } else if (nextBlockToWrite == 0) {
                 size_t rb = readBytesRead.load(std::memory_order_relaxed);
                 std::string rs = formatBytes(rb);
                 std::string cs = compressedFileSize > 0
                     ? formatBytes(compressedFileSize) : "?";
-                fprintf(stderr, "\rReading:              [ %s / %s ]%s",
-                        rs.c_str(), cs.c_str(), "          ");
+                fprintf(stderr, "\r%sReading:%s              %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_DIM, CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_WHITE, rs.c_str(), CC_RESET,
+                        CC_WHITE, cs.c_str(), CC_RESET,
+                        CC_DIM, CC_RESET);
             } else {
                 bool workersActive = !dispatcherDone.load()
                     || blocksDone.load() < totalBlocks.load();
@@ -5169,12 +5503,29 @@ public:
                     ? std::min(size_t(99), totalBytesWritten * 100 / knownTotal) : 0;
                 std::string ws = formatBytes(totalBytesWritten);
                 std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
-                if (workersActive)
-                    fprintf(stderr, "\rDecompressing: %3zu%%  [ %s / %s ]%s",
-                            pct, ws.c_str(), ts.c_str(), "          ");
-                else
-                    fprintf(stderr, "\rWriting:       %3zu%%  [ %s / %s ]%s",
-                            pct, ws.c_str(), ts.c_str(), "          ");
+                if (workersActive) {
+                    std::string gpuStr = formatBytes(gpuBlocks.load() * chunkSize);
+                    std::string cpuStr = formatBytes(cpuBlocks.load() * chunkSize);
+                    fprintf(stderr,
+                        "\r%sDecompressing:%s %s%3zu%%%s  %s[%s %s%s%s / %s%s%s ]%s"
+                        "  %sGPU:%s %s%s%s  %sCPU:%s %s%s%s%s",
+                        CC_BCYAN, CC_RESET,
+                        CC_BYELLOW, pct, CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_BGREEN, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_CYAN, CC_RESET, CC_GREEN, gpuStr.c_str(), CC_RESET,
+                        CC_CYAN, CC_RESET, CC_BLUE,  cpuStr.c_str(), CC_RESET);
+                } else {
+                    fprintf(stderr, "\r%sWriting:%s       %s%3zu%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                            CC_BGREEN, CC_RESET,
+                            CC_BYELLOW, pct, CC_RESET,
+                            CC_DIM, CC_RESET,
+                            CC_BGREEN, ws.c_str(), CC_RESET,
+                            CC_WHITE, ts.c_str(), CC_RESET,
+                            CC_DIM, CC_RESET);
+                }
             }
             fflush(stderr);
         };
@@ -5266,11 +5617,15 @@ public:
             std::string ws = formatBytes(totalBytesWritten);
             std::string ts = formatBytes(totalBytesWritten);
             if (testMode)
-                fprintf(stderr, "\rTesting:       100%%  [ %s / %s ]%s",
-                        ws.c_str(), ts.c_str(), "          ");
+                fprintf(stderr, "\r%sTesting:%s       %s100%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_BCYAN, CC_RESET, CC_BYELLOW, CC_RESET,
+                        CC_DIM, CC_RESET, CC_BGREEN, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET, CC_DIM, CC_RESET);
             else
-                fprintf(stderr, "\rWriting:       100%%  [ %s / %s ]%s",
-                        ws.c_str(), ts.c_str(), "          ");
+                fprintf(stderr, "\r%sWriting:%s       %s100%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_BGREEN, CC_RESET, CC_BYELLOW, CC_RESET,
+                        CC_DIM, CC_RESET, CC_BGREEN, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET, CC_DIM, CC_RESET);
             fflush(stderr);
         }
 
@@ -5282,8 +5637,8 @@ public:
             csOk = (computedCS == storedCS);
             if (!csOk)
                 fprintf(stderr,
-                        "Warning: checksum mismatch  stored 0x%08X computed 0x%08X\n",
-                        storedCS, computedCS);
+                        "%sWarning: checksum mismatch  stored 0x%08X computed 0x%08X%s\n",
+                        CC_BRED, storedCS, computedCS, CC_RESET);
         } else {
             fprintf(stderr, "Warning: could not read stored checksum\n");
         }
@@ -5297,16 +5652,24 @@ public:
             - gpuBlocks.load() - cpuBlocks.load();
 
         if (testMode) {
+            double ratio = compressedFileSize > 0
+                ? (100.0 * compressedFileSize / totalBytesWritten) : 0.0;
             VLOG(NORMAL, "\rTest complete (hybrid, %zu GPU%s + %zu thread%s): "
                     "%s in %.2f s%s\n",
                     gpus.size(),       gpus.size()       == 1 ? "" : "s",
                     effectiveThreads,  effectiveThreads  == 1 ? "" : "s",
                     outputSize.c_str(), duration.count() / 1000.0, "          ");
-            VLOG(NORMAL, csOk ? "Test OK: %s\n" : "Test FAILED: %s (checksum mismatch)\n",
-                    inputFile.c_str());
+            if (csOk)
+                VLOG(NORMAL, "%sTest OK:%s %s  %sratio:%s %s%.1f%%%s\n",
+                        CC_BGREEN, CC_RESET, inputFile.c_str(),
+                        CC_CYAN, CC_RESET, CC_BYELLOW, ratio, CC_RESET);
+            else
+                VLOG(NORMAL, "%sTest FAILED:%s %s (checksum mismatch)\n",
+                        CC_BRED, CC_RESET, inputFile.c_str());
         } else {
-            VLOG(NORMAL, "\rDecompression complete (hybrid, %zu GPU%s + %zu thread%s): "
+            VLOG(NORMAL, "\r%sDecompression complete%s (hybrid, %zu GPU%s + %zu thread%s): "
                     "%s in %.2f s%s\n",
+                    CC_BGREEN, CC_RESET,
                     gpus.size(),       gpus.size()       == 1 ? "" : "s",
                     effectiveThreads,  effectiveThreads  == 1 ? "" : "s",
                     outputSize.c_str(), duration.count() / 1000.0, "          ");
@@ -5594,29 +5957,51 @@ public:
                     ? std::min(size_t(99), tbw * 100 / knownTotal) : 0;
                 std::string ws = formatBytes(tbw);
                 std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
-                fprintf(stderr, "\rTesting:       %3zu%%  [ %s / %s ]%s",
-                        pct, ws.c_str(), ts.c_str(), "          ");
+                fprintf(stderr, "\r%sTesting:%s       %s%3zu%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_BCYAN, CC_RESET,
+                        CC_BYELLOW, pct, CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_BWHITE, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET,
+                        CC_DIM, CC_RESET);
             } else if (nextBlockToWrite == 0) {
                 size_t rb = readBytesRead.load(std::memory_order_relaxed);
                 std::string rs = formatBytes(rb);
                 std::string cs = compressedFileSize > 0
                     ? formatBytes(compressedFileSize) : "?";
-                fprintf(stderr, "\rReading:              [ %s / %s ]%s",
-                        rs.c_str(), cs.c_str(), "          ");
+                fprintf(stderr, "\r%sReading:%s              %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_DIM, CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_WHITE, rs.c_str(), CC_RESET,
+                        CC_WHITE, cs.c_str(), CC_RESET,
+                        CC_DIM, CC_RESET);
             } else {
-                // "Writing" once reader is done (all decompression work submitted);
-                // "Decompressing" while reader still feeding work to workers.
                 bool readerStillRunning = !readerDone.load();
                 size_t pct = knownTotal > 0
                     ? std::min(size_t(99), tbw * 100 / knownTotal) : 0;
                 std::string ws = formatBytes(tbw);
                 std::string ts = knownTotal > 0 ? formatBytes(knownTotal) : "?";
-                if (readerStillRunning)
-                    fprintf(stderr, "\rDecompressing: %3zu%%  [ %s / %s ]%s",
-                            pct, ws.c_str(), ts.c_str(), "          ");
+                if (readerStillRunning) {
+                    std::string cpuStr = formatBytes(blocksSubmitted.load() * chunkSize);
+                    fprintf(stderr,
+                        "\r%sDecompressing:%s %s%3zu%%%s  %s[%s %s%s%s / %s%s%s ]%s"
+                        "  %sCPU:%s %s%s%s%s",
+                        CC_BCYAN, CC_RESET,
+                        CC_BYELLOW, pct, CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_BGREEN, ws.c_str(), CC_RESET,
+                        CC_WHITE, ts.c_str(), CC_RESET,
+                        CC_DIM, CC_RESET,
+                        CC_CYAN, CC_RESET, CC_BLUE, cpuStr.c_str(), CC_RESET);
+                }
                 else
-                    fprintf(stderr, "\rWriting:       %3zu%%  [ %s / %s ]%s",
-                            pct, ws.c_str(), ts.c_str(), "          ");
+                    fprintf(stderr, "\r%sWriting:%s       %s%3zu%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                            CC_BGREEN, CC_RESET,
+                            CC_BYELLOW, pct, CC_RESET,
+                            CC_DIM, CC_RESET,
+                            CC_BGREEN, ws.c_str(), CC_RESET,
+                            CC_WHITE, ts.c_str(), CC_RESET,
+                            CC_DIM, CC_RESET);
             }
             fflush(stderr);
         };
@@ -5703,19 +6088,27 @@ public:
             // Final 100% line then overwrite with completion message
             if (g_verbosity == NORMAL && estimatedBlocks > 10) {
                 std::string ws = formatBytes(totalBytesWritten.load());
-                fprintf(stderr, "\rWriting:       100%%  [ %s / %s ]%s",
-                        ws.c_str(), ws.c_str(), "          ");
+                fprintf(stderr, "\r%sWriting:%s       %s100%%%s  %s[%s %s%s%s / %s%s%s ]%s%s          ",
+                        CC_BGREEN, CC_RESET, CC_BYELLOW, CC_RESET,
+                        CC_DIM, CC_RESET, CC_BGREEN, ws.c_str(), CC_RESET,
+                        CC_WHITE, ws.c_str(), CC_RESET, CC_DIM, CC_RESET);
                 fflush(stderr);
             }
 
             // Overwrite progress line with completion message
-            fprintf(stderr, "\r%s (CPU, %zu thread%s): %s in %.2f s%s\n",
+            fprintf(stderr, "\r%s%s%s (CPU, %zu thread%s): %s in %.2f s%s\n",
+                    CC_BGREEN,
                     testMode ? "Test complete" : "Decompression complete",
+                    CC_RESET,
                     numWorkers, numWorkers==1?"":"s", outputSize.c_str(), elapsed,
-                    "          ");  // Clear any progress debris
-            
+                    "          ");
+
             if (testMode) {
-                VLOG(NORMAL, "Test OK: %s\n", inputFile.c_str());
+                double ratio = compressedFileSize > 0
+                    ? (100.0 * compressedFileSize / totalBytesWritten.load()) : 0.0;
+                VLOG(NORMAL, "%sTest OK:%s %s  %sratio:%s %s%.1f%%%s\n",
+                        CC_BGREEN, CC_RESET, inputFile.c_str(),
+                        CC_CYAN, CC_RESET, CC_BYELLOW, ratio, CC_RESET);
             }
 
             double mbps = totalBytesWritten.load() > 0 && elapsed > 0
@@ -5846,6 +6239,7 @@ public:
             {"no-early-read", no_argument, nullptr, 1006},
             {"force-compress", no_argument, nullptr, 'z'},
             {"hc-level", required_argument, nullptr, 1007},
+            {"progress", no_argument, nullptr, 1008},
             {nullptr, 0, nullptr, 0}
         };
         
@@ -5962,6 +6356,10 @@ public:
                         hcLevel = (int)hlv;
                     }
                     break;
+                case 1008:  // --progress: force progress display even on pipe
+                    forceProgress = true;
+                    if (g_verbosity < NORMAL) g_verbosity = NORMAL;
+                    break;
                 case 2000:  // --help: show full help
                     printHelp();
                     return false;
@@ -6069,6 +6467,7 @@ Common options:
   -f            force overwrite
   -h            show this help (use --help for full details)
   -k            keep original files
+      --progress show progress when piped (pipe mode defaults to quiet)
   -q            quiet mode
   -t            test integrity
   -v            verbose (-vv, -vvv for more)
@@ -6098,7 +6497,7 @@ For complete documentation, use --help
      */
     void printHelp() {
         std::cout << "gzl4 " << VERSION << 
-            R"( - Multi-Backend (GPU, CPU, and Hybrid) LZ4 Compression Tool
+            R"HELP( - Multi-Backend (GPU, CPU, and Hybrid) LZ4 Compression Tool
 
 Usage: gzl4 [OPTION]... [FILE]
 
@@ -6109,6 +6508,8 @@ Options:
   -h                   display short help (-h)
       --help           display this complete help and exit
   -k, --keep           keep (don't delete) input files
+      --progress       show progress even when reading from a pipe/stdin
+                       (pipe mode defaults to quiet; this restores level 1)
   -q, --quiet          quiet mode: only errors are output (verbosity level 0)
   -t, --test           test compressed file integrity
   -z, --force-compress force compression mode (ignore .lz4 auto-detection)
@@ -6212,6 +6613,156 @@ Architecture:
   Standard LZ4 frame format; fully compatible with lz4 command-line tool
 
 Changelog:
+  v3.24.23 UX: added --progress flag to force verbosity level 1 (NORMAL)
+           even when reading from a pipe/stdin, overriding the v3.24.22
+           pipe-mode quiet default. Useful for monitoring long-running pipes
+           interactively: "tar -cf - bigdir | gzl4 --progress > out.lz4".
+           Implementation: forceProgress member + case 1008 in parseArguments;
+           the pipe-mode QUIET override is skipped when forceProgress is set.
+           Explicit -v/-vv flags already bypassed the override (they set
+           g_verbosity above NORMAL before the check runs).
+  v3.24.22 UX: default to quiet mode (-q) when input is a pipe/stdin.
+           Progress bars on stderr interfere with scripted pipelines and are
+           less useful when total size is unknown. User can still override
+           with -v, -vv, etc. Applied after parseArguments so explicit -v
+           flags take precedence over the pipe-mode default.
+  v3.24.21 Bugfix/Perf: stdin pipe compression stuttered at the end and showed
+           "Writing: 100% [0 B / 0 B]" because the AsyncWriter was never told
+           the final chunk count, so it could not self-exit and instead waited
+           for stop()  meaning all output flushing happened in one burst after
+           compression finished rather than streaming during compression.
+           Two fixes:
+           (1) After all workers/dispatcher join, call setTotalChunks(actual)
+               so the writer self-exits cleanly as soon as the last chunk is
+               written (same path as file mode). Applied to all three backends.
+           (2) Writing progress display now uses getBytesWritten() instead of
+               getNextChunkToWrite() * chunkSize for stdin, giving accurate
+               byte counts even for partial last chunks.
+           Also: AsyncWriter now uses a 4 MB flush size for pipe/non-seekable
+           outputs (down from 256 MB), reducing end-of-stream stall and
+           improving downstream parallelism. lseek/posix_fadvise skipped for
+           pipes (both were no-ops returning ESPIPE anyway). Regular file
+           output is unchanged (still uses 256 MB staging buffer).
+  v3.24.20 Perf: stdin pipe compression was ~3x slower than direct file
+           compression (14s vs 5s on a 6.5 GB file). Two fixes:
+           (1) Early reader for stdin: the earlyReader that normally buffers
+               file data during GPU init (~1-4s CUDA setup) was skipped for
+               stdin because stat("-") returns no size. Now starts earlyReader
+               unconditionally for stdin with a 256-chunk queue cap, so data
+               flows into the pipeline during GPU init instead of waiting.
+               Added earlyReaderStarted flag (replaces getFileSize()>0 checks)
+               so compressor paths correctly adopt the pre-warmed reader
+               regardless of whether fileSize is known.
+           (2) Pipe buffer size: Linux default pipe buffer is 64 KB, causing
+               ~64 read() syscalls per 4 MB chunk. Added F_SETPIPE_SZ(1MB) on
+               STDIN_FILENO at reader open time; kernel caps at
+               /proc/sys/fs/pipe-max-size if needed (silently, no error).
+               Larger buffer reduces context switches between tar and gzl4.
+           Remaining gap vs file mode is inherent: no posix_fadvise prefetch
+           available on pipes, and the upstream process (tar) becomes the
+           bottleneck rather than disk bandwidth.
+  v3.24.19 Bugfix: stdin compression still produced 0-byte output after
+           v3.24.17-18. Root cause: AsyncReader::readerLoop() loop condition
+           was [while (totalRead < fileSize)] -- with fileSize==0 for stdin
+           this is immediately false (0 < 0), so the thread exited without
+           reading a single byte. All the compressor-level fixes were correct
+           but irrelevant since the reader never produced chunks.
+           Fix: added pipeMode = (fileSize == 0) flag in readerLoop. In pipe
+           mode the outer loop runs unconditionally; toRead = chunkSize each
+           iteration; ::read() is called via a new readFull() helper that
+           loops on short reads (handles kernel pipe buffer fragmentation);
+           n==0 return from readFull signals EOF and breaks the loop cleanly;
+           partial last chunks are handled by trimming heapData to actual
+           bytes read. Pooled path (pinned memory) similarly handles pipe EOF
+           by calling poolHandle.release() to return the slot before breaking.
+  v3.24.18 Bugfix: stdout compression ("gzl4 > out.lz4" or piped output)
+           produced a 23-byte file (header only, no compressed data) from the
+           GPU-only and hybrid backends. Root cause: asyncWriter.start() was
+           called with getActualOutputPath() unconditionally in both paths 
+           the async writer opened a regular file even when stdoutMode was set,
+           discarding all compressed blocks. The CPU-only path already used
+           stdoutMode ? "-" : getActualOutputPath() correctly. Fixed by
+           applying the same ternary to the asyncWriter.start() calls in
+           compressFileGPU (line ~2854) and compressFileHybrid (line ~3428).
+           The frame header write and end-mark/checksum write in both paths
+           were already correctly gated on stdoutMode  only the async writer
+           was wrong.
+  v3.24.17 Bugfix: stdin compression ("tar ... | gzl4 > out.lz4") failed with
+           "Error: Cannot stat input file: -" in all three compressors.
+           Root cause: each compressor called stat(inputFile) unconditionally
+           at startup to obtain fileSize for numChunks pre-calculation and
+           progress display denominators. stat("-") always fails.
+           Fix: detect stdinMode = (inputFile == "-") before stat(); skip it
+           and set fileSize=0 / numChunks=SIZE_MAX sentinel. All downstream
+           uses of numChunks and fileSize guarded:
+             - maxReadQueue / poolSlots clamps: bypass min(numChunks,...) for stdin
+             - asyncWriter.setTotalChunks: skipped for stdin (writer drains on
+               reader EOF instead of chunk count)
+             - Progress loops:
+                 CPU-only: outer while() now checks asyncReader.isFinished()
+                   in addition to nextChunkToWrite < chunksSubmitted
+                 GPU-only: activeWorkers already works correctly (workers exit
+                   when reader returns false), no loop change needed
+                 Hybrid: main loop changed from chunksSubmitted < numChunks
+                   to dispatcherDone.load() for stdin
+             - Compressing/Writing display: pct omitted for stdin (shows raw
+               byte count instead of percentage since total is unknown)
+             - Completion line: omits ratio for stdin, shows
+               "stdin -> X.X GB in N.N s" instead
+             - VERBOSE chunk-percentage stats: divide by totalDone (actual
+               chunks processed) instead of numChunks (which was SIZE_MAX)
+  v3.24.16 UX: full color treatment for all three compression paths, and
+           GPU-first ordering for hybrid mode everywhere it appears.
+           Color changes (matching decompression style throughout):
+             "Compressing (...):"   header line → CC_BCYAN label
+             "Compressing: ##%  CPU/GPU/GPU+CPU: X"
+               → CC_BCYAN label, CC_BYELLOW pct, CC_CYAN key, CC_GREEN GPU
+                 bytes, CC_BLUE CPU bytes (same palette as decompression)
+             "Writing: ##%  [X / Y]" → CC_BGREEN label, CC_BYELLOW pct,
+               CC_BGREEN written, CC_WHITE total  matching decompressor
+               Writing phase exactly (bracket format unified too)
+             "Writing: 100%  [X / Y]" → same palette
+             "Compression complete (...):" → CC_BGREEN label, CC_WHITE
+               in/out sizes, CC_BYELLOW ratio  matching decompressor
+               completion line style
+           GPU-first reorder:
+             Hybrid header was the only place listing CPU threads before
+             GPU count. Changed "Compressing (Hybrid, N thread + M GPU"
+             to "Compressing (Hybrid, M GPU + N thread" in both the
+             header and "Compression complete" lines. All decompressor
+             hybrid lines already said "GPU + thread" -- now consistent
+             everywhere.
+  v3.24.15 Bugfix: 5 remaining -Wformat-extra-args in the 100% completion
+           fprintf calls (Testing/Writing lines in decompressFileGPU,
+           decompressFileHybrid, decompressFileCPU).  v3.24.14 correctly
+           embedded the spaces as literal text in the format string but forgot
+           to remove the now-redundant `"          "` trailing argument; those
+           calls had `CC_DIM, CC_RESET, "          ")`  two specifiers (%s%s)
+           but three args.  Fix: drop the `"          "` arg, leaving just
+           `CC_DIM, CC_RESET)`.
+  v3.24.14 Bugfix: 17 -Wformat-extra-args warnings in decompressor progress
+           display.  All progress fprintf calls passed "          " (10 spaces,
+           for terminal line-clearing) as an extra argument with no matching
+           format specifier.  Root cause: CC_* color macros each consume one
+           %s, so the format spec count was exactly one short of the arg count
+           everywhere the trailing spaces were passed as a separate arg rather
+           than embedded in the format string.  Fix: embed "          " as
+           literal text in every affected format string and remove it from the
+           argument list.  All 17 warned call sites fixed across decompressFileGPU
+           (showProgress lambda + 100% completion lines), decompressFileHybrid
+           (same), and decompressFileCPU (same).  Compression-path fprintf calls
+           that had a proper %s for the spaces were already correct and unchanged.
+  v3.24.13 UX: three final polish items requested after v3.24.12 review:
+           (1) CPU-only decompressor Decompressing phase now shows
+               "CPU: X.X GB" matching the GPU+CPU display already present
+               in --gpu-only and --hybrid. Uses blocksSubmitted*chunkSize
+               as the proxy for bytes processed by worker threads (same
+               convention as gpu-only/hybrid use gpuBlocks*chunkSize).
+           (2) "Test OK:" line already had ratio: ##% in all three backends
+               from earlier work  confirmed present and correct.
+           (3) ANSI color support already fully implemented (detectColor()
+               called in main(), CC_* macros gate on g_color throughout)
+                confirmed working, no additional changes needed.
   v3.24.12 UX: three-phase progress display for all three decompressors
            (--gpu-only, --hybrid, --cpu-only).  Previous display was a single
            label that never changed, used raw block count for pct (wrong for
@@ -6633,7 +7184,7 @@ Pipe examples:
   gzl4 -c file.tar | ssh host "cat > out.lz4"  compress to remote
   gzl4 -dc file.tar.lz4 | tar -x          decompress to stdout, pipe to tar
   gzl4 -c - < file.tar > file.tar.lz4     explicit stdin with "-"
-)" << std::endl;
+)HELP" << std::endl;
     }
 
     /*
@@ -6676,6 +7227,13 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4
             return false;
         }
 
+        // When reading from a pipe, default to quiet mode: progress bars and
+        // status lines written to stderr interfere with scripted pipelines.
+        // The user can still override with -v/-vv etc. after the input file arg.
+        if (inputFile == "-" && g_verbosity == NORMAL && !forceProgress) {
+            g_verbosity = QUIET;
+        }
+
         // Chunk size is derived from the compression level  only meaningful when
         // compressing.  During decompression the real chunk size is read from the
         // LZ4 frame header; we still call this to set a sane default for the early
@@ -6686,19 +7244,28 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4
         // GPU context creation takes 1-4 s per machine. Start reading during
         // that window so the disk is never idle while we wait for CUDA.
         if (!decompress && backendMode != BackendMode::CPU_ONLY && !disableEarlyRead) {
-            // Stat the file to know how large a queue to pre-fill
-            struct stat st;
-            if (stat(inputFile.c_str(), &st) == 0 && st.st_size > 0) {
-                size_t fSize     = (size_t)st.st_size;
-                size_t nChunks   = (fSize + chunkSize - 1) / chunkSize;
-                // Queue the entire file  no artificial cap. If malloc fails,
-                // we get a clean error. On modern servers (64GB+ RAM), capping
-                // an 8GB file at 2009 chunks just creates 5s of idle waiting.
-                // The reader will malloc chunks until OOM or EOF, whichever comes first.
-                VLOG(VERBOSE, "Early reader: starting %.2f GB file read-ahead "
-                     "(%zu chunks, unlimited queue) while GPUs initialise\n",
-                     fSize / (1024.0*1024.0*1024.0), nChunks);
-                earlyReader.start(inputFile, chunkSize, SIZE_MAX);
+            if (inputFile == "-") {
+                // Stdin pipe: size is unknown but we can still pre-buffer chunks
+                // while GPUs initialise. Cap queue at 256 chunks to bound RAM.
+                VLOG(VERBOSE, "Early reader: buffering stdin while GPUs initialise\n");
+                earlyReader.start(inputFile, chunkSize, 256);
+                earlyReaderStarted = true;
+            } else {
+                // Stat the file to know how large a queue to pre-fill
+                struct stat st;
+                if (stat(inputFile.c_str(), &st) == 0 && st.st_size > 0) {
+                    size_t fSize     = (size_t)st.st_size;
+                    size_t nChunks   = (fSize + chunkSize - 1) / chunkSize;
+                    // Queue the entire file  no artificial cap. If malloc fails,
+                    // we get a clean error. On modern servers (64GB+ RAM), capping
+                    // an 8GB file at 2009 chunks just creates 5s of idle waiting.
+                    // The reader will malloc chunks until OOM or EOF, whichever comes first.
+                    VLOG(VERBOSE, "Early reader: starting %.2f GB file read-ahead "
+                         "(%zu chunks, unlimited queue) while GPUs initialise\n",
+                         fSize / (1024.0*1024.0*1024.0), nChunks);
+                    earlyReader.start(inputFile, chunkSize, SIZE_MAX);
+                    earlyReaderStarted = true;
+                }
             }
         }
 
@@ -6755,6 +7322,7 @@ GZL4Compressor* GZL4Compressor::g_instance = nullptr;
  * Main entry point
  */
 int main(int argc, char* argv[]) {
+    detectColor();
     try {
         GZL4Compressor compressor;
         
