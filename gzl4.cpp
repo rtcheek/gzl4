@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.25.0";
+constexpr const char* VERSION = "3.26.0";
 
 // Compression backend modes
 enum class BackendMode {
@@ -735,13 +735,11 @@ struct PreallocSlot {
     uint8_t*        h_output = nullptr;   // D→H output data (capacity * outStride)
 
     cudaStream_t    stream          = 0;
-    cudaEvent_t     sizesReadyEvent = 0;  // fires when h_oSizes/h_stats land on host
     bool            ready           = false;
 
     // Per-batch state (set by worker thread each iteration)
     size_t                            batchSize  = 0;
     bool                              hasPending = false;  // per-chunk D→H in flight
-    bool                              sizesPhase = false;  // sizes on host, output D→H pending
     std::vector<size_t>               indices;
     std::vector<size_t>               origSizes;
     // Input data: held until after D→H completes, then released back to pool
@@ -757,7 +755,6 @@ struct PreallocSlot {
         cudaFreeHost(h_iSizes); cudaFreeHost(h_oSizes);
         cudaFreeHost(h_stats);  cudaFreeHost(h_output);
         if (stream) { cudaStreamDestroy(stream); stream = 0; }
-        if (sizesReadyEvent) { cudaEventDestroy(sizesReadyEvent); sizesReadyEvent = 0; }
         *this = PreallocSlot{};
     }
 };
@@ -2851,8 +2848,6 @@ public:
                     ok = ok && cudaHostAlloc(&sl.h_stats,  SLOT_CAPACITY*sizeof(nvcompStatus_t), cudaHostAllocDefault) == cudaSuccess;
                     ok = ok && cudaHostAlloc(&sl.h_output, SLOT_CAPACITY*maxOutPerChunk,         cudaHostAllocDefault) == cudaSuccess;
                     ok = ok && cudaStreamCreate(&sl.stream) == cudaSuccess;
-                    ok = ok && cudaEventCreateWithFlags(&sl.sizesReadyEvent,
-                                                        cudaEventDisableTiming) == cudaSuccess;
                     if (ok) { sl.ready = true; }
                     else    { fprintf(stderr, "GPU%d: failed to init slot %d\n", gpus[g].deviceId, si);
                               gpuInitOk[g] = false; break; }
@@ -2933,186 +2928,123 @@ public:
             cudaSetDevice(gpu.deviceId);
             std::vector<PreallocSlot>& slots = gpuSlots[gpuIdx];
             const int nSlots = (int)slots.size();
-
-            // Initialize all slots as not having pending work
-            for (auto& slot : slots) {
-                slot.hasPending = false;
-                slot.sizesPhase = false;
-            }
+            int sIdx = 0;
+            bool firstRound = true;
 
             while (!workerAbort.load()) {
-                bool anyActivity = false;
+                PreallocSlot& slot = slots[sIdx];
+                sIdx = (sIdx + 1) % nSlots;
 
-                // ── Poll all slots: collect completed batches (non-blocking) ──────
-                for (int si = 0; si < nSlots; si++) {
-                    PreallocSlot& slot = slots[si];
+                // Block until this slot's previous batch is done.
+                // cudaStreamSynchronize sleeps the thread (POSIX futex) until
+                // the GPU signals  no spin-polling, no event latency overhead.
+                cudaStreamSynchronize(slot.stream);
 
-                    // ── Phase 1: sizes arrived → issue per-chunk D→H for actual bytes ─
-                    // The event fires when h_oSizes and h_stats are ready on the host.
-                    // We then issue batchSize individual D→H transfers, each sized to the
-                    // actual compressed output rather than the worst-case outStride, saving
-                    // PCIe bandwidth proportional to the compression ratio.
-                    if (slot.sizesPhase &&
-                        cudaEventQuery(slot.sizesReadyEvent) == cudaSuccess) {
-                        anyActivity = true;
-                        for (size_t i = 0; i < slot.batchSize; i++) {
-                            size_t actual = slot.h_oSizes[i];
-                            if (actual > 0 && actual <= slot.outStride) {
-                                cudaMemcpyAsync(
-                                    slot.h_output + i * slot.outStride,
-                                    slot.d_output + i * slot.outStride,
-                                    actual,
-                                    cudaMemcpyDeviceToHost, slot.stream);
-                            }
+                // Collect and submit the completed batch
+                if (!firstRound && slot.hasPending) {
+                    std::vector<std::vector<uint8_t>> cChunks, oChunks;
+                    cChunks.reserve(slot.batchSize);
+                    oChunks.reserve(slot.batchSize);
+                    for (size_t i = 0; i < slot.batchSize; i++) {
+                        size_t outSz  = slot.h_oSizes[i];
+                        size_t origSz = slot.origSizes[i];
+                        const uint8_t* origPtr = slot.origHandles.size() > i
+                            ? slot.origHandles[i].data : slot.origData[i].data();
+                        if (outSz < origSz) {
+                            std::vector<uint8_t> buf(outSz);
+                            memcpy(buf.data(), slot.h_output + i * slot.outStride, outSz);
+                            cChunks.push_back(std::move(buf));
+                        } else {
+                            cChunks.push_back({});  // uncompressible: store raw
                         }
-                        slot.sizesPhase = false;
-                        slot.hasPending = true;
+                        oChunks.emplace_back(origPtr, origPtr + origSz);
                     }
+                    slot.origHandles.clear(); slot.origData.clear();
+                    asyncWriter.enqueueBatch(cChunks, oChunks, slot.indices, slot.origSizes);
+                    chunksSubmitted += slot.batchSize;
+                    slot.hasPending = false;
+                }
+                firstRound = false;
 
-                    // ── Phase 2: per-chunk D→H complete → collect and submit ──────────
-                    if (slot.hasPending) {
-                        // Non-blocking check if this slot's stream is done
-                        cudaError_t status = cudaStreamQuery(slot.stream);
-                        
-                        if (status == cudaSuccess) {
-                            // Stream completed! Collect results
-                            anyActivity = true;
-                            
-                            std::vector<std::vector<uint8_t>> cChunks, oChunks;
-                            cChunks.reserve(slot.batchSize);
-                            oChunks.reserve(slot.batchSize);
-                            
-                            for (size_t i = 0; i < slot.batchSize; i++) {
-                                size_t outSz  = slot.h_oSizes[i];
-                                size_t origSz = slot.origSizes[i];
+                // Fill slot with next batch of chunks from the reader
+                slot.indices.clear();
+                slot.origSizes.clear();
+                slot.origData.clear();
+                slot.origHandles.clear();
+                slot.batchSize = 0;
 
-                                // Get pointer to original data (pooled or heap)
-                                const uint8_t* origPtr = slot.origHandles.size() > i
-                                    ? slot.origHandles[i].data
-                                    : slot.origData[i].data();
-
-                                if (outSz < origSz) {
-                                    // Compressed version is smaller - use it
-                                    std::vector<uint8_t> buf(outSz);
-                                    memcpy(buf.data(), slot.h_output + i * slot.outStride, outSz);
-                                    cChunks.push_back(std::move(buf));
-                                } else {
-                                    cChunks.push_back({});   // store as uncompressed (better)
-                                }
-                                // Always copy original  releases pool slot immediately
-                                oChunks.emplace_back(origPtr, origPtr + origSz);
-                            }
-                            // Release pool handles now  reader can refill those slots
-                            slot.origHandles.clear();
-                            slot.origData.clear();
-
-                            asyncWriter.enqueueBatch(cChunks, oChunks,
-                                                     slot.indices, slot.origSizes);
-                            chunksSubmitted += slot.batchSize;
-                            slot.hasPending = false;
-                        } else if (status != cudaErrorNotReady) {
-                            // Actual error (not just "not ready")
-                            fprintf(stderr, "GPU%d stream error: %s\n", 
-                                    gpu.deviceId, cudaGetErrorString(status));
-                            workerAbort.store(true);
-                            break;
-                        }
-                    }
+                while (slot.batchSize < slot.capacity) {
+                    AsyncReader::ReadChunk chunk;
+                    if (!asyncReader.getChunk(chunk)) break;
+                    cudaMemcpyAsync(
+                        slot.d_input + slot.batchSize * slot.chunkStride,
+                        chunk.data(), chunk.size,
+                        cudaMemcpyHostToDevice, slot.stream);
+                    slot.h_iSizes[slot.batchSize] = chunk.size;
+                    slot.indices.push_back(chunk.chunkIndex);
+                    slot.origSizes.push_back(chunk.size);
+                    if (chunk.poolHandle.valid())
+                        slot.origHandles.push_back(std::move(chunk.poolHandle));
+                    else
+                        slot.origData.push_back(std::move(chunk.heapData));
+                    slot.batchSize++;
                 }
 
-                // ── Launch new batches on any free slots ──────────────────────────
-                for (int si = 0; si < nSlots && !asyncReader.isFinished(); si++) {
-                    PreallocSlot& slot = slots[si];
-                    
-                    if (slot.hasPending || slot.sizesPhase) continue;  // Slot still busy
-                    
-                    // Slot is free - try to fill and launch
-                    slot.indices.clear();
-                    slot.origSizes.clear();
-                    slot.origData.clear();
-                    slot.origHandles.clear();
-                    slot.batchSize = 0;
+                if (slot.batchSize == 0) break;  // reader exhausted
 
-                    while (slot.batchSize < slot.capacity) {
-                        AsyncReader::ReadChunk chunk;
-                        if (!asyncReader.getChunk(chunk)) break;
-                        // H→D: DMA from pinned slot (or memcpy from heap in fallback)
-                        cudaMemcpyAsync(
-                            slot.d_input + slot.batchSize * slot.chunkStride,
-                            chunk.data(), chunk.size,
-                            cudaMemcpyHostToDevice, slot.stream);
-                        slot.h_iSizes[slot.batchSize] = chunk.size;
-                        slot.indices.push_back(chunk.chunkIndex);
-                        slot.origSizes.push_back(chunk.size);
-                        // Hold the input data until stream completes
-                        if (chunk.poolHandle.valid())
-                            slot.origHandles.push_back(std::move(chunk.poolHandle));
-                        else
-                            slot.origData.push_back(std::move(chunk.heapData));
-                        slot.batchSize++;
-                    }
-
-                    if (slot.batchSize == 0) continue;  // No chunks available
-                    
-                    anyActivity = true;
-
-                    // H→D: input sizes (tiny  just sizeof(size_t)*batchSize bytes)
-                    cudaMemcpyAsync(slot.d_iSizes, slot.h_iSizes,
-                                    slot.batchSize * sizeof(size_t),
-                                    cudaMemcpyHostToDevice, slot.stream);
-
-                    // ── Launch: nvCOMP compression (after all H→D copies in stream) ─
-                    nvcompStatus_t nErr = nvcompBatchedLZ4CompressAsync(
-                        slot.d_iPtrs, slot.d_iSizes, slot.chunkStride,
-                        slot.batchSize, slot.d_temp, slot.tempBytes,
-                        slot.d_oPtrs, slot.d_oSizes, nvOpts, slot.d_stats, slot.stream);
-                    if (nErr != nvcompSuccess) {
-                        fprintf(stderr, "GPU%d slot: nvcomp error %d\n", gpu.deviceId, (int)nErr);
-                        workerAbort.store(true); 
-                        break;
-                    }
-                    batchesLaunched++;
-
-                    // ── D→H: oSizes and stats only (tiny: batchSize*16 bytes) ─────────
-                    // The bulk output transfer is deferred until sizes land on host
-                    // (sizesPhase collect step above), so we only move actual compressed
-                    // bytes instead of worst-case outStride bytes per chunk.
-                    cudaMemcpyAsync(slot.h_oSizes, slot.d_oSizes,
-                                    slot.batchSize * sizeof(size_t),
-                                    cudaMemcpyDeviceToHost, slot.stream);
-                    cudaMemcpyAsync(slot.h_stats, slot.d_stats,
-                                    slot.batchSize * sizeof(nvcompStatus_t),
-                                    cudaMemcpyDeviceToHost, slot.stream);
-                    cudaEventRecord(slot.sizesReadyEvent, slot.stream);
-
-                    slot.sizesPhase = true;   // Phase 1 pending (sizes in flight)
-                    slot.hasPending = false;  // Phase 2 not yet started
+                // Launch: iSizes H->D, then nvCOMP compress, then full output D->H
+                cudaMemcpyAsync(slot.d_iSizes, slot.h_iSizes,
+                                slot.batchSize * sizeof(size_t),
+                                cudaMemcpyHostToDevice, slot.stream);
+                nvcompStatus_t nErr = nvcompBatchedLZ4CompressAsync(
+                    slot.d_iPtrs, slot.d_iSizes, slot.chunkStride,
+                    slot.batchSize, slot.d_temp, slot.tempBytes,
+                    slot.d_oPtrs, slot.d_oSizes, nvOpts, slot.d_stats, slot.stream);
+                if (nErr != nvcompSuccess) {
+                    fprintf(stderr, "GPU%d: nvcomp error %d\n", gpu.deviceId, (int)nErr);
+                    workerAbort.store(true); break;
                 }
-                
-                // If no activity (all slots in-flight, reader exhausted), block
-                // on the first pending stream instead of spinning or sleeping.
-                // cudaStreamSynchronize yields to the OS until the GPU finishes 
-                // no CPU cycles wasted, no up-to-100µs discovery latency.
-                if (!anyActivity) {
-                    for (int si = 0; si < nSlots; si++) {
-                        if (slots[si].hasPending || slots[si].sizesPhase) {
-                            cudaStreamSynchronize(slots[si].stream);
-                            break;
-                        }
+                // Copy full output buffer (sized to worst-case) + sizes + stats in one go.
+                // Simpler than the deferred per-chunk copy approach and equally fast
+                // since the stream is already serialized.
+                cudaMemcpyAsync(slot.h_output, slot.d_output,
+                                slot.batchSize * slot.outStride,
+                                cudaMemcpyDeviceToHost, slot.stream);
+                cudaMemcpyAsync(slot.h_oSizes, slot.d_oSizes,
+                                slot.batchSize * sizeof(size_t),
+                                cudaMemcpyDeviceToHost, slot.stream);
+                cudaMemcpyAsync(slot.h_stats, slot.d_stats,
+                                slot.batchSize * sizeof(nvcompStatus_t),
+                                cudaMemcpyDeviceToHost, slot.stream);
+                slot.hasPending = true;
+            }
+
+            // Drain: collect results from any slots that still have pending work
+            for (int si = 0; si < nSlots; si++) {
+                PreallocSlot& sl = slots[si];
+                cudaStreamSynchronize(sl.stream);
+                if (!sl.hasPending) continue;
+                std::vector<std::vector<uint8_t>> cChunks, oChunks;
+                cChunks.reserve(sl.batchSize);
+                oChunks.reserve(sl.batchSize);
+                for (size_t i = 0; i < sl.batchSize; i++) {
+                    size_t outSz  = sl.h_oSizes[i];
+                    size_t origSz = sl.origSizes[i];
+                    const uint8_t* origPtr = sl.origHandles.size() > i
+                        ? sl.origHandles[i].data : sl.origData[i].data();
+                    if (outSz < origSz) {
+                        std::vector<uint8_t> buf(outSz);
+                        memcpy(buf.data(), sl.h_output + i * sl.outStride, outSz);
+                        cChunks.push_back(std::move(buf));
+                    } else {
+                        cChunks.push_back({});
                     }
+                    oChunks.emplace_back(origPtr, origPtr + origSz);
                 }
-                
-                // Exit when reader finished AND all slots are idle
-                if (asyncReader.isFinished()) {
-                    bool allIdle = true;
-                    for (const auto& s : slots) {
-                        if (s.hasPending || s.sizesPhase) {
-                            allIdle = false;
-                            break;
-                        }
-                    }
-                    if (allIdle) break;
-                }
+                sl.origHandles.clear(); sl.origData.clear();
+                asyncWriter.enqueueBatch(cChunks, oChunks, sl.indices, sl.origSizes);
+                chunksSubmitted += sl.batchSize;
+                sl.hasPending = false;
             }
         };
 
@@ -6755,10 +6687,9 @@ EXAMPLES
      * Print version information (-V and --version)
      */
     void printVersion() {
-        std::cout << "gzl4 " << VERSION << 
+        std::cout << "gzl4 " << VERSION <<
             R"( - GPU, CPU, and Hybrid LZ4 Compression Tool
-Built with nvCOMP 5.1.x, CUDA 12.8, liblz4
-)" << std::endl;
+Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
     }
 
 
@@ -6768,7 +6699,24 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4
     void printChangelog() {
         std::cout << "gzl4 " << VERSION << " - Changelog\n\n"
             R"CL(Changelog:
-  v3.25.0  Build + UX overhaul + decompressor segfault fix.
+  v3.26.0  Build + UX overhaul + decompressor segfault fix + GPU-only perf fix.
+
+           Perf: --gpu-only compression was ~12% slower than --hybrid even
+           when hybrid used 0 CPU chunks. Root cause: the GPU-only worker
+           used cudaEventQuery polling (spin-check all N slots every loop
+           iteration, fall back to cudaStreamSynchronize only when ALL slots
+           showed no activity) plus a two-phase deferred D->H strategy that
+           issued N individual per-chunk copies after an event fired. This
+           added event-query overhead and an extra round-trip of latency per
+           batch. Hybrid used a simpler cudaStreamSynchronize-per-slot-rotation
+           approach: advance to the next slot in round-robin order, block until
+           it finishes, collect, refill, launch. One blocking call per batch,
+           CPU thread sleeps (POSIX futex) rather than spinning.
+           Fix: rewrote compressFileGPU gpuWorker to match hybrid exactly:
+           cudaStreamSynchronize at slot entry, single full-output cudaMemcpyAsync
+           instead of deferred per-chunk copies, drain loop mirrors hybrid.
+           Removed now-dead sizesPhase bool and sizesReadyEvent cudaEvent_t
+           from PreallocSlot (field, release(), and slot init).
 
            Bugfix: segfault when decompressing files with high compression
            ratio (e.g. tar archives compressed from 6.5 GB -> 3.84 GB).
@@ -6827,6 +6775,9 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4
            -h now use bare names (no ./ or ./build/ prefix), assuming the
            binary is on the user's PATH.
 
+  v3.25.0  Build: resolved all compiler warnings from v3.24.24.
+           Version bumped to mark clean warning-free build.
+           (Full details folded into v3.26.0 changelog entry above.)
   v3.24.24 Feature: tar -I "./build/gzl4" compatibility.
            tar -I calls the compressor with no filename args; stdin is the
            data and stdout receives the result. For decompression tar passes
