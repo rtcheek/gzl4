@@ -44,7 +44,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.26.0";
+constexpr const char* VERSION = "3.26.2";
 
 // Compression backend modes
 enum class BackendMode {
@@ -1642,6 +1642,7 @@ private:
     size_t pipelineDepth;     // slots per GPU (--pipeline-depth)
     bool   disableEarlyRead;  // skip early reader (--no-early-read)
     bool   forceProgress;     // --progress: show progress even when piped
+    bool   earlyExit;         // true = help/version printed; exit 0 cleanly
 
     // Started before GPU init so reads overlap with CUDA context creation
     AsyncReader      earlyReader;
@@ -1666,6 +1667,7 @@ public:
         , pipelineDepth(0)                  // 0 = auto-tune, >0 = user override
         , disableEarlyRead(false)
         , forceProgress(false)
+        , earlyExit(false)
     {}
     
     ~GZL4Compressor() {}
@@ -4653,7 +4655,7 @@ public:
 
             size_t tb = totalBlocks.load();
             size_t bd = blocksDone.load();
-            if (readDone.load() && tb > 0 && bd >= tb) {
+            if (readDone.load() && bd >= tb) {  // tb==0 valid for empty files
                 VLOG(DEBUG, "Writer: done  totalBlocks=%zu  blocksDone=%zu  written=%zu\n",
                      tb, bd, nextBlockToWrite);
                 break;
@@ -4801,7 +4803,7 @@ public:
             }
         }
         
-        return true;
+        return checksumOk;  // exit 1 on checksum mismatch (corrupt file)
     }
     
     /*
@@ -5541,7 +5543,7 @@ public:
 
             size_t tb = totalBlocks.load();
             size_t bd = blocksDone.load();
-            if (dispatcherDone.load() && tb > 0 && bd >= tb) {
+            if (dispatcherDone.load() && bd >= tb) {  // tb==0 valid for empty files
                 VLOG(DEBUG, "Main: termination  totalBlocks=%zu blocksDone=%zu "
                      "written=%zu\n", tb, bd, nextBlockToWrite);
                 break;
@@ -5668,7 +5670,7 @@ public:
         if (!keepOriginal && !stdoutMode && !testMode)
             unlink(inputFile.c_str());
 
-        return !decompError;
+        return !decompError && csOk;  // exit 1 on decompError OR checksum mismatch
     }
     
     /*
@@ -5799,10 +5801,11 @@ public:
         std::condition_variable resultCV;
 
         // ── writer state ───────────────────────────────────────────────
-        std::atomic<bool>   writeError{false};
-        std::atomic<size_t> blocksSubmitted{0};  // total blocks sent to workers
-        XXH::State          xxhState(XXH32_SEED);
-        std::atomic<size_t> totalBytesWritten{0};
+        std::atomic<bool>     writeError{false};
+        std::atomic<uint32_t> storedFooterCS{0};  // content checksum from LZ4 footer
+        std::atomic<size_t>   blocksSubmitted{0};  // total blocks sent to workers
+        XXH::State            xxhState(XXH32_SEED);
+        std::atomic<size_t>   totalBytesWritten{0};
 
         // Diagnostics (reported at -vv)
         int64_t writeUs    = 0;   // time inside ::write() syscalls
@@ -5817,7 +5820,14 @@ public:
             while (true) {
                 uint32_t rawSz;
                 ssize_t n = ::read(inputFd, &rawSz, 4);
-                if (n == 0 || rawSz == 0) break;        // EOF or end-mark
+                if (n == 0 || rawSz == 0) {   // EOF or end-mark
+                    // Read the 4-byte content checksum immediately after end-mark
+                    // while inputFd is still open and positioned correctly.
+                    uint32_t footerCS = 0;
+                    if (::read(inputFd, &footerCS, 4) == 4)
+                        storedFooterCS.store(footerCS, std::memory_order_relaxed);
+                    break;
+                }
                 if (n != 4) { readError.store(true); break; }
 
                 bool isUncomp = (rawSz & 0x80000000) != 0;
@@ -6028,11 +6038,12 @@ public:
                 if (pending > maxPending) maxPending = pending;
             }
 
-            // Termination: reader finished and we've written all blocks
+            // Termination: reader finished and we've written all blocks.
+            // Note: tb == 0 is valid for empty files  break immediately.
             if (ok && readError.load()) { ok = false; break; }
             if (ok && readerDone.load()) {
                 size_t tb = blocksSubmitted.load();
-                if (nextBlockToWrite >= tb && tb > 0) break;
+                if (nextBlockToWrite >= tb) break;
             }
 
             if (!flushedAny) {
@@ -6067,7 +6078,19 @@ public:
             std::chrono::high_resolution_clock::now() - startTime).count();
 
         if (ok) {
-            uint32_t checksum = xxhState.digest();
+            uint32_t computedChecksum = xxhState.digest();
+            uint32_t storedChecksum   = storedFooterCS.load(std::memory_order_relaxed);
+            bool checksumOk = (storedChecksum == 0)
+                                  ? true   // footer not present (truncated stream)
+                                  : (computedChecksum == storedChecksum);
+            if (!checksumOk) {
+                fprintf(stderr, "%sWarning: Checksum mismatch  file may be corrupted!%s\n",
+                        CC_BRED, CC_RESET);
+                fprintf(stderr, "  Stored:   0x%08X\n", storedChecksum);
+                fprintf(stderr, "  Computed: 0x%08X\n", computedChecksum);
+            }
+            ok = ok && checksumOk;
+            uint32_t checksum = computedChecksum;  // keep for VLOG below
             std::string outputSize = formatBytes(totalBytesWritten.load());
 
             // Final 100% line then overwrite with completion message
@@ -6091,9 +6114,13 @@ public:
             if (testMode) {
                 double ratio = compressedFileSize > 0
                     ? (100.0 * compressedFileSize / totalBytesWritten.load()) : 0.0;
-                VLOG(NORMAL, "%sTest OK:%s %s  %sratio:%s %s%.1f%%%s\n",
-                        CC_BGREEN, CC_RESET, inputFile.c_str(),
-                        CC_CYAN, CC_RESET, CC_BYELLOW, ratio, CC_RESET);
+                if (checksumOk)
+                    VLOG(NORMAL, "%sTest OK:%s %s  %sratio:%s %s%.1f%%%s\n",
+                            CC_BGREEN, CC_RESET, inputFile.c_str(),
+                            CC_CYAN, CC_RESET, CC_BYELLOW, ratio, CC_RESET);
+                else
+                    VLOG(NORMAL, "%sTest FAILED:%s %s (checksum mismatch)\n",
+                            CC_BRED, CC_RESET, inputFile.c_str());
             }
 
             double mbps = totalBytesWritten.load() > 0 && elapsed > 0
@@ -6245,7 +6272,7 @@ public:
                     break;
                 case 'h':
                     printShortHelp();
-                    return false;
+                    earlyExit = true; return false;
                 case 'k':
                     keepOriginal = true;
                     break;
@@ -6261,7 +6288,7 @@ public:
                     break;
                 case 'V':
                     printVersion();
-                    return false;
+                    earlyExit = true; return false;
                 case 'T':
                     {
                         char* endptr;
@@ -6348,13 +6375,13 @@ public:
                     break;
                 case 1009:  // --change-log
                     printChangelog();
-                    return false;
+                    earlyExit = true; return false;
                 case 2000:  // --help: show full help
                     printHelp();
-                    return false;
+                    earlyExit = true; return false;
                 case 2001:  // --version: show full version
                     printVersion();
-                    return false;
+                    earlyExit = true; return false;
                 default:
                     fprintf(stderr, "Try 'gzl4 --help' for more information.\n");
                     return false;
@@ -6699,7 +6726,40 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
     void printChangelog() {
         std::cout << "gzl4 " << VERSION << " - Changelog\n\n"
             R"CL(Changelog:
+  v3.26.2  Version bump.
+  v3.26.1  Bugfix: test suite fixes + informational-command exit-code fix
+           + -t exits 1 on checksum mismatch + empty-file decompress hang fix.
+
+           Bugfix: decompressing an empty (0-byte content) LZ4 file hung
+           forever in all three decompressors (CPU, GPU, hybrid). The writer
+           loop termination condition was "readerDone && tb > 0 && bd >= tb"
+            the "tb > 0" guard was intended to prevent premature exit before
+           the dispatcher had set totalBlocks, but it also blocked exit when
+           totalBlocks legitimately was 0 (empty file). Fixed by removing the
+           "tb > 0" guard; the readerDone/dispatcherDone flag already ensures
+           the count is final before we evaluate the condition.
+
+
+           Bugfix: all three decompressors (GPU, hybrid, CPU) printed
+           "Test FAILED: checksum mismatch" but still returned true/exit 0,
+           so scripts using "gzl4 -t" as a validity gate passed silently on
+           corrupt files. Fixes per decompressor:
+             GPU:    return checksumOk instead of unconditional return true.
+             Hybrid: return !decompError && csOk instead of !decompError.
+             CPU:    added storedFooterCS atomic; reader thread reads the
+                     4-byte footer checksum immediately after the end-mark
+                     (while inputFd is still open); after join, compares
+                     stored vs computed and folds into ok flag; testMode
+                     display updated to show FAILED when !checksumOk.
+           See v3.26.0 entry for full details of changes in this release.
   v3.26.0  Build + UX overhaul + decompressor segfault fix + GPU-only perf fix.
+
+           Bugfix: -h, --help, -V, --version, --change-log all exited 1
+           instead of 0. parseArguments() returned false for both "printed
+           help cleanly" and "bad argument"  main() mapped false -> EXIT_FAILURE
+           in both cases. Fix: added earlyExit bool member; informational
+           handlers set earlyExit=true before returning false; run() returns
+           earlyExit (true=exit 0) when parseArguments fails early.
 
            Perf: --gpu-only compression was ~12% slower than --hybrid even
            when hybrid used 0 CPU chunks. Root cause: the GPU-only worker
@@ -7367,7 +7427,7 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
         
         // Parse command line
         if (!parseArguments(argc, argv)) {
-            return false;
+            return earlyExit;  // true = printed help/version (exit 0); false = error
         }
 
         // When reading from a pipe, default to quiet mode: progress bars and
