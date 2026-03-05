@@ -25,6 +25,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <inttypes.h>
 #include <cstdlib>
 #include <algorithm>
 #include <numeric>
@@ -44,7 +45,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.26.2";
+constexpr const char* VERSION = "3.26.5";
 
 // Compression backend modes
 enum class BackendMode {
@@ -426,14 +427,18 @@ namespace LZ4Frame {
         return 7;                                          // 4MB (LZ4 frame limit)
     }
     
-    bool writeFrameHeader(std::ostream& out, size_t contentSize, size_t chunkSizeBytes) {
+    bool writeFrameHeader(std::ostream& out, size_t contentSize, size_t chunkSizeBytes,
+                          bool storeContentSize = true) {
         // Write magic number
         writeU32(out, LZ4_MAGIC);
         
         // Build frame descriptor
         FrameDescriptor desc;
-        desc.contentSize = contentSize;
-        desc.hasContentSize = true;
+        // Only embed content size when we know it (>0) and caller wants it stored.
+        // Per lz4 spec: 0 in the field is technically valid but means unknown;
+        // omitting the field entirely (hasContentSize=false) is cleaner.
+        desc.hasContentSize = storeContentSize && (contentSize > 0);
+        desc.contentSize = desc.hasContentSize ? contentSize : 0;
         desc.hasContentChecksum = true;
         desc.hasBlockChecksum = false;
         desc.blockIndependence = true;
@@ -1584,6 +1589,11 @@ private:
     bool forceMode;         // -z: force compression mode (ignore .lz4 extension auto-detection)
     bool stdoutMode;
     bool testMode;
+    bool listMode;         // --list
+    std::vector<std::string> listFileArgs;    // files to list (--list)
+    std::vector<std::string> extraInputFiles; // extra positional args (multi-file)
+    bool storeContentSize; // --content-size / --no-content-size
+    bool contentSizeExplicit; // true = user set it explicitly
     
     // Signal handler for cleanup
     static void signalHandler(int signum) {
@@ -1660,6 +1670,9 @@ public:
         , forceMode(false)
         , stdoutMode(false)
         , testMode(false)
+        , listMode(false)
+        , storeContentSize(true)    // default: store when size is known
+        , contentSizeExplicit(false)
         , hcLevel(0)
         , backendMode(BackendMode::HYBRID)  // Default to hybrid mode
         , cpuThreads(CPU_THREADS_AUTO)      // Auto-detect
@@ -2417,7 +2430,8 @@ public:
         std::vector<uint8_t> headerBuffer;
         {
             std::ostringstream headerStream(std::ios::binary);
-            if (!LZ4Frame::writeFrameHeader(headerStream, fileSize, chunkSize)) {
+            if (!LZ4Frame::writeFrameHeader(headerStream, fileSize, chunkSize,
+                                            storeContentSize && !stdinMode)) {
                 fprintf(stderr, "Error: Failed to write LZ4 frame header\n");
                 return false;
             }
@@ -2653,15 +2667,15 @@ public:
         std::string inputSize  = stdinMode ? "(stdin)" : formatBytes(fileSize);
         std::string outputSize = formatBytes((size_t)totalBytesWritten);
         if (stdinMode)
-            VLOG(NORMAL, "\r%sCompression complete%s (CPU-only): stdin -> %s%s%s in %.2f s\n",
+            VLOG(NORMAL, "\r%sCompression complete:%s stdin -> %s%s%s in %.2f s\n",
                     CC_BGREEN, CC_RESET,
-                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    CC_CYAN, outputSize.c_str(), CC_RESET,
                     duration.count() / 1000.0);
         else
-        VLOG(NORMAL, "\r%sCompression complete%s (CPU-only): %s%s%s -> %s%s%s %s(%.2f%%)%s in %.2f s\n",
+        VLOG(NORMAL, "\r%sCompression complete:%s %s%s%s -> %s%s%s %s(%.2f%%)%s in %.2f s\n",
                 CC_BGREEN, CC_RESET,
                 CC_WHITE, inputSize.c_str(), CC_RESET,
-                CC_WHITE, outputSize.c_str(), CC_RESET,
+                CC_CYAN, outputSize.c_str(), CC_RESET,
                 CC_BYELLOW, ratio, CC_RESET,
                 duration.count() / 1000.0);
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
@@ -2862,7 +2876,8 @@ public:
         {
             // Create a temporary string stream to build header
             std::ostringstream headerStream(std::ios::binary);
-            if (!LZ4Frame::writeFrameHeader(headerStream, fileSize, chunkSize)) {
+            if (!LZ4Frame::writeFrameHeader(headerStream, fileSize, chunkSize,
+                                            storeContentSize && !stdinMode)) {
                 fprintf(stderr, "Error: Failed to write LZ4 frame header\n");
                 return false;
             }
@@ -3204,19 +3219,15 @@ public:
         std::string inputSize  = stdinMode ? "(stdin)" : formatBytes(fileSize);
         std::string outputSize = formatBytes((size_t)totalBytesWritten);
         if (stdinMode)
-            VLOG(NORMAL, "\r%sCompression complete%s (GPU-only, %zu GPU%s / %zu pipeline slots): "
-                    "stdin -> %s%s%s in %.2f s\n",
+            VLOG(NORMAL, "\r%sCompression complete:%s stdin -> %s%s%s in %.2f s\n",
                     CC_BGREEN, CC_RESET,
-                    gpus.size(), gpus.size() == 1 ? "" : "s", finalSlots,
-                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    CC_CYAN, outputSize.c_str(), CC_RESET,
                     duration.count() / 1000.0);
         else
-            VLOG(NORMAL, "\r%sCompression complete%s (GPU-only, %zu GPU%s / %zu pipeline slots): "
-                    "%s%s%s -> %s%s%s %s(%.2f%%)%s in %.2f s\n",
+            VLOG(NORMAL, "\r%sCompression complete:%s %s%s%s -> %s%s%s %s(%.2f%%)%s in %.2f s\n",
                     CC_BGREEN, CC_RESET,
-                    gpus.size(), gpus.size() == 1 ? "" : "s", finalSlots,
                     CC_WHITE, inputSize.c_str(), CC_RESET,
-                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    CC_CYAN, outputSize.c_str(), CC_RESET,
                     CC_BYELLOW, ratio, CC_RESET,
                     duration.count() / 1000.0);
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
@@ -3407,7 +3418,8 @@ public:
         // Write LZ4 frame header
         {
             std::ostringstream hs(std::ios::binary);
-            if (!LZ4Frame::writeFrameHeader(hs, fileSize, chunkSize)) {
+            if (!LZ4Frame::writeFrameHeader(hs, fileSize, chunkSize,
+                                            storeContentSize && !stdinMode)) {
                 fprintf(stderr,"Error: Failed to write LZ4 frame header\n"); return false;
             }
             std::string hstr = hs.str();
@@ -3759,21 +3771,15 @@ public:
         std::string inputSize  = stdinMode ? "(stdin)" : formatBytes(fileSize);
         std::string outputSize = formatBytes((size_t)bw);
         if (stdinMode) {
-            VLOG(NORMAL, "\r%sCompression complete%s (Hybrid, %zu GPU%s + %zu thread%s): "
-                    "stdin -> %s%s%s in %.2f s\n",
+            VLOG(NORMAL, "\r%sCompression complete:%s stdin -> %s%s%s in %.2f s\n",
                     CC_BGREEN, CC_RESET,
-                    gpus.size(),      gpus.size()==1?"":"s",
-                    effectiveThreads, effectiveThreads==1?"":"s",
-                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    CC_CYAN, outputSize.c_str(), CC_RESET,
                     duration.count()/1000.0);
         } else {
-            VLOG(NORMAL, "\r%sCompression complete%s (Hybrid, %zu GPU%s + %zu thread%s): "
-                    "%s%s%s -> %s%s%s %s(%.2f%%)%s in %.2f s\n",
+            VLOG(NORMAL, "\r%sCompression complete:%s %s%s%s -> %s%s%s %s(%.2f%%)%s in %.2f s\n",
                     CC_BGREEN, CC_RESET,
-                    gpus.size(),      gpus.size()==1?"":"s",
-                    effectiveThreads, effectiveThreads==1?"":"s",
                     CC_WHITE, inputSize.c_str(), CC_RESET,
-                    CC_WHITE, outputSize.c_str(), CC_RESET,
+                    CC_CYAN, outputSize.c_str(), CC_RESET,
                     CC_BYELLOW, 100.0*bw/fileSize, CC_RESET,
                     duration.count()/1000.0);
         }
@@ -3916,7 +3922,8 @@ public:
                     gpus.size(), gpus.size() == 1 ? "" : "s",
                     inputFile.c_str());
         } else {
-            VLOG(NORMAL, "Decompressing (GPU+fallback, %zu GPU%s): %s -> %s\n",
+            VLOG(NORMAL, "%sDecompressing%s (GPU+fallback, %zu GPU%s): %s -> %s\n",
+                    CC_BCYAN, CC_RESET,
                     gpus.size(), gpus.size() == 1 ? "" : "s",
                     inputFile.c_str(), outputFile.c_str());
         }
@@ -4752,10 +4759,10 @@ public:
             double ratio = compressedSize > 0 ? (100.0 * compressedSize / totalBytesWritten) : 0.0;
             std::string outputSize = formatBytes(totalBytesWritten);
 
-            VLOG(NORMAL, "\rTest complete (GPU+fallback, %zu GPU%s): %s in %.2f s%s\n",
-                    gpus.size(), gpus.size() == 1 ? "" : "s",
-                    outputSize.c_str(), duration.count() / 1000.0,
-                    "          ");
+            VLOG(NORMAL, "\r%sTest complete:%s %s%s%s in %.2f s%s\n",
+                    CC_BGREEN, CC_RESET,
+                    CC_BGREEN, outputSize.c_str(), CC_RESET,
+                    duration.count() / 1000.0, "          ");
             if (checksumOk)
                 VLOG(NORMAL, "%sTest OK:%s %s  %sratio:%s %s%.1f%%%s\n",
                         CC_BGREEN, CC_RESET, inputFile.c_str(),
@@ -4774,12 +4781,10 @@ public:
         } else {
             double mbps = (totalBytesWritten / (1024.0*1024.0)) / (duration.count() / 1000.0);
             std::string outputSize = formatBytes(totalBytesWritten);
-            VLOG(NORMAL, "\r%sDecompression complete%s (GPU+fallback, %zu GPU%s): "
-                    "%s in %.2f s%s\n",
+            VLOG(NORMAL, "\r%sDecompression complete:%s %s%s%s in %.2f s%s\n",
                     CC_BGREEN, CC_RESET,
-                    gpus.size(), gpus.size() == 1 ? "" : "s",
-                    outputSize.c_str(), duration.count() / 1000.0,
-                    "          ");
+                    CC_BGREEN, outputSize.c_str(), CC_RESET,
+                    duration.count() / 1000.0, "          ");
             VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
             VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
                  gpuBlocks.load(), cpuFallbackBlocks.load(),
@@ -4926,7 +4931,8 @@ public:
                     effectiveThreads,  effectiveThreads  == 1 ? "" : "s",
                     inputFile.c_str());
         } else {
-            VLOG(NORMAL, "Decompressing (hybrid, %zu GPU%s + %zu thread%s): %s -> %s\n",
+            VLOG(NORMAL, "%sDecompressing%s (hybrid, %zu GPU%s + %zu thread%s): %s -> %s\n",
+                    CC_BCYAN, CC_RESET,
                     gpus.size(),       gpus.size()       == 1 ? "" : "s",
                     effectiveThreads,  effectiveThreads  == 1 ? "" : "s",
                     inputFile.c_str(), outputFile.c_str());
@@ -5637,11 +5643,10 @@ public:
         if (testMode) {
             double ratio = compressedFileSize > 0
                 ? (100.0 * compressedFileSize / totalBytesWritten) : 0.0;
-            VLOG(NORMAL, "\rTest complete (hybrid, %zu GPU%s + %zu thread%s): "
-                    "%s in %.2f s%s\n",
-                    gpus.size(),       gpus.size()       == 1 ? "" : "s",
-                    effectiveThreads,  effectiveThreads  == 1 ? "" : "s",
-                    outputSize.c_str(), duration.count() / 1000.0, "          ");
+            VLOG(NORMAL, "\r%sTest complete:%s %s%s%s in %.2f s%s\n",
+                    CC_BGREEN, CC_RESET,
+                    CC_BGREEN, outputSize.c_str(), CC_RESET,
+                    duration.count() / 1000.0, "          ");
             if (csOk)
                 VLOG(NORMAL, "%sTest OK:%s %s  %sratio:%s %s%.1f%%%s\n",
                         CC_BGREEN, CC_RESET, inputFile.c_str(),
@@ -5650,12 +5655,10 @@ public:
                 VLOG(NORMAL, "%sTest FAILED:%s %s (checksum mismatch)\n",
                         CC_BRED, CC_RESET, inputFile.c_str());
         } else {
-            VLOG(NORMAL, "\r%sDecompression complete%s (hybrid, %zu GPU%s + %zu thread%s): "
-                    "%s in %.2f s%s\n",
+            VLOG(NORMAL, "\r%sDecompression complete:%s %s%s%s in %.2f s%s\n",
                     CC_BGREEN, CC_RESET,
-                    gpus.size(),       gpus.size()       == 1 ? "" : "s",
-                    effectiveThreads,  effectiveThreads  == 1 ? "" : "s",
-                    outputSize.c_str(), duration.count() / 1000.0, "          ");
+                    CC_BGREEN, outputSize.c_str(), CC_RESET,
+                    duration.count() / 1000.0, "          ");
         }
         VLOG(VERBOSE, "  GPU: %zu blocks (%.1f%%)  CPU: %zu blocks (%.1f%%)"
              "  pass-through: %zu  throughput: %.2f MB/s\n",
@@ -5732,7 +5735,8 @@ public:
                     numWorkers, numWorkers == 1 ? "" : "s",
                     inputFile.c_str());
         } else {
-            VLOG(NORMAL, "Decompressing (CPU, %zu thread%s): %s -> %s\n",
+            VLOG(NORMAL, "%sDecompressing%s (CPU, %zu thread%s): %s -> %s\n",
+                    CC_BCYAN, CC_RESET,
                     numWorkers, numWorkers == 1 ? "" : "s",
                     inputFile.c_str(), outputFile.c_str());
         }
@@ -6104,11 +6108,11 @@ public:
             }
 
             // Overwrite progress line with completion message
-            fprintf(stderr, "\r%s%s%s (CPU, %zu thread%s): %s in %.2f s%s\n",
+            fprintf(stderr, "\r%s%s%s %s%s%s in %.2f s%s\n",
                     CC_BGREEN,
-                    testMode ? "Test complete" : "Decompression complete",
+                    testMode ? "Test complete:" : "Decompression complete:",
                     CC_RESET,
-                    numWorkers, numWorkers==1?"":"s", outputSize.c_str(), elapsed,
+                    CC_BGREEN, outputSize.c_str(), CC_RESET, elapsed,
                     "          ");
 
             if (testMode) {
@@ -6253,6 +6257,9 @@ public:
             {"hc-level", required_argument, nullptr, 1007},
             {"progress", no_argument, nullptr, 1008},
             {"change-log", no_argument, nullptr, 1009},
+            {"list",            no_argument, nullptr, 1012},
+            {"content-size",    no_argument, nullptr, 1010},
+            {"no-content-size", no_argument, nullptr, 1011},
             {nullptr, 0, nullptr, 0}
         };
         
@@ -6376,6 +6383,17 @@ public:
                 case 1009:  // --change-log
                     printChangelog();
                     earlyExit = true; return false;
+                case 1012:  // --list: display frame metadata
+                    listMode = true;
+                    break;
+                case 1010:  // --content-size: embed original size in frame header
+                    storeContentSize = true;
+                    contentSizeExplicit = true;
+                    break;
+                case 1011:  // --no-content-size: omit original size from frame header
+                    storeContentSize = false;
+                    contentSizeExplicit = true;
+                    break;
                 case 2000:  // --help: show full help
                     printHelp();
                     earlyExit = true; return false;
@@ -6392,9 +6410,29 @@ public:
         // auto-detection.  "ungzl4 -z file" means: compress, period.
         if (forceMode) decompress = false;
         
+        // In --list mode, collect all remaining files; set inputFile to first
+        if (listMode) {
+            if (optind >= argc) {
+                fprintf(stderr, "Error: --list requires at least one filename\n");
+                return false;
+            }
+            for (int i = optind; i < argc; i++)
+                listFileArgs.push_back(argv[i]);
+            inputFile = listFileArgs[0];  // satisfies downstream checks
+            return true;
+        }
+
         // Get input file  "-" or missing with piped stdin = read from stdin
         if (optind < argc) {
             inputFile = argv[optind];
+            for (int i = optind + 1; i < argc; i++)
+                extraInputFiles.push_back(argv[i]);
+            // -c (stdout) is incompatible with multiple files
+            if (stdoutMode && !extraInputFiles.empty()) {
+                fprintf(stderr, "Error: -c (stdout) is not compatible with multiple input files\n");
+                fprintf(stderr, "Use -c with a single file, or omit -c to compress each file in place\n");
+                return false;
+            }
         } else if (!isatty(STDIN_FILENO)) {
             // stdin is a pipe/redirect  use it as input
             inputFile  = "-";
@@ -6477,12 +6515,12 @@ public:
      * Print short help message (-h)
      */
     void printShortHelp() {
-        std::cout << R"(gzl4 )" << VERSION << R"( - Multi-Backend LZ4 Compression Tool
+        std::cout << R"(gzl4 )" << VERSION << R"( - Multi-Backend (GPU, CPU, and Hybrid) LZ4 Compression Tool
 
-Usage: gzl4 [OPTION]... [FILE]
+Usage: gzl4 [OPTION]... [FILE ...]
 
 Common options:
-  -c            write to stdout
+  -c            write to stdout (single file only)
   -d            decompress
   -f            force overwrite
   -h            show this help (use --help for full details)
@@ -6498,18 +6536,18 @@ Common options:
 
 Program name behavior:
   ungzl4        Auto-enables decompression mode (-d implied)
-                Use -z to force compression despite "un" prefix
 
 Examples:
   gzl4 file.tar              # compress to file.tar.lz4
+  gzl4 a.tar b.tar c.tar     # compress multiple files in place
   gzl4 -d file.tar.lz4       # decompress to file.tar
+  gzl4 -d *.lz4              # decompress multiple files
   gzl4 file.tar.lz4          # auto-detects decompression
   gzl4 -z file.tar.lz4       # compress again to file.tar.lz4.lz4
   cat file | gzl4 > out.lz4  # pipe mode
   ungzl4 file.tar.lz4        # decompress (same as gzl4 -d)
 
-For complete documentation, use --help
-Version history:            --change-log
+For complete documentation: --help; version history: --change-log
 )";
     }
     
@@ -6521,8 +6559,8 @@ Version history:            --change-log
             R"HELP( - Multi-Backend (GPU, CPU, and Hybrid) LZ4 Compression Tool
 
 USAGE
-  gzl4 [OPTIONS] [FILE]            compress FILE -> FILE.lz4
-  gzl4 -d [OPTIONS] FILE.lz4       decompress FILE.lz4 -> FILE
+  gzl4 [OPTIONS] [FILE ...]        compress FILE(s) -> FILE.lz4
+  gzl4 -d [OPTIONS] FILE.lz4 ...  decompress FILE(s) -> FILE
   gzl4 [OPTIONS] < FILE > OUT      pipe: stdin -> stdout
   tar -I gzl4 -cf a.tar.lz4 dir/ use as tar compressor
   tar -I gzl4 -xf a.tar.lz4      use as tar decompressor
@@ -6532,17 +6570,34 @@ USAGE
 
 BASIC OPTIONS
   -c, --stdout         write to standard output; keep original files
+                       (incompatible with multiple input files)
   -d, --decompress     decompress (default: compress)
   -f, --force          overwrite output if it already exists
                        (uses .tmp + atomic rename for safety)
   -k, --keep           keep input file after compress/decompress
   -t, --test           verify integrity; no output written
+      --list           list information about one or more .lz4 files
+                       (use -v for per-frame detail)
   -z, --force-compress force compression even for .lz4 input files
                        (gzl4 auto-detects .lz4 extension -> decompress)
+      --content-size   embed original size in LZ4 frame header
+      --no-content-size omit original size from LZ4 frame header
+                       (see FRAME FORMAT OPTIONS below for details)
   -h                   short help
       --help           this help
       --change-log     full version history
   -V, --version        version information
+
+MULTI-FILE
+  gzl4 accepts multiple input files on the command line:
+    gzl4 a.tar b.tar c.tar        compress each -> a.tar.lz4 b.tar.lz4 c.tar.lz4
+    gzl4 -d a.lz4 b.lz4          decompress each in place
+    gzl4 -f *.lz4                 decompress all .lz4, overwrite if needed
+  All flags (-k -f -t -d -z etc.) apply uniformly to every file.
+  Processing continues after a per-file failure; exit code 1 if any failed.
+  Auto-detect (.lz4 extension -> decompress) is applied per file, so a
+  mixed list compresses uncompressed files and decompresses .lz4 files.
+  Note: -c (--stdout) is not compatible with multiple files.
 
 COMPRESSION LEVELS
   -1 .. -9             LZ4 fast compression (default: -9)
@@ -6585,6 +6640,22 @@ GPU TUNING
     RTX 5090  batch=68 streams=4  -> 1208 MB/s
     1x H100   batch=9  streams=5
     8x H100   batch=3  streams=3  (avoid PCIe bus saturation)
+
+FRAME FORMAT OPTIONS
+  --content-size       Embed the original uncompressed size as an 8-byte
+                       field in the LZ4 frame header (FLG bit C_SIZE).
+                       Allows decompressors to pre-allocate output buffers
+                       and display accurate progress bars.
+                       Default: ON for file input (size known via stat),
+                                OFF for stdin/pipe (size unknown).
+
+  --no-content-size    Omit the size field from the frame header.
+                       Produces output identical to piped mode regardless
+                       of input source.  Useful for reproducible builds
+                       or when the size field would be misleading.
+
+  Output of both modes is fully compatible with the reference lz4 tool
+  and any conforming LZ4 implementation.
 
 VERBOSITY AND PROGRESS
   (default)            Level 1: progress bars + completion summary
@@ -6672,9 +6743,13 @@ EXAMPLES
   gzl4 -d archive.tar.lz4               decompress -> archive.tar
   gzl4 archive.tar.lz4                  auto-detects .lz4 -> decompress
   gzl4 -t archive.tar.lz4               test integrity, no output
+  gzl4 --list archive.tar.lz4           show frame info
+  gzl4 --list -v a.lz4 b.lz4 c.lz4    per-frame detail, multiple files
   gzl4 -k archive.tar                   compress, keep original
   gzl4 -f archive.tar                   compress, overwrite if exists
   gzl4 -12 bigfile.dat                  max HC compression (CPU only)
+  gzl4 --no-content-size archive.tar    omit size from frame header
+  gzl4 --content-size < file > file.lz4 embed size even from stdin
 
   Backend and tuning:
   gzl4 --cpu-only -T 16 data.tar        16-thread CPU only
@@ -6683,6 +6758,9 @@ EXAMPLES
   gzl4 --gpu-only --streams-per-gpu 8 f 8 concurrent GPU streams
   gzl4 -d --gpu-only --batch-size 4 f.lz4  GPU decompress, 4-chunk batches
   gzl4 -vv -k archive.tar              verbose output, keep original
+  gzl4 a.tar b.tar c.tar               compress multiple files
+  gzl4 -d a.tar.lz4 b.tar.lz4         decompress multiple files
+  gzl4 -f *.lz4                        decompress all .lz4 in dir
 
   Pipe and streaming:
   tar -cf - mydir | gzl4 > archive.tar.lz4
@@ -6705,9 +6783,254 @@ EXAMPLES
   ungzl4 symlink:
   ln -s gzl4 ungzl4
   ungzl4 archive.tar.lz4            # decompress
-  ungzl4 -z -f -k file.tar          # compress despite "un" prefix (-z overrides)
+  ungzl4 -z -f -k file.tar   # compress despite "un" prefix (-z overrides)
   tar -I ungzl4 -xf archive.tar.lz4
 )HELP" << std::endl;
+    }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // --list: scan one .lz4 file and print frame metadata
+    // Output matches the reference lz4 tool column layout:
+    //   Frames  Type      Block  Compressed  Uncompressed  Ratio  Filename
+    // ─────────────────────────────────────────────────────────────────────────
+    struct FrameInfo {
+        uint64_t compressedBytes;    // bytes consumed by this frame on disk
+        uint64_t uncompressedBytes;  // from content-size field (0 = unknown)
+        bool     hasContentSize;
+        bool     hasContentChecksum;
+        bool     hasBlockChecksum;
+        bool     blockIndependence;
+        int      blockMaxSizeId;     // 4=64K 5=256K 6=1M 7=4M
+    };
+
+    // Scan all frames in an open file, skipping block data without reading it.
+    // Returns false on I/O error or malformed magic.
+    bool scanFrames(int fd, std::vector<FrameInfo>& frames) {
+        // We read sequentially; use lseek to skip block payloads.
+        off_t pos = 0;
+
+        while (true) {
+            // Try to read a 4-byte magic / end sentinel
+            uint32_t magic = 0;
+            ssize_t n = ::pread(fd, &magic, 4, pos);
+            if (n == 0) break;           // clean EOF
+            if (n < 4) return false;     // truncated
+
+            if (magic != LZ4_MAGIC) {
+                // Not an LZ4 frame  either garbage or we're past the data
+                break;
+            }
+            pos += 4;
+
+            // Read FLG + BD
+            uint8_t flg, bd;
+            if (::pread(fd, &flg, 1, pos) != 1) return false;
+            pos++;
+            if (::pread(fd, &bd,  1, pos) != 1) return false;
+
+            FrameInfo fi{};
+            fi.blockIndependence  = (flg & 0x20) != 0;
+            fi.hasBlockChecksum   = (flg & 0x10) != 0;
+            fi.hasContentSize     = (flg & 0x08) != 0;
+            fi.hasContentChecksum = (flg & 0x04) != 0;
+            fi.blockMaxSizeId     = (bd  >> 4) & 0x07;
+            pos++;  // consumed BD
+
+            // Optional content size (8 bytes)
+            if (fi.hasContentSize) {
+                uint64_t cs = 0;
+                if (::pread(fd, &cs, 8, pos) != 8) return false;
+                fi.uncompressedBytes = cs;
+                pos += 8;
+            }
+
+            // Header checksum (1 byte)  skip
+            pos++;
+
+            // Walk blocks to count compressed payload bytes
+            uint64_t blockBytes = 0;
+            while (true) {
+                uint32_t bsz = 0;
+                if (::pread(fd, &bsz, 4, pos) != 4) return false;
+                pos += 4;
+                blockBytes += 4;  // the block-size word itself
+                if (bsz == 0) break;  // end mark
+                uint32_t dataSz = bsz & 0x7FFFFFFF;
+                pos += dataSz;
+                blockBytes += dataSz;
+                if (fi.hasBlockChecksum) { pos += 4; blockBytes += 4; }
+            }
+
+            // Optional content checksum (4 bytes)
+            if (fi.hasContentChecksum) { pos += 4; blockBytes += 4; }
+
+            // Total compressed size for this frame:
+            //   4 (magic) + 1 (FLG) + 1 (BD) [+ 8 (C_SIZE)] + 1 (HC) + blocks
+            uint64_t headerBytes = 4 + 1 + 1 + 1 + (fi.hasContentSize ? 8 : 0);
+            fi.compressedBytes = headerBytes + blockBytes;
+            frames.push_back(fi);
+        }
+        return true;
+    }
+
+    // Format a byte count like lz4 does: auto-select unit, 4 significant digits
+    static std::string fmtBytes(uint64_t n) {
+        if (n == 0) return "N/A";
+        const char* units[] = { "", "K", "M", "G", "T" };
+        double v = (double)n;
+        int u = 0;
+        while (v >= 1000.0 && u < 4) { v /= 1024.0; u++; }
+        char buf[32];
+        if (u == 0) snprintf(buf, sizeof(buf), "%" PRIu64, n);
+        else        snprintf(buf, sizeof(buf), "%.2f%s", v, units[u]);
+        return buf;
+    }
+
+    // Pad visible text to width, then wrap in a color code.
+    // Must be done BEFORE printf so %-Ns sees only the padded plain text
+    // (escape bytes would be counted as visible width otherwise).
+    static std::string colCell(const char* color, const std::string& text, int width) {
+        std::string padded = text;
+        if ((int)text.size() < width)
+            padded.append(width - (int)text.size(), ' ');
+        if (!g_color || color == nullptr) return padded;
+        return std::string(color) + padded + CC_RESET;
+    }
+
+    // Width-aware colored list columns
+    static std::string fmtComp(uint64_t n, int w) {
+        return colCell(CC_CYAN, fmtBytes(n), w);
+    }
+    static std::string fmtUncomp(uint64_t n, bool known, int w) {
+        return colCell(known ? CC_BGREEN : CC_DIM, known ? fmtBytes(n) : "N/A", w);
+    }
+    static std::string fmtRatio(double comp, double uncomp, int w) {
+        if (uncomp <= 0) return colCell(CC_DIM, "N/A", w);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.3f", comp / uncomp);
+        return colCell(CC_BYELLOW, buf, w);
+    }
+
+    // Block-size id -> human label used by lz4: B4I/B4D … B7I/B7D
+    static std::string blockLabel(int id, bool independent) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "B%d%c", id, independent ? 'I' : 'D');
+        return buf;
+    }
+
+    bool listFile(const std::string& path) {
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) {
+            fprintf(stderr, "gzl4 --list: cannot stat '%s': %s\n",
+                    path.c_str(), strerror(errno));
+            return false;
+        }
+        uint64_t fileBytes = (uint64_t)st.st_size;
+
+        int fd = ::open(path.c_str(), O_RDONLY | O_LARGEFILE);
+        if (fd < 0) {
+            fprintf(stderr, "gzl4 --list: cannot open '%s': %s\n",
+                    path.c_str(), strerror(errno));
+            return false;
+        }
+
+        std::vector<FrameInfo> frames;
+        bool ok = scanFrames(fd, frames);
+        ::close(fd);
+
+        if (!ok || frames.empty()) {
+            fprintf(stderr, "gzl4 --list: '%s': not a valid LZ4 file\n", path.c_str());
+            return false;
+        }
+
+        // Aggregate totals
+        uint64_t totalComp   = 0;
+        uint64_t totalUncomp = 0;
+        bool     allHaveSize = true;
+        bool     multiBlock  = (frames.size() > 1);
+
+        for (auto& f : frames) {
+            totalComp   += f.compressedBytes;
+            if (f.hasContentSize) totalUncomp += f.uncompressedBytes;
+            else                  allHaveSize = false;
+        }
+
+        // Use the first frame's block settings for the summary row
+        auto& f0 = frames[0];
+
+        // Filename: basename only, matching lz4 behaviour
+        std::string fname = path;
+        auto slash = fname.rfind('/');
+        if (slash != std::string::npos) fname = fname.substr(slash + 1);
+
+        // Colored filename
+        std::string fnameCol = std::string(CC_BWHITE) + fname + CC_RESET;
+
+        // Verbose: show one row per frame, then a totals row
+        if (g_verbosity >= VERBOSE) {
+            // Header  bold, plain %-Ns is fine since no escapes in the text itself
+            fprintf(stdout, "%s%-7s  %-8s  %-5s  %-11s  %-12s  %-8s  %s%s\n",
+                CC_BOLD,
+                "Frames", "Type", "Block", "Compressed", "Uncompressed",
+                "Ratio", "Filename", CC_RESET);
+            for (size_t i = 0; i < frames.size(); i++) {
+                auto& fi = frames[i];
+                // Pre-pad plain label strings to their column widths, then dim-color them
+                char frameLbl[32]; snprintf(frameLbl, sizeof(frameLbl), "frame%-2zu", i + 1);
+                std::string fLbl  = colCell(CC_DIM, frameLbl,                                         7);
+                std::string tLbl  = colCell(CC_DIM, "LZ4Frame",                                       8);
+                std::string bLbl  = colCell(CC_DIM, blockLabel(fi.blockMaxSizeId, fi.blockIndependence), 5);
+                std::string comp  = fmtComp  (fi.compressedBytes,   11);
+                std::string unc   = fmtUncomp(fi.uncompressedBytes, fi.hasContentSize, 12);
+                std::string r     = fmtRatio ((double)fi.compressedBytes,
+                                              fi.hasContentSize ? (double)fi.uncompressedBytes : 0.0, 8);
+                fprintf(stdout, "  %s  %s  %s  %s  %s  %s\n",
+                    fLbl.c_str(), tLbl.c_str(), bLbl.c_str(),
+                    comp.c_str(), unc.c_str(), r.c_str());
+            }
+            if (multiBlock) {
+                std::string fLbl  = colCell(CC_DIM, std::to_string(frames.size()),  7);
+                std::string tLbl  = colCell(CC_DIM, "(total)",                       8);
+                std::string bLbl  = colCell(CC_DIM, "-",                             5);
+                std::string comp  = fmtComp  (totalComp,          11);
+                std::string unc   = fmtUncomp(totalUncomp, allHaveSize, 12);
+                std::string r     = fmtRatio ((double)totalComp, allHaveSize ? (double)totalUncomp : 0.0, 8);
+                fprintf(stdout, "%s  %s  %s  %s  %s  %s  %s\n",
+                    fLbl.c_str(), tLbl.c_str(), bLbl.c_str(),
+                    comp.c_str(), unc.c_str(), r.c_str(), fnameCol.c_str());
+            } else {
+                std::string fLbl  = colCell(CC_DIM, std::to_string(frames.size()),  7);
+                std::string tLbl  = colCell(CC_DIM, "LZ4Frame",                      8);
+                std::string bLbl  = colCell(CC_DIM, blockLabel(f0.blockMaxSizeId, f0.blockIndependence), 5);
+                std::string comp  = fmtComp  (totalComp,          11);
+                std::string unc   = fmtUncomp(totalUncomp, allHaveSize, 12);
+                std::string r     = fmtRatio ((double)totalComp, allHaveSize ? (double)totalUncomp : 0.0, 8);
+                fprintf(stdout, "%s  %s  %s  %s  %s  %s  %s\n",
+                    fLbl.c_str(), tLbl.c_str(), bLbl.c_str(),
+                    comp.c_str(), unc.c_str(), r.c_str(), fnameCol.c_str());
+            }
+        } else {
+            // Normal: single summary row per file
+            std::string fLbl  = colCell(CC_DIM, std::to_string(frames.size()),  7);
+            std::string tLbl  = colCell(CC_DIM, "LZ4Frame",                      8);
+            std::string bLbl  = colCell(CC_DIM, blockLabel(f0.blockMaxSizeId, f0.blockIndependence), 5);
+            std::string comp  = fmtComp  (fileBytes,          11);
+            std::string unc   = fmtUncomp(totalUncomp, allHaveSize, 12);
+            std::string r     = fmtRatio ((double)fileBytes, allHaveSize ? (double)totalUncomp : 0.0, 8);
+            fprintf(stdout, "%s  %s  %s  %s  %s  %s  %s\n",
+                fLbl.c_str(), tLbl.c_str(), bLbl.c_str(),
+                comp.c_str(), unc.c_str(), r.c_str(), fnameCol.c_str());
+        }
+        return true;
+    }
+
+    void printListHeader() {
+        fprintf(stdout,
+            "%s%-7s  %-8s  %-5s  %-11s  %-12s  %-8s  %s%s\n",
+            CC_BOLD,
+            "Frames", "Type", "Block", "Compressed", "Uncompressed",
+            "Ratio", "Filename", CC_RESET);
     }
 
     /*
@@ -6726,7 +7049,56 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
     void printChangelog() {
         std::cout << "gzl4 " << VERSION << " - Changelog\n\n"
             R"CL(Changelog:
+  v3.26.5  Feature: multi-file command line (compress/decompress N files).
+
+           Multiple positional arguments are now accepted:
+             gzl4 a.tar b.tar c.tar          -> a.tar.lz4  b.tar.lz4  c.tar.lz4
+             gzl4 -d a.tar.lz4 b.tar.lz4    -> a.tar  b.tar
+           Flags (-k -f -t -d -z etc.) apply to all files. Processing
+           continues on failure (all files attempted, exit 1 if any failed).
+           Auto-detect (.lz4 extension -> decompress) is applied per-file.
+           Implementation: extraInputFiles member; per-file loop in run();
+           output path + no-clobber check re-derived for each extra file.
+
+  v3.26.4  Feature: --list: display .lz4 frame metadata.
+
+           gzl4 --list file.lz4 [file2.lz4 ...] prints a table:
+             Frames  Type      Block  Compressed  Uncompressed  Ratio  Filename
+           matching the column layout of the reference lz4 tool.
+           Columns: Frames = number of LZ4 frames; Type = LZ4Frame;
+           Block = B<id><I|D> (e.g. B7I = 4 MB independent blocks);
+           Compressed = on-disk file size; Uncompressed = from frame
+           content-size field (N/A if not present); Ratio = compressed
+           divided by uncompressed; Filename = basename.
+           -v shows one row per frame then a summary; multiple files
+           are all listed under a single header.
+           Implementation: listFile(), scanFrames(), fmtBytes(),
+           blockLabel(), printListHeader(); long option 1012; member
+           listMode + listFileArgs.
+
+  v3.26.3  Feature: --content-size / --no-content-size.
   v3.26.2  Version bump.
+
+           Details:
+
+           --content-size embeds the original uncompressed file size as
+           an 8-byte little-endian field in the LZ4 frame header (FLG
+           bit 3 = C_SIZE). Matches the behaviour of the reference lz4
+           command-line tool. New members: storeContentSize (bool),
+           contentSizeExplicit (bool). New long options: 1010
+           (--content-size) and 1011 (--no-content-size).
+
+           Default behaviour:
+             File input:  storeContentSize=true  (size is known via stat)
+             Stdin/pipe:  storeContentSize=false (size is unknown)
+           Both defaults can be overridden explicitly.
+
+           writeFrameHeader() gains a storeContentSize parameter
+           (default true for back-compat). hasContentSize is now set
+           only when storeContentSize=true AND contentSize>0  avoids
+           writing a 0-size field (which was previously emitted for
+           stdin/pipe mode and was misleading).
+
   v3.26.1  Bugfix: test suite fixes + informational-command exit-code fix
            + -t exits 1 on checksum mismatch + empty-file decompress hang fix.
 
@@ -6756,7 +7128,8 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
 
            Bugfix: -h, --help, -V, --version, --change-log all exited 1
            instead of 0. parseArguments() returned false for both "printed
-           help cleanly" and "bad argument"  main() mapped false -> EXIT_FAILURE
+           help cleanly" and "bad argument"  main() mapped false ->
+           EXIT_FAILURE
            in both cases. Fix: added earlyExit bool member; informational
            handlers set earlyExit=true before returning false; run() returns
            earlyExit (true=exit 0) when parseArguments fails early.
@@ -6773,7 +7146,8 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
            it finishes, collect, refill, launch. One blocking call per batch,
            CPU thread sleeps (POSIX futex) rather than spinning.
            Fix: rewrote compressFileGPU gpuWorker to match hybrid exactly:
-           cudaStreamSynchronize at slot entry, single full-output cudaMemcpyAsync
+           cudaStreamSynchronize at slot entry, single full-output
+           cudaMemcpyAsync
            instead of deferred per-chunk copies, drain loop mirrors hybrid.
            Removed now-dead sizesPhase bool and sizesReadyEvent cudaEvent_t
            from PreallocSlot (field, release(), and slot init).
@@ -6934,7 +7308,8 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
            Fix: detect stdinMode = (inputFile == "-") before stat(); skip it
            and set fileSize=0 / numChunks=SIZE_MAX sentinel. All downstream
            uses of numChunks and fileSize guarded:
-             - maxReadQueue / poolSlots clamps: bypass min(numChunks,...) for stdin
+             - maxReadQueue / poolSlots clamps: bypass min(numChunks,...) for
+             stdin
              - asyncWriter.setTotalChunks: skipped for stdin (writer drains on
                reader EOF instead of chunk count)
              - Progress loops:
@@ -6987,10 +7362,12 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
            everywhere the trailing spaces were passed as a separate arg rather
            than embedded in the format string.  Fix: embed "          " as
            literal text in every affected format string and remove it from the
-           argument list.  All 17 warned call sites fixed across decompressFileGPU
+           argument list.  All 17 warned call sites fixed across
+           decompressFileGPU
            (showProgress lambda + 100% completion lines), decompressFileHybrid
            (same), and decompressFileCPU (same).  Compression-path fprintf calls
-           that had a proper %s for the spaces were already correct and unchanged.
+           that had a proper %s for the spaces were already correct and
+           unchanged.
   v3.24.13 UX: three final polish items requested after v3.24.12 review:
            (1) CPU-only decompressor Decompressing phase now shows
                "CPU: X.X GB" matching the GPU+CPU display already present
@@ -7062,7 +7439,8 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
            uncompressed output. With estimatedBlocks=71,409 but actual block
            count=110,735, two things happened:
              (1) Workers wrote results[71409..110734]  out-of-bounds UB.
-             (2) The writer drain loop checked nextBlockToWrite < estimatedBlocks
+             (2) The writer drain loop checked nextBlockToWrite <
+             estimatedBlocks
                  and stopped at 71,409. The termination condition (blocksDone >=
                  totalBlocks) was never reached because all worker threads were
                  still running and filling blockQueue  the main thread exited
@@ -7077,14 +7455,16 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
            Previously writeTask() called xxhState->update(originalData, origSz)
            then bufAppend(compressedData) sequentially on the writer thread,
            pegging one CPU core at 100% after GPU work finished.  These two
-           operations touch different memory (originalChunks vs compressedChunks)
+           operations touch different memory (originalChunks vs
+           compressedChunks)
            so they can run in parallel:
              Writer thread: bufAppend/bufFlush only (I/O).
              Hash thread (new): xxhState->update() over original data.
            originalChunks[i] is std::moved to HashWork after bufAppend completes
            (so uncompressed-fallback writes still see the data), then the hash
            thread pops it from a TsQueue<HashWork> FIFO and hashes it.  Because
-           the writer thread processes pendingWrites in strict chunk-index order,
+           the writer thread processes pendingWrites in strict chunk-index
+           order,
            the FIFO is already ordered  no reordering map needed.  After the
            final bufFlush(), the writer closes the hash queue; the hash thread
            drains any remaining items and exits.  stop() joins both threads.
@@ -7110,12 +7490,14 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
              (a) xxhState->update()  content checksum
              (b) uncompressed fallback write (outSz >= origSz, rare)
            For the pooled path (the common path), the copy is eliminated by
-           moving the PinnedInputPool::Handle itself into WriteTask.pinnedHandles.
+           moving the PinnedInputPool::Handle itself into
+           WriteTask.pinnedHandles.
            The pinned memory remains valid until writeTask() returns and the
            WriteTask is destroyed, at which point ~Handle() releases the slot.
            For the heap path (early-reader / no-pool fallback), origData vectors
            are std::moved instead of copied  also zero allocation.
-           writeTask() uses pinnedHandles[i].data directly for xxhState->update()
+           writeTask() uses pinnedHandles[i].data directly for
+           xxhState->update()
            and for the uncompressed fallback bufAppend() (pinned memory is
            fully readable from CPU). enqueueBatch() gains a pinnedHandles
            parameter; all three GPU collect phases (GPU-only main, hybrid main,
@@ -7138,7 +7520,8 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
            of one: first visit syncs on oSizes+stats D→H and issues per-chunk
            D→H (actual sizes); second visit syncs on per-chunk D→H and collects.
            The per-chunk D→H for a done slot overlaps with nvCOMP on the other
-           (nSlots-1) pipeline slots. No CUDA event needed  cudaStreamSynchronize
+           (nSlots-1) pipeline slots. No CUDA event needed 
+           cudaStreamSynchronize
            guarantees sizes are host-visible. Drain loop handles both states.
   v3.24.4  Perf #4: two-phase D→H transfer in GPU-only compression worker.
            Previously the D→H section issued one cudaMemcpyAsync for the
@@ -7213,7 +7596,8 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
            with zero locking. Writer checks ready[next].load(acquire) lock-free
            on the hot path; resultMutex kept only for resultCV.wait_for().
            Also adds -v timing diagnostics to decompressFileCPU matching GPU
-           paths: write time, wait-stall time, drain efficiency, max out-of-order
+           paths: write time, wait-stall time, drain efficiency, max
+           out-of-order
            depth.
   v3.23.3  Perf: eliminated all polling sleeps from hot paths:
            (1) CPU compressor: getResult()+sleep_for(100µs) replaced with
@@ -7236,16 +7620,20 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
                OS page cache used by write() and showing up as unexpectedly slow
                write() syscalls.  Expected ~10 streams (same as hybrid auto).
            (2) Writer loop 1ms poll replaced with resultCV.wait_for(5ms).
-               GPU workers now call resultCV.notify_one() after every blocksDone++
+               GPU workers now call resultCV.notify_one() after every
+               blocksDone++
                so the writer wakes immediately when a result is ready instead of
                discovering it up to 1ms later.  Previously accumulated 3.8s of
                wait time in 1ms sleep increments.
   v3.23.1  Perf: decompressFileGPU  dedicated reader thread so disk reads and
            disk writes run concurrently instead of serially on the main thread.
            Previously: read block → enqueue → drain results → write → repeat.
-           Now: reader thread reads/enqueues; main thread is pure writer (mirrors
-           --hybrid dispatcher architecture). Diagnostics showed GPU never stalls
-           (waitUs≈0), write consumes 24% of runtime, results pile 256 blocks deep
+           Now: reader thread reads/enqueues; main thread is pure writer
+           (mirrors
+           --hybrid dispatcher architecture). Diagnostics showed GPU never
+           stalls
+           (waitUs≈0), write consumes 24% of runtime, results pile 256 blocks
+           deep
             confirming the bottleneck was serial read/write serialisation. Also
            retains -v timing breakdown: read/write/wait/drain-efficiency.
   v3.23.0  Perf #1: pinned host output staging (h_decomp) for both
@@ -7261,13 +7649,15 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
            matches.
   v3.22.0  Hybrid decompression fixes: VRAM-aware stream auto-sizing (50% of
            free VRAM cap prevents OOM hang); goto-free GPU worker with per-slot
-           CUDA error logging and graceful re-routing to CPU queue on alloc fail;
+           CUDA error logging and graceful re-routing to CPU queue on alloc
+           fail;
            blocksDone-based termination (fixes pass-through count race);
            DEBUG heartbeat in main drain loop; cpuWorker takes tidx arg
   v3.21.0  True hybrid decompression: dispatcher thread routes blocks GPU-first
            via TsQueue; CPU overflow workers (effectiveThreads) run
            LZ4_decompress_safe in parallel  cpuBlocks now reflects real CPU
-           work, not just nvCOMP error fallbacks; progress shows true GPU/CPU split
+           work, not just nvCOMP error fallbacks; progress shows true GPU/CPU
+           split
   v3.19.9  CONSISTENT TEST MODE (-t) OUTPUT: all three decompression backends
            now show "Decompressing (test, <backend>): <infile>" with no arrow to
            the output file; "Writing:" drain phase suppressed in test mode;
@@ -7298,89 +7688,144 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
            --hybrid ported to full N_STREAMS x SC slot-ring (was single-stream,
            silently ignoring --streams-per-gpu); -f rename now silent at normal
            verbosity, shown as "Renaming: src -> dst" at -v and above
-  v3.19.4  FAST --gpu-only DECOMPRESSION + --streams-per-gpu TUNING: decompressor
+  v3.19.4  FAST --gpu-only DECOMPRESSION + --streams-per-gpu TUNING:
+           decompressor
            uses N_STREAMS independent streams (default 32 single GPU, 16 for 2-4
            GPUs, 8 for 5+), each with batch_size=1 per nvCOMP call to avoid
            Error 12 when files contain mixed nvCOMP + raw LZ4 blocks (hybrid);
-           --streams-per-gpu N now controls decompression parallelism (previously
+           --streams-per-gpu N now controls decompression parallelism
+           (previously
            only affected compression); each stream has pre-allocated persistent
            device buffers (~12 MB VRAM/stream at 4 MB chunk); async H→D and
            metadata D→H overlap across streams; CPU fallback only on genuine
            GPU errors; hybrid mode unchanged: CPU-first, GPU for nvCOMP blocks;
-           fixed asyncWriter.start() outputFile vs getActualOutputPath() (-f bug)
+           fixed asyncWriter.start() outputFile vs getActualOutputPath() (-f
+           bug)
   v3.19.3  (intermediate  superseded by 3.19.4)
-  v3.19.2  CRITICAL BUG FIXES: Fixed GPU/Hybrid decompression stalling in final flush by adding
-           missing mutex locks around results.find(); fixed -f temp file error messages to show
-           actual path being written (temp file); all file writes now correctly use temp file
+  v3.19.2  CRITICAL BUG FIXES: Fixed GPU/Hybrid decompression stalling in final
+           flush by adding
+           missing mutex locks around results.find(); fixed -f temp file error
+           messages to show
+           actual path being written (temp file); all file writes now correctly
+           use temp file
            when -f is active; updated output format for better readability
-  v3.19.1  SIMPLIFIED VERSION OUTPUT: -V and --version now show same concise output; moved
-           detailed backend/architecture info from version to --help for better organization;
-           fixed compiler warning (unused parameter); removed outdated decompression note;
-           fixed changelog formatting (removed extra newline, corrected indentation for
-           v3.4.0-v3.0.0); all --help lines now ≤80 characters for better terminal display
-  v3.19.0  SAFE FILE REPLACEMENT & UNGZL4 SUPPORT: -f now uses .tmp files with atomic rename on
-           success, protecting original from corruption if interrupted; SIGINT/SIGTERM cleanup temp
-           files; program name detection: "ungzl4" auto-enables decompression (-z overrides); two-
-           tier help: -h shows brief syntax, --help shows full documentation; -V shows version,
-           --version shows full details; all temp file operations reported at normal verbosity
-  v3.18.0  LZ4-COMPATIBLE -z FLAG: Fixed -z to work like standard lz4 tool; -z now forces
-           compression mode (ignores .lz4 extension auto-detection), allowing .lz4.lz4 files;
-           removed incorrect "force compressed output even if larger" behavior; always stores
-           smaller version (compressed or original); auto-detects decompression when input ends
-           with .lz4; warns when compressing .lz4 files without -z; matches lz4 CLI behavior
-  v3.17.1  UNIFIED VERBOSITY SYSTEM: Refactored verbosity into single 5-level system (0-4);
-           removed separate g_quiet flag and QLOG macro; -q sets level 0 (errors only), default
-           is level 1 (normal progress), -v/-vv/-vvv increment to 2/3/4; simpler, more standard
-           architecture; all output uses single VLOG macro; easier to maintain and extend
-  v3.17.0  QUIET MODE & PIPE CONVENIENCE: Added -q/--quiet flag to suppress all non-error
-           output (useful in scripts/pipes); proper EXIT_SUCCESS/EXIT_FAILURE return codes
-           on all paths; no-argument invocation automatically assumes pipe mode (stdin to
-           stdout) if stdout is not a tty, otherwise shows help; QLOG macro for conditional
+  v3.19.1  SIMPLIFIED VERSION OUTPUT: -V and --version now show same concise
+           output; moved
+           detailed backend/architecture info from version to --help for better
+           organization;
+           fixed compiler warning (unused parameter); removed outdated
+           decompression note;
+           fixed changelog formatting (removed extra newline, corrected
+           indentation for
+           v3.4.0-v3.0.0); all --help lines now ≤80 characters for better
+           terminal display
+  v3.19.0  SAFE FILE REPLACEMENT & UNGZL4 SUPPORT: -f now uses .tmp files with
+           atomic rename on
+           success, protecting original from corruption if interrupted;
+           SIGINT/SIGTERM cleanup temp
+           files; program name detection: "ungzl4" auto-enables decompression
+           (-z overrides); two-
+           tier help: -h shows brief syntax, --help shows full documentation; -V
+           shows version,
+           --version shows full details; all temp file operations reported at
+           normal verbosity
+  v3.18.0  LZ4-COMPATIBLE -z FLAG: Fixed -z to work like standard lz4 tool; -z
+           now forces
+           compression mode (ignores .lz4 extension auto-detection), allowing
+           .lz4.lz4 files;
+           removed incorrect "force compressed output even if larger" behavior;
+           always stores
+           smaller version (compressed or original); auto-detects decompression
+           when input ends
+           with .lz4; warns when compressing .lz4 files without -z; matches lz4
+           CLI behavior
+  v3.17.1  UNIFIED VERBOSITY SYSTEM: Refactored verbosity into single 5-level
+           system (0-4);
+           removed separate g_quiet flag and QLOG macro; -q sets level 0 (errors
+           only), default
+           is level 1 (normal progress), -v/-vv/-vvv increment to 2/3/4;
+           simpler, more standard
+           architecture; all output uses single VLOG macro; easier to maintain
+           and extend
+  v3.17.0  QUIET MODE & PIPE CONVENIENCE: Added -q/--quiet flag to suppress all
+           non-error
+           output (useful in scripts/pipes); proper EXIT_SUCCESS/EXIT_FAILURE
+           return codes
+           on all paths; no-argument invocation automatically assumes pipe mode
+           (stdin to
+           stdout) if stdout is not a tty, otherwise shows help; QLOG macro for
+           conditional
            output based on quiet flag
-  v3.16.4  REFINED TEST MODE OUTPUT: Removed "Testing: <filename>" start line; progress
-           and completion messages now show "Decompressing (test):" when in test mode;
+  v3.16.4  REFINED TEST MODE OUTPUT: Removed "Testing: <filename>" start line;
+           progress
+           and completion messages now show "Decompressing (test):" when in test
+           mode;
            cleaner, more consistent output across all decompression modes
-  v3.16.3  UNIFIED DECOMPRESSION OUTPUT: All decompression modes now show consistent output;
-           progress displays human-readable bytes instead of blocks; completion message
-           overwrites progress line using \r; test mode shows "Test OK: filename" on new
-           line after completion; removed "-> /dev/null" clutter from test mode output
-  v3.16.2  INTELLIGENT AUTO-TUNING: Batch size and stream count now auto-tune based on
-           GPU count; single GPU uses batch=64, streams=4 (RTX 5090: 1208 MB/s); 5+ GPUs
-           use batch=4, streams=3 (prevents PCIe flooding on multi-GPU); empirical tuning
-           based on RTX 5090 and 8× H100 testing; user can still override with flags
-  v3.16.1  EXPANDED TUNING RANGES: --batch-size cap raised from 128 to 1024 chunks;
-           --streams-per-gpu cap raised from 16 to 128 streams; enables future-proofing
+  v3.16.3  UNIFIED DECOMPRESSION OUTPUT: All decompression modes now show
+           consistent output;
+           progress displays human-readable bytes instead of blocks; completion
+           message
+           overwrites progress line using \r; test mode shows "Test OK:
+           filename" on new
+           line after completion; removed "-> /dev/null" clutter from test mode
+           output
+  v3.16.2  INTELLIGENT AUTO-TUNING: Batch size and stream count now auto-tune
+           based on
+           GPU count; single GPU uses batch=64, streams=4 (RTX 5090: 1208 MB/s);
+           5+ GPUs
+           use batch=4, streams=3 (prevents PCIe flooding on multi-GPU);
+           empirical tuning
+           based on RTX 5090 and 8× H100 testing; user can still override with
+           flags
+  v3.16.1  EXPANDED TUNING RANGES: --batch-size cap raised from 128 to 1024
+           chunks;
+           --streams-per-gpu cap raised from 16 to 128 streams; enables
+           future-proofing
            and fine-tuning for high-memory GPUs and evolving workloads
-  v3.16.0  NON-BLOCKING GPU WORKERS: Replaced cudaStreamSynchronize with cudaStreamQuery
-           polling; GPU workers never block waiting for streams to complete; continuously
-           launch batches on free slots while polling others; provides steady flow of
-           results to writer instead of bursty stop-and-go pattern; eliminates writer
-           starvation; achieves 1195 MB/s with batch-size 48 + streams 10 on RTX 5090
-  v3.15.2  CRITICAL PERFORMANCE FIX: Auto-tune pipeline depth based on GPU count;
+  v3.16.0  NON-BLOCKING GPU WORKERS: Replaced cudaStreamSynchronize with
+           cudaStreamQuery
+           polling; GPU workers never block waiting for streams to complete;
+           continuously
+           launch batches on free slots while polling others; provides steady
+           flow of
+           results to writer instead of bursty stop-and-go pattern; eliminates
+           writer
+           starvation; achieves 1195 MB/s with batch-size 48 + streams 10 on RTX
+           5090
+  v3.15.2  CRITICAL PERFORMANCE FIX: Auto-tune pipeline depth based on GPU
+           count;
            single GPU now uses 6 slots (was 1) to hide sync latency, restoring
            performance from 118 MB/s back to ~800 MB/s; multi-GPU uses 1 slot
-  v3.15.1  Unified progress output: writing progress added to CPU-only/Hybrid modes;
-           all "Compression complete" and "Decompression complete" messages now use
+  v3.15.1  Unified progress output: writing progress added to CPU-only/Hybrid
+           modes;
+           all "Compression complete" and "Decompression complete" messages now
+           use
            human-readable bytes (matching ls -h format)
-  v3.15.0  Progress output consistency: "Compressing: N% GPU: X CPU: Y" format across
-           all modes; "Writing: N% [X/Y to disk]" for writer phase; decompression
+  v3.15.0  Progress output consistency: "Compressing: N% GPU: X CPU: Y" format
+           across
+           all modes; "Writing: N% [X/Y to disk]" for writer phase;
+           decompression
            shows bytes processed; formatBytes() helper for human-readable sizes
-  v3.14.0  Hybrid mode v3: GPU-priority dispatcher; separate GPU/CPU work queues;
+  v3.14.0  Hybrid mode v3: GPU-priority dispatcher; separate GPU/CPU work
+           queues;
            GPUs get chunks first, CPUs only when GPUs saturated; all workers
            submit directly to thread-safe AsyncWriter (no central coordinator)
   v3.13.x  HC compression levels: -10/-11/-12 support via argv preprocessor;
            --hc-level 1-12 for explicit control; fixed hcLevel reset bug;
            removed duplicate help text; cleaned up output formatting
-  v3.12.x  Hybrid rewrite: unified worker model (same slot machinery as gpu-only);
+  v3.12.x  Hybrid rewrite: unified worker model (same slot machinery as
+           gpu-only);
            removed old scheduler-based architecture; direct writer submission
-  v3.11.x  GPU decompression via nvCOMP batched API (batch_size=1 for single blocks);
+  v3.11.x  GPU decompression via nvCOMP batched API (batch_size=1 for single
+           blocks);
            hybrid decompression with automatic CPU fallback on Error 12;
            pipe support (stdin/stdout via "-"); output message standardization;
            actualSize parameter fix; checksum seek position fix
   v3.10.x  Command-line tuning params: --batch-size (chunks/batch, default 8);
            --streams-per-gpu (pipeline depth, optimal=1); performance testing
            optimal config: cap=8, depth=1, 601 MB/s on 8GB test file
-  v3.9.x   GPU worker threads with per-slot rotation; parallel slot initialization;
+  v3.9.x   GPU worker threads with per-slot rotation; parallel slot
+           initialization;
            early reader startup (overlap with GPU init); writer greedy drain;
            PinnedInputPool for zero-copy DMA; double-read deadlock fix
   v3.8.0   Unified output across all modes; fadvise on all code paths;
@@ -7437,6 +7882,12 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
             g_verbosity = QUIET;
         }
 
+        // Content size: default off for stdin (size unknown), on for files.
+        // --content-size / --no-content-size override both cases.
+        if (!contentSizeExplicit && inputFile == "-") {
+            storeContentSize = false;
+        }
+
         // Chunk size is derived from the compression level  only meaningful when
         // compressing.  During decompression the real chunk size is read from the
         // LZ4 frame header; we still call this to set a sane default for the early
@@ -7444,6 +7895,8 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
         setChunkSizeFromLevel();
 
         // ── Start reading as early as possible ────────────────────────────────
+        // (skipped in --list mode; no GPU, no early reader needed)
+        if (!listMode) {
         // GPU context creation takes 1-4 s per machine. Start reading during
         // that window so the disk is never idle while we wait for CUDA.
         if (!decompress && backendMode != BackendMode::CPU_ONLY && !disableEarlyRead) {
@@ -7490,28 +7943,110 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
                  batchSize, (batchSize * chunkSize * 5) / (1024.0*1024.0*1024.0));
         }
 
-        // Perform operation
+        }  // end !listMode
+
+        // Perform operation  iterate over all positional file arguments
         bool success;
-        if (decompress) {
-            success = decompressFile();
+        if (listMode) {
+            // --list: iterate all files given on command line
+            printListHeader();
+            success = true;
+            for (auto& path : listFileArgs) {
+                if (!listFile(path)) success = false;
+            }
         } else {
-            success = compressFile();
+            // Build the full file list: first file + any extras
+            std::vector<std::string> allFiles;
+            allFiles.push_back(inputFile);
+            for (auto& f : extraInputFiles) allFiles.push_back(f);
+
+            // Save flags set by parseArguments (based on the first file).
+            // Per-file state (outputFile, decompress, tempOutputFile) is
+            // re-derived for each additional file.
+            const bool decompressFlag  = decompress;
+            const bool forceOverwriteF = forceOverwrite;
+            const bool keepOriginalF   = keepOriginal;
+            const bool testModeF       = testMode;
+            const bool stdoutModeF     = stdoutMode;
+
+            success = true;
+            for (size_t fi = 0; fi < allFiles.size(); fi++) {
+                // Reset per-file mutable state
+                inputFile      = allFiles[fi];
+                // outputFile and tempOutputFile: already set by parseArguments
+                // for fi==0; re-derived below for fi>0.
+                if (fi > 0) {
+                    outputFile        = "";
+                    tempOutputFile    = "";
+                    earlyReaderStarted = false;  // don't reuse spent early reader
+                }
+                decompress     = decompressFlag;
+                forceOverwrite = forceOverwriteF;
+                keepOriginal   = keepOriginalF;
+                testMode       = testModeF;
+                stdoutMode     = stdoutModeF;
+
+                // Per-file content-size default (off for stdin, on for files)
+                if (!contentSizeExplicit)
+                    storeContentSize = (inputFile != "-");
+
+                // For extra files (fi > 0) re-derive output path and auto-detect
+                if (fi > 0) {
+                    struct stat st;
+                    if (stat(inputFile.c_str(), &st) != 0) {
+                        fprintf(stderr, "Error: Cannot stat '%s': %s\n",
+                                inputFile.c_str(), strerror(errno));
+                        success = false; continue;
+                    }
+                    bool hasLz4Ext = (inputFile.size() > 4 &&
+                        inputFile.substr(inputFile.size()-4) == ".lz4");
+                    // Auto-detect decompress from extension unless -d/-z forced it
+                    if (!forceMode)
+                        decompress = hasLz4Ext;
+                    // Derive output filename
+                    if (stdoutMode) {
+                        outputFile = "-";
+                    } else if (decompress) {
+                        if (!hasLz4Ext) {
+                            fprintf(stderr,
+                                "Error: '%s' has no .lz4 extension; skipping\n",
+                                inputFile.c_str());
+                            success = false; continue;
+                        }
+                        outputFile = inputFile.substr(0, inputFile.size()-4);
+                    } else {
+                        outputFile = inputFile + ".lz4";
+                    }
+                    // No-clobber check
+                    if (!testMode && !forceOverwrite && !stdoutMode &&
+                            stat(outputFile.c_str(), &st) == 0) {
+                        fprintf(stderr,
+                            "Error: Output already exists: %s (use -f to overwrite)\n",
+                            outputFile.c_str());
+                        success = false; continue;
+                    }
+                    if (forceOverwrite && !stdoutMode && !testMode)
+                        tempOutputFile = outputFile + ".tmp";
+                }
+
+                // Process this file
+                bool fileOk = decompress ? decompressFile() : compressFile();
+
+                // Rename temp -> final on success; cleanup on failure
+                if (fileOk && !tempOutputFile.empty())
+                    fileOk = renameTempToFinal();
+                if (!fileOk) {
+                    cleanupTempFile();
+                    success = false;
+                }
+                // Continue processing remaining files regardless of this failure
+            }
         }
 
         // Synchronize all GPUs
         for (size_t i = 0; i < gpus.size(); i++) {
             cudaSetDevice(gpus[i].deviceId);
             cudaDeviceSynchronize();
-        }
-
-        // On success, rename temp file to final name (if using temp file)
-        if (success && !tempOutputFile.empty()) {
-            success = renameTempToFinal();
-        }
-        
-        // On failure, cleanup temp file
-        if (!success) {
-            cleanupTempFile();
         }
 
         return success;

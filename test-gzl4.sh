@@ -672,12 +672,12 @@ cp "$DATA/small.txt" src.txt
 
 # Without -k, original is removed after compress
 run_gzl4 src.txt || true
-check_file_absent   "11.01  compress without -k removes original"   "src.txt"
+check_file_absent   "src.txt"             "11.01  compress without -k removes original"
 check_file_exists   "src.txt.lz4"             "11.02  compress creates .lz4"
 
 # Without -k, original is removed after decompress
 run_gzl4 src.txt.lz4 || true
-check_file_absent   "11.03  decompress without -k removes .lz4"     "src.txt.lz4"
+check_file_absent   "src.txt.lz4"         "11.03  decompress without -k removes .lz4"
 check_file_exists   "src.txt"                 "11.04  decompress restores original"
 
 # -k keeps both
@@ -865,6 +865,265 @@ if ! "$GZL4" --bad-option-xyz 2>/dev/null; then
     pass "15.07  unknown option exits non-zero"
 else
     fail "15.07  unknown option exits non-zero" "should have returned non-zero"
+fi
+
+# =============================================================================
+# 16. --content-size / --no-content-size
+# =============================================================================
+section "16. --content-size / --no-content-size"
+
+W="$(mkwork s16)"; cd "$W"
+cp "$DATA/small.txt" src.txt
+
+# Compress with --content-size: FLG byte bit 3 (0x08) should be set.
+# LZ4 frame layout: magic(4) FLG(1) ...  FLG is byte offset 4 (0-indexed).
+# Use -c so gzl4_to captures the output via stdout.
+gzl4_to with_cs.lz4 -c --cpu-only --content-size src.txt || true
+if [[ -f with_cs.lz4 ]]; then
+    flg=$(od -An -tx1 -j4 -N1 with_cs.lz4 | tr -d ' \n')
+    bit3=$(( 0x$flg & 0x08 ))
+    if [[ $bit3 -ne 0 ]]; then pass "16.01  --content-size sets C_SIZE bit in FLG"
+    else fail "16.01  --content-size sets C_SIZE bit in FLG" \
+              "FLG=0x$flg, bit 3 not set"; fi
+else
+    fail "16.01  --content-size sets C_SIZE bit in FLG" "compression failed"
+fi
+
+# Compress with --no-content-size: FLG bit 3 should be clear.
+gzl4_to no_cs.lz4 -c --cpu-only --no-content-size src.txt || true
+if [[ -f no_cs.lz4 ]]; then
+    flg=$(od -An -tx1 -j4 -N1 no_cs.lz4 | tr -d ' \n')
+    bit3=$(( 0x$flg & 0x08 ))
+    if [[ $bit3 -eq 0 ]]; then pass "16.02  --no-content-size clears C_SIZE bit in FLG"
+    else fail "16.02  --no-content-size clears C_SIZE bit in FLG" \
+              "FLG=0x$flg, bit 3 unexpectedly set"; fi
+else
+    fail "16.02  --no-content-size clears C_SIZE bit in FLG" "compression failed"
+fi
+
+# Default file mode should embed content size (bit 3 set)
+# Use -c so gzl4_to captures output; src.txt is preserved for later tests.
+gzl4_to default_cs.lz4 -c --cpu-only src.txt || true
+if [[ -f default_cs.lz4 ]]; then
+    flg=$(od -An -tx1 -j4 -N1 default_cs.lz4 | tr -d ' \n')
+    bit3=$(( 0x$flg & 0x08 ))
+    if [[ $bit3 -ne 0 ]]; then pass "16.03  file mode default embeds content size"
+    else fail "16.03  file mode default embeds content size" \
+              "FLG=0x$flg, bit 3 not set"; fi
+else
+    fail "16.03  file mode default embeds content size" "compression failed"
+fi
+
+# Pipe mode default should NOT embed content size (bit 3 clear)
+gzl4_to pipe_cs.lz4 --cpu-only < src.txt || true
+if [[ -f pipe_cs.lz4 ]]; then
+    flg=$(od -An -tx1 -j4 -N1 pipe_cs.lz4 | tr -d ' \n')
+    bit3=$(( 0x$flg & 0x08 ))
+    if [[ $bit3 -eq 0 ]]; then pass "16.04  pipe mode default omits content size"
+    else fail "16.04  pipe mode default omits content size" \
+              "FLG=0x$flg, bit 3 set in pipe mode"; fi
+else
+    fail "16.04  pipe mode default omits content size" "compression failed"
+fi
+
+# Roundtrip: --no-content-size output still decompresses correctly
+gzl4_to nocs_out.txt -dc no_cs.lz4 || true
+check_files_equal "16.05  --no-content-size roundtrip" "$DATA/small.txt" nocs_out.txt
+
+# =============================================================================
+# 17. --list
+# =============================================================================
+section "17. --list"
+
+W="$(mkwork s17)"; cd "$W"
+
+# Create a file with known content size embedded
+gzl4_to known.lz4 -c --cpu-only --content-size "$DATA/small.txt" || true
+# Create a file without content size
+gzl4_to unknown.lz4 -c --cpu-only --no-content-size "$DATA/small.txt" || true
+
+# --list exits 0 on valid file
+if [[ -f known.lz4 ]]; then
+    if "$GZL4" --list known.lz4 >/dev/null 2>&1; then
+        pass "17.01  --list exits 0 on valid .lz4"
+    else
+        fail "17.01  --list exits 0 on valid .lz4" "exit non-zero"
+    fi
+else
+    skip "17.01  --list exits 0 on valid .lz4" "compression failed"
+fi
+
+# --list output contains expected column header
+if [[ -f known.lz4 ]]; then
+    list_out=$("$GZL4" --list known.lz4 2>/dev/null)
+    if echo "$list_out" | grep -q "Frames"; then
+        pass "17.02  --list output has Frames header"
+    else
+        fail "17.02  --list output has Frames header" "header not found in: $list_out"
+    fi
+else
+    skip "17.02  --list output has Frames header" "no input file"
+fi
+
+# --list shows uncompressed size when content-size is present
+if [[ -f known.lz4 ]]; then
+    list_out=$("$GZL4" --list known.lz4 2>/dev/null)
+    # Should NOT contain N/A in the Uncompressed column
+    data_line=$(echo "$list_out" | grep -v "^Frames" | head -1)
+    uncomp=$(echo "$data_line" | awk '{print $5}')
+    if [[ "$uncomp" != "N/A" && -n "$uncomp" ]]; then
+        pass "17.03  --list shows uncompressed size when C_SIZE present"
+    else
+        fail "17.03  --list shows uncompressed size when C_SIZE present" \
+             "got: '$data_line'"
+    fi
+else
+    skip "17.03  --list shows uncompressed size when C_SIZE present" "no input file"
+fi
+
+# --list shows N/A for uncompressed when no content-size
+if [[ -f unknown.lz4 ]]; then
+    list_out=$("$GZL4" --list unknown.lz4 2>/dev/null)
+    if echo "$list_out" | grep -q "N/A"; then
+        pass "17.04  --list shows N/A when C_SIZE absent"
+    else
+        fail "17.04  --list shows N/A when C_SIZE absent" \
+             "N/A not found in: $list_out"
+    fi
+else
+    skip "17.04  --list shows N/A when C_SIZE absent" "no input file"
+fi
+
+# --list shows LZ4Frame type
+if [[ -f known.lz4 ]]; then
+    if "$GZL4" --list known.lz4 2>/dev/null | grep -q "LZ4Frame"; then
+        pass "17.05  --list shows LZ4Frame type"
+    else
+        fail "17.05  --list shows LZ4Frame type" "LZ4Frame not in output"
+    fi
+else
+    skip "17.05  --list shows LZ4Frame type" "no input file"
+fi
+
+# --list shows block descriptor (B<n>I or B<n>D format)
+if [[ -f known.lz4 ]]; then
+    if "$GZL4" --list known.lz4 2>/dev/null | grep -qE "B[4-7][ID]"; then
+        pass "17.06  --list shows block descriptor (B<n>I/D)"
+    else
+        fail "17.06  --list shows block descriptor (B<n>I/D)" "pattern not found"
+    fi
+else
+    skip "17.06  --list shows block descriptor (B<n>I/D)" "no input file"
+fi
+
+# --list with multiple files: single header, one row per file
+if [[ -f known.lz4 && -f unknown.lz4 ]]; then
+    list_out=$("$GZL4" --list known.lz4 unknown.lz4 2>/dev/null)
+    header_count=$(echo "$list_out" | grep -c "^Frames")
+    data_count=$(echo "$list_out" | grep -v "^Frames" | grep -c "LZ4Frame")
+    if [[ $header_count -eq 1 && $data_count -eq 2 ]]; then
+        pass "17.07  --list multiple files: 1 header, 2 data rows"
+    else
+        fail "17.07  --list multiple files: 1 header, 2 data rows" \
+             "headers=$header_count data=$data_count"
+    fi
+else
+    skip "17.07  --list multiple files: 1 header, 2 data rows" "missing input files"
+fi
+
+# --list -v shows per-frame detail (frame<n> rows)
+if [[ -f known.lz4 ]]; then
+    if "$GZL4" --list -v known.lz4 2>/dev/null | grep -q "frame"; then
+        pass "17.08  --list -v shows per-frame rows"
+    else
+        fail "17.08  --list -v shows per-frame rows" "no frame rows in -v output"
+    fi
+else
+    skip "17.08  --list -v shows per-frame rows" "no input file"
+fi
+
+# --list on non-.lz4 file exits non-zero
+if ! "$GZL4" --list "$DATA/small.txt" >/dev/null 2>&1; then
+    pass "17.09  --list on non-lz4 file exits non-zero"
+else
+    fail "17.09  --list on non-lz4 file exits non-zero" "should have failed"
+fi
+
+# =============================================================================
+# 18. Multi-file command line
+# =============================================================================
+section "18. Multi-file command line"
+
+W="$(mkwork s18)"; cd "$W"
+cp "$DATA/small.txt" file1.txt
+cp "$DATA/small.bin" file2.bin
+cp "$DATA/small.txt" file3.txt
+
+# Compress multiple files in one invocation
+run_gzl4 --cpu-only -k file1.txt file2.bin file3.txt || true
+check_file_exists "file1.txt.lz4" "18.01  multi-file: file1.txt.lz4 created"
+check_file_exists "file2.bin.lz4" "18.02  multi-file: file2.bin.lz4 created"
+check_file_exists "file3.txt.lz4" "18.03  multi-file: file3.txt.lz4 created"
+
+# Originals kept (-k)
+check_file_exists "file1.txt" "18.04  multi-file -k: file1.txt kept"
+check_file_exists "file2.bin" "18.05  multi-file -k: file2.bin kept"
+
+# Decompress multiple files in one invocation
+run_gzl4 -d --cpu-only -k file1.txt.lz4 file2.bin.lz4 file3.txt.lz4 || true
+check_files_equal "18.06  multi-file decompress: file1.txt roundtrip" \
+    "$DATA/small.txt" file1.txt
+check_files_equal "18.07  multi-file decompress: file2.bin roundtrip" \
+    "$DATA/small.bin" file2.bin
+check_files_equal "18.08  multi-file decompress: file3.txt roundtrip" \
+    "$DATA/small.txt" file3.txt
+
+# Auto-detect per file: mixed list (compress .txt, decompress .lz4)
+cp "$DATA/small.txt" auto_src.txt
+gzl4_to auto_pre.lz4 -c --cpu-only -k "$DATA/small.bin" || true
+mv auto_pre.lz4 auto_src2.lz4
+run_gzl4 --cpu-only -k auto_src.txt auto_src2.lz4 || true
+check_file_exists "auto_src.txt.lz4" \
+    "18.09  auto-detect: .txt was compressed"
+check_file_exists "auto_src2"        \
+    "18.10  auto-detect: .lz4 was decompressed"
+
+# No-clobber: second file already exists, should error but first still succeeds
+cp "$DATA/small.txt" nc1.txt
+cp "$DATA/small.txt" nc2.txt
+touch nc2.txt.lz4   # pre-create to trigger no-clobber on second file
+if ! run_gzl4 --cpu-only -k nc1.txt nc2.txt 2>/dev/null; then
+    pass "18.11  multi-file no-clobber: exits non-zero when output exists"
+else
+    fail "18.11  multi-file no-clobber: exits non-zero when output exists" \
+         "should have returned non-zero"
+fi
+check_file_exists "nc1.txt.lz4" \
+    "18.12  multi-file no-clobber: first file still processed"
+
+# -c (stdout) rejected with multiple files
+if ! run_gzl4 -c --cpu-only file1.txt file2.bin 2>/dev/null; then
+    pass "18.13  -c with multiple files exits non-zero"
+else
+    fail "18.13  -c with multiple files exits non-zero" \
+         "should have rejected -c + multi-file"
+fi
+
+# -c error message mentions incompatibility
+err_msg=$("$GZL4" -c --cpu-only file1.txt file2.bin 2>&1 || true)
+if echo "$err_msg" | grep -qi "not compatible\|incompatible"; then
+    pass "18.14  -c multi-file error message is descriptive"
+else
+    fail "18.14  -c multi-file error message is descriptive" \
+         "got: $err_msg"
+fi
+
+# -t (test) on multiple files: all pass
+run_gzl4 -t --cpu-only file1.txt.lz4 file2.bin.lz4 file3.txt.lz4 || true
+if run_gzl4 -t --cpu-only file1.txt.lz4 file2.bin.lz4 file3.txt.lz4 2>/dev/null; then
+    pass "18.15  -t on multiple valid files exits 0"
+else
+    fail "18.15  -t on multiple valid files exits 0" "exit non-zero"
 fi
 
 # =============================================================================
