@@ -45,7 +45,7 @@
 #include <signal.h>
 
 // Configuration constants
-constexpr const char* VERSION = "3.26.5";
+constexpr const char* VERSION = "3.26.6";
 
 // Compression backend modes
 enum class BackendMode {
@@ -1258,7 +1258,7 @@ public:
             outputFd = STDOUT_FILENO;
             isPipe    = true;
             flushSize = 4ULL * 1024 * 1024;  // 4 MB for pipes: low latency over throughput
-            VLOG(VERBOSE, "AsyncWriter: writing blocks to stdout (pipe mode, 4 MB flush)\n");
+            VLOG(VERBOSE, "AsyncWriter: writing chunks to stdout (pipe mode, 4 MB flush)\n");
         } else {
             // Open file with O_APPEND since header was already written by main thread
             outputFd = open(filename.c_str(), O_WRONLY | O_APPEND, 0644);
@@ -1271,7 +1271,7 @@ public:
             // Also check dynamically (e.g. redirected to /dev/null or a fifo)
             isPipe    = (lseek(outputFd, 0, SEEK_CUR) < 0);
             flushSize = isPipe ? 4ULL * 1024 * 1024 : WRITE_BUF_SIZE;
-            VLOG(VERBOSE, "AsyncWriter: opened %s for appending blocks%s\n",
+            VLOG(VERBOSE, "AsyncWriter: opened %s for appending chunks%s\n",
                  filename.c_str(), isPipe ? " (pipe/fifo)" : "");
         }
         
@@ -1661,9 +1661,9 @@ private:
     
 public:
     GZL4Compressor() 
-        : chunkSize(CHUNK_SIZE_LEVEL_9)
+        : chunkSize(CHUNK_SIZE_LEVEL_1)
         , batchSize(1)
-        , compressionLevel(9)
+        , compressionLevel(1)
         , decompress(false)
         , keepOriginal(false)
         , forceOverwrite(false)
@@ -2681,7 +2681,7 @@ public:
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
         VLOG(VERBOSE, "  Read:    %.2f s  |  CPU compress (%zu threads): %.2f s  |  Write: %.2f s\n",
              cpuReadTime, effectiveThreads, timeCompressing, cpuWriteTime);
-        VLOG(VERBOSE, "  Uncompressed blocks: %zu / %zu (%.1f%%)\n",
+        VLOG(VERBOSE, "  Uncompressed chunks: %zu / %zu (%.1f%%)\n",
              chunksExpanded, numChunks, 100.0 * chunksExpanded / numChunks);
         
         if (!keepOriginal && !stdoutMode) {
@@ -2707,6 +2707,9 @@ public:
                 CC_BCYAN, CC_RESET,
                 gpus.size(), gpus.size()==1?"":"s",
                 inputFile.c_str(), outputFile.c_str());
+        if (hcLevel > 0)
+            fprintf(stderr, "Note: --best / HC compression is not supported by nvCOMP; "
+                            "GPU path uses fast LZ4 (-9). Use --hybrid or --cpu-only for HC.\n");
         
         // Get file size (0 = unknown, e.g. stdin pipe)
         const bool stdinMode = (inputFile == "-");
@@ -4011,7 +4014,7 @@ public:
         // Always allocate at least 1 slot so block 0 never OOBs on tiny/empty files.
         if (estimatedBlocks == 0) estimatedBlocks = 1;
 
-        VLOG(VERBOSE, "  %.2f MB  |  block size %zu KB  |  ~%zu blocks\n",
+        VLOG(VERBOSE, "  %.2f MB  |  chunk size %zu KB  |  ~%zu chunks\n",
              originalFileSize / (1024.0*1024.0), chunkSize / 1024, estimatedBlocks);
         
         XXH::State xxhState(XXH32_SEED);
@@ -4240,7 +4243,7 @@ public:
                 VLOG(VERBOSE, "GPU%zu: allocated %zu/%zu decompression slots (VRAM limited)\n",
                      gpuIdx, allocatedSlots, N_STREAMS);
             } else {
-                VLOG(VERBOSE, "GPU%zu: %zu streams × %zu blocks/batch, ~%.0f MB VRAM + ~%.0f MB pinned\n",
+                VLOG(VERBOSE, "GPU%zu: %zu streams × %zu chunks/batch, ~%.0f MB VRAM + ~%.0f MB pinned\n",
                      gpuIdx, N_STREAMS, SC,
                      N_STREAMS * SC * (maxCompSize + chunkSize + tempBytes) / (1024.0*1024.0),
                      N_STREAMS * SC * chunkSize / (1024.0*1024.0));
@@ -4490,7 +4493,7 @@ public:
                     std::chrono::steady_clock::now() - rt0).count());
                 if (nr == 0) break;  // clean EOF
                 if (nr != 4) {
-                    fprintf(stderr, "Error: truncated block-size field at block %zu\n",
+                    fprintf(stderr, "Error: truncated chunk-size field at chunk %zu\n",
                             blockIdx);
                     decompError = true; break;
                 }
@@ -4502,7 +4505,7 @@ public:
                 uint32_t blockSize = blockSize32 & 0x7FFFFFFFu;
 
                 if (blockSize > 128u * 1024 * 1024) {
-                    fprintf(stderr, "Error: implausibly large block %u at block %zu\n",
+                    fprintf(stderr, "Error: implausibly large chunk %u at chunk %zu\n",
                             blockSize, blockIdx);
                     decompError = true; break;
                 }
@@ -4511,7 +4514,7 @@ public:
                 {
                     auto rt1 = std::chrono::steady_clock::now();
                     if (::read(inputFd, raw.data(), blockSize) != (ssize_t)blockSize) {
-                        fprintf(stderr, "Error: truncated block data at block %zu\n",
+                        fprintf(stderr, "Error: truncated chunk data at chunk %zu\n",
                                 blockIdx);
                         decompError = true; break;
                     }
@@ -4637,7 +4640,7 @@ public:
                     auto wt0 = std::chrono::steady_clock::now();
                     if (::write(outputFd, blk.data.data(), blk.data.size())
                             != (ssize_t)blk.data.size()) {
-                        fprintf(stderr, "Error: write failed at block %zu\n",
+                        fprintf(stderr, "Error: write failed at chunk %zu\n",
                                 nextBlockToWrite);
                         decompError = true;
                     }
@@ -4776,7 +4779,7 @@ public:
             VLOG(VERBOSE, "  Time: %.2f s  Throughput: %.2f MB/s\n",
                  duration.count() / 1000.0,
                  (totalBytesWritten / (1024.0*1024.0)) / (duration.count() / 1000.0));
-            VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback blocks: %zu\n",
+            VLOG(VERBOSE, "  GPU chunks: %zu  CPU-fallback chunks: %zu\n",
                  gpuBlocks.load(), cpuFallbackBlocks.load());
         } else {
             double mbps = (totalBytesWritten / (1024.0*1024.0)) / (duration.count() / 1000.0);
@@ -4786,7 +4789,7 @@ public:
                     CC_BGREEN, outputSize.c_str(), CC_RESET,
                     duration.count() / 1000.0, "          ");
             VLOG(VERBOSE, "Throughput: %.2f MB/s\n", mbps);
-            VLOG(VERBOSE, "  GPU blocks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
+            VLOG(VERBOSE, "  GPU chunks: %zu  CPU-fallback: %zu  pass-through: %zu\n",
                  gpuBlocks.load(), cpuFallbackBlocks.load(),
                  nextBlockToWrite - gpuBlocks.load() - cpuFallbackBlocks.load());
             VLOG(VERBOSE, "  Timing breakdown:\n");
@@ -4795,7 +4798,7 @@ public:
                  writeUs / 1e6, nextBlockToWrite,
                  writeUs / 1e3 / std::max(size_t(1), nextBlockToWrite));
             VLOG(VERBOSE, "    wait(result stall):%6.3f s\n",  waitUs / 1e6);
-            VLOG(VERBOSE, "    drain efficiency:  %.2f blocks/call  (max out-of-order: %zu blocks)\n",
+            VLOG(VERBOSE, "    drain efficiency:  %.2f chunks/call  (max out-of-order: %zu chunks)\n",
                  drainCalls > 0 ? (double)drainBlocks / drainCalls : 0.0,
                  maxPending);
         }
@@ -4937,7 +4940,7 @@ public:
                     effectiveThreads,  effectiveThreads  == 1 ? "" : "s",
                     inputFile.c_str(), outputFile.c_str());
         }
-        VLOG(VERBOSE, "  %.2f MB  |  block size %zu KB  |  ~%zu blocks\n",
+        VLOG(VERBOSE, "  %.2f MB  |  chunk size %zu KB  |  ~%zu chunks\n",
              originalFileSize / (1024.0*1024.0), chunkSize/1024, estimatedBlocks);
 
         // Open output
@@ -5054,21 +5057,21 @@ public:
                     break;
                 }
                 if (nr != 4) {
-                    fprintf(stderr, "Dispatcher: short read at block %zu\n", blockIdx);
+                    fprintf(stderr, "Dispatcher: short read at chunk %zu\n", blockIdx);
                     decompError = true; break;
                 }
 
                 bool isUncomp = (bs32 & 0x80000000u) != 0;
                 uint32_t bs   =  bs32 & 0x7FFFFFFFu;
                 if (bs > 128u * 1024 * 1024) {
-                    fprintf(stderr, "Error: implausibly large block %u at block %zu\n",
+                    fprintf(stderr, "Error: implausibly large chunk %u at chunk %zu\n",
                             bs, blockIdx);
                     decompError = true; break;
                 }
 
                 std::vector<uint8_t> raw(bs);
                 if (::read(inputFd, raw.data(), bs) != (ssize_t)bs) {
-                    fprintf(stderr, "Error: truncated block data at block %zu\n", blockIdx);
+                    fprintf(stderr, "Error: truncated chunk data at chunk %zu\n", blockIdx);
                     decompError = true; break;
                 }
                 readBytesRead.fetch_add(4 + bs, std::memory_order_relaxed);
@@ -5219,7 +5222,7 @@ public:
             }
 
             const size_t allocatedSlots = slots.size();
-            VLOG(VERBOSE, "Hybrid GPU%zu: %zu/%zu streams × %zu blocks, "
+            VLOG(VERBOSE, "Hybrid GPU%zu: %zu/%zu streams × %zu chunks, "
                  "~%.0f MB VRAM + %.0f MB pinned host\n",
                  gpuIdx, allocatedSlots, N_STREAMS_H, SC,
                  allocatedSlots * perStreamVRAM / (1024.0*1024.0),
@@ -5529,7 +5532,7 @@ public:
                 if (outputFd >= 0 &&
                     ::write(outputFd, blk.data.data(), blk.data.size())
                         != (ssize_t)blk.data.size()) {
-                    fprintf(stderr, "Warning: write error at block %zu\n",
+                    fprintf(stderr, "Warning: write error at chunk %zu\n",
                             nextBlockToWrite);
                     decompError = true;
                 }
@@ -5590,7 +5593,7 @@ public:
             if (outputFd >= 0 &&
                 ::write(outputFd, blk.data.data(), blk.data.size())
                     != (ssize_t)blk.data.size())
-                fprintf(stderr, "Warning: write error in final flush block %zu\n",
+                fprintf(stderr, "Warning: write error in final flush chunk %zu\n",
                         nextBlockToWrite);
             totalBytesWritten += blk.data.size();
             blk.data.clear();
@@ -5660,14 +5663,14 @@ public:
                     CC_BGREEN, outputSize.c_str(), CC_RESET,
                     duration.count() / 1000.0, "          ");
         }
-        VLOG(VERBOSE, "  GPU: %zu blocks (%.1f%%)  CPU: %zu blocks (%.1f%%)"
+        VLOG(VERBOSE, "  GPU: %zu chunks (%.1f%%)  CPU: %zu chunks (%.1f%%)"
              "  pass-through: %zu  throughput: %.2f MB/s\n",
              gpuBlocks.load(),
              nextBlockToWrite > 0 ? 100.0 * gpuBlocks.load()  / nextBlockToWrite : 0.0,
              cpuBlocks.load(),
              nextBlockToWrite > 0 ? 100.0 * cpuBlocks.load()  / nextBlockToWrite : 0.0,
              passthroughBlocks, mbps);
-        VLOG(VERBOSE, "  Result store: max out-of-order depth: %zu blocks\n",
+        VLOG(VERBOSE, "  Result store: max out-of-order depth: %zu chunks\n",
              maxPending);
 
         if (!keepOriginal && !stdoutMode && !testMode)
@@ -5740,7 +5743,7 @@ public:
                     numWorkers, numWorkers == 1 ? "" : "s",
                     inputFile.c_str(), outputFile.c_str());
         }
-        VLOG(VERBOSE, "  %.2f MB source  |  block size %zu KB  |  ~%zu blocks\n",
+        VLOG(VERBOSE, "  %.2f MB source  |  chunk size %zu KB  |  ~%zu chunks\n",
              originalFileSize/(1024.0*1024.0), chunkSize/1024, estimatedBlocks);
         VLOG(VERBOSE, "CPU decompression: %zu worker threads\n", numWorkers);
 
@@ -5837,7 +5840,7 @@ public:
                 bool isUncomp = (rawSz & 0x80000000) != 0;
                 uint32_t bsz  =  rawSz & 0x7FFFFFFF;
                 if (bsz > 256*1024*1024) {
-                    fprintf(stderr, "Implausible blockSize=%u at block %zu\n",
+                    fprintf(stderr, "Implausible chunk size=%u at chunk %zu\n",
                             bsz, blockIdx);
                     readError.store(true); break;
                 }
@@ -5848,7 +5851,7 @@ public:
                 blk.data.resize(bsz);
                 n = ::read(inputFd, blk.data.data(), bsz);
                 if (n != (ssize_t)bsz) {
-                    fprintf(stderr, "Short read block %zu: wanted %u got %zd\n",
+                    fprintf(stderr, "Short read chunk %zu: wanted %u got %zd\n",
                             blk.blockIdx, bsz, n);
                     readError.store(true); break;
                 }
@@ -6132,12 +6135,12 @@ public:
             VLOG(VERBOSE, "  Throughput: %.2f MB/s  |  checksum: 0x%08X\n",
                  mbps, checksum);
             VLOG(VERBOSE, "  Timing breakdown:\n");
-            VLOG(VERBOSE, "    write(decomp out): %6.3f s  (%zu blocks, avg %.2f ms each)\n",
+            VLOG(VERBOSE, "    write(decomp out): %6.3f s  (%zu chunks, avg %.2f ms each)\n",
                  writeUs / 1e6, nextBlockToWrite,
                  writeUs / 1e3 / std::max(size_t(1), nextBlockToWrite));
             VLOG(VERBOSE, "    wait(result stall):%6.3f s\n", waitUs / 1e6);
-            VLOG(VERBOSE, "    drain efficiency:  %.2f blocks/call"
-                 "  (high-water pending: %zu blocks)\n",
+            VLOG(VERBOSE, "    drain efficiency:  %.2f chunks/call"
+                 "  (high-water pending: %zu chunks)\n",
                  drainCalls > 0 ? (double)nextBlockToWrite / drainCalls : 0.0,
                  maxPending);
         }
@@ -6242,7 +6245,7 @@ public:
             {"verbose", no_argument, nullptr, 'v'},
             {"version", no_argument, nullptr, 2001},  // --version shows full version
             {"fast", no_argument, nullptr, '1'},
-            {"best", no_argument, nullptr, '9'},
+            {"best", no_argument, nullptr, 1013},  // --best: HC-12 on CPU, -9 on GPU
             {"cpu-only", no_argument, nullptr, 1001},
             {"gpu-only", no_argument, nullptr, 1002},
             {"hybrid", no_argument, nullptr, 1003},
@@ -6383,6 +6386,13 @@ public:
                 case 1009:  // --change-log
                     printChangelog();
                     earlyExit = true; return false;
+                case 1013:  // --best: maximum compression
+                    // CPU/hybrid workers use HC level 12; GPU falls back to -9 fast LZ4
+                    // (nvCOMP has no HC equivalent  a warning is emitted at runtime).
+                    compressionLevel = 9;   // 4 MB chunks (max for LZ4 frame)
+                    hcLevel = 12;
+                    VLOG(DEBUG, "--best: compressionLevel=9, hcLevel=12\n");
+                    break;
                 case 1012:  // --list: display frame metadata
                     listMode = true;
                     break;
@@ -6530,7 +6540,7 @@ Common options:
   -t            test integrity
   -v            verbose (-vv, -vvv for more)
   -z            force compression (even if .lz4)
-  -1 to -9      compression level (default: -9)
+  -1 to -9      compression level (default: -1)
   -10 to -12    LZ4 High Compression (CPUs only)
   -V            show version (use --version for full details)
 
@@ -6600,10 +6610,12 @@ MULTI-FILE
   Note: -c (--stdout) is not compatible with multiple files.
 
 COMPRESSION LEVELS
-  -1 .. -9             LZ4 fast compression (default: -9)
-    -1 / --fast          256 KB chunks (fastest, lowest ratio)
+  -1 .. -9             LZ4 fast compression (default: -1)
+    -1 / --fast          256 KB chunks (default; fastest, best ratio on most data)
     -5                     2 MB chunks
-    -9 / --best            4 MB chunks (best ratio, LZ4 frame max)
+    -9                     4 MB chunks (largest chunks, LZ4 frame max)
+  --best                 HC level 12 on CPU workers + 4 MB chunks on GPU
+                         (maximum compression; slower than -1 .. -9)
   -10 / -11 / -12      LZ4 HC high compression (CPU workers only)
     -10                  HC level  4 (moderate)
     -11                  HC level  8 (strong)
@@ -7049,6 +7061,21 @@ Built with nvCOMP 5.1.x, CUDA 12.8, liblz4)" << std::endl;
     void printChangelog() {
         std::cout << "gzl4 " << VERSION << " - Changelog\n\n"
             R"CL(Changelog:
+  v3.26.6  Default compression level changed from -9 to -1; --best now
+           implements true maximum compression.
+
+           Default level: benchmarking showed -1 (256 KB chunks) is both
+           faster and produces smaller output than -9 (4 MB chunks) across
+           all backends. LZ4's hash table is diluted at larger chunk sizes.
+
+           --best: previously an alias for -9 (4 MB chunks, fast LZ4).
+           Now sets HC level 12 on CPU workers (LZ4_compress_HC, exhaustive
+           match search) with 4 MB chunks. In --hybrid mode the GPU handles
+           chunks with fast LZ4 while CPU workers use HC-12. In --gpu-only
+           mode a warning is printed and fast LZ4 is used (nvCOMP has no
+           HC equivalent). Use --hybrid --best or --cpu-only --best for
+           true maximum compression.
+
   v3.26.5  Feature: multi-file command line (compress/decompress N files).
 
            Multiple positional arguments are now accepted:
