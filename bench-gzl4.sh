@@ -15,6 +15,9 @@
 #   --quick         shorter sweep
 #   --no-hc         skip HC levels (-10/-11/-12)
 #   --no-gpu        skip GPU backends
+#   --sparse        use zero-heavy synthetic data to exercise sparse-write
+#                   and zero-chunk routing optimisations (alternating
+#                   256 MB zero / 256 MB random blocks)
 #   --help
 # =============================================================================
 set -uo pipefail
@@ -32,7 +35,6 @@ WHT=$'\033[1;37m'
 MGN=$'\033[1;35m'
 
 # ── All display goes to stderr so \r overwrites work on a single stream ────────
-# Redirect our own stdout to stderr; real data (JSON path) uses fd3.
 exec 3>&1 1>&2
 
 # ── Ctrl-C / cleanup ──────────────────────────────────────────────────────────
@@ -43,7 +45,6 @@ cleanup() {
     echo ""
     echo ""
     echo "  ${YLW}⚠  Interrupted  cleaning up${R}"
-    # Kill any running gzl4 child
     [[ -n "$CHILD_PID" ]] && kill "$CHILD_PID" 2>/dev/null || true
     [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR"
     exit 130
@@ -60,6 +61,7 @@ OUT_JSON=""
 QUICK=0
 NO_HC=0
 NO_GPU=0
+SPARSE=0       # --sparse: generate zero-heavy synthetic data
 
 usage() {
     cat <<EOF
@@ -74,6 +76,11 @@ ${BOLD}bench_gzl4.sh${R}  gzl4 performance sweep
   ${CYN}--quick${R}        shorter sweep
   ${CYN}--no-hc${R}        skip HC levels
   ${CYN}--no-gpu${R}       skip GPU backends
+  ${CYN}--sparse${R}       zero-heavy data: exercises sparse-write (decompress)
+                 and zero-chunk GPU bypass (hybrid compress).
+                 Generates alternating 256 MB zero / 256 MB random blocks.
+                 Use with ${BOLD}--size-mb${R} to control total size (must be a
+                 multiple of 512 MB for clean alternation; rounded up if not).
 EOF
     exit 0
 }
@@ -89,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         --quick)   QUICK=1;         shift   ;;
         --no-hc)   NO_HC=1;         shift   ;;
         --no-gpu)  NO_GPU=1;        shift   ;;
+        --sparse)  SPARSE=1;        shift   ;;
         --help|-h) usage ;;
         *) echo "${RED}Unknown option: $1${R}"; exit 1 ;;
     esac
@@ -126,22 +134,19 @@ ok()      { printf "  ${GRN}✓${R} %s\n" "$*"; }
 warn()    { printf "  ${YLW}⚠${R} %s\n" "$*"; }
 die()     { echo "  ${RED}✗ $*${R}"; exit 1; }
 
-BARW=28   # visible bar width
+BARW=28
 _bar_full=""
 _bar_empty=""
 for (( _i=0; _i<BARW; _i++ )); do _bar_full+="="; _bar_empty+="-"; done
 
-# GZL4_SUB_PCT: current gzl4 internal progress (0-100), updated by run_compress
 GZL4_SUB_PCT=""
 _current_label=""
 
 draw_bar() {
-    # draw_bar CURRENT TOTAL "label"
     local cur=$1 tot=$2 label="${3:0:26}"
     local pct=$(( cur * 100 / tot ))
     local fill=$(( cur * BARW / tot ))
     local emp=$(( BARW - fill ))
-    # Show gzl4 sub-progress if available  numeric = timed run, text = warmup
     local sub=""
     if [[ -n "$GZL4_SUB_PCT" ]]; then
         if [[ "$GZL4_SUB_PCT" =~ ^[0-9]+$ ]]; then
@@ -158,10 +163,7 @@ erase_bar() {
     printf "\r%-${TERMW}s\r" ""
 }
 
-# ── Result row ────────────────────────────────────────────────────────────────
-# All output is already going to stderr (exec 3>&1 1>&2 above)
 print_row() {
-    # print_row LABEL MBPS RATIO PHASE_BEST_MBPS
     local label="$1" mbps="$2" ratio="$3" best="$4"
     local pct=100
     awk "BEGIN{exit !($best+0 > 0)}" 2>/dev/null && \
@@ -181,13 +183,43 @@ table_header() {
     printf "  %s%s%s\n" "$DIM" "$(printf '─%.0s' {1..61})" "$R"
 }
 
+# ── Sparse-specific helpers ───────────────────────────────────────────────────
+
+# After each decompress run, parse gzl4 -v output for sparse stats.
+# Returns the sparse percentage (0 if none reported).
+LAST_SPARSE_PCT="0"
+parse_sparse_pct() {
+    local log="$1"
+    # Look for: "Sparse holes: X.X GB skipped (YY.Y% of output)"
+    local line
+    line=$(grep -oP 'Sparse holes:.*?\(\K[0-9.]+(?=%)' "$log" 2>/dev/null | tail -1 || echo "")
+    LAST_SPARSE_PCT="${line:-0}"
+}
+
+# print_sparse_row: like print_row but appends the sparse percentage.
+print_sparse_row() {
+    local label="$1" mbps="$2" ratio="$3" best="$4" sparse_pct="$5"
+    local pct=100
+    awk "BEGIN{exit !($best+0 > 0)}" 2>/dev/null && \
+        pct=$(awk "BEGIN{printf \"%d\", ($mbps+0)/($best+0)*100}" 2>/dev/null) || true
+    local color
+    if   [[ $pct -ge 95 ]]; then color="${GRN}${BOLD}"
+    elif [[ $pct -ge 75 ]]; then color="${YLW}"
+    elif [[ $pct -ge 50 ]]; then color="${WHT}"
+    else                         color="${DIM}"
+    fi
+    local sparse_col=""
+    if awk "BEGIN{exit !($sparse_pct+0 > 0)}" 2>/dev/null; then
+        sparse_col=$(printf "  ${CYN}sparse:${GRN}%5.1f%%${R}" "$sparse_pct")
+    fi
+    printf "  %-36s  %s%8.1f${R}  ${DIM}MB/s${R}  ${YLW}%6.2f%%${R}%s\n" \
+        "${label:0:36}" "$color" "$mbps" "$ratio" "$sparse_col"
+}
+
 # ── Timing ────────────────────────────────────────────────────────────────────
 now_ms() { date +%s%3N; }
 
-# ── run_compress: warmup + timed runs ─────────────────────────────────────────
-# run_compress gzl4args...
-# Compresses BENCH_FILE to stdout -> COMPRESSED
-# Results in globals RC_MBPS and RC_RATIO; reads _current_label for progress display
+# ── run_compress ──────────────────────────────────────────────────────────────
 RC_MBPS="0"
 RC_RATIO="0"
 run_compress() {
@@ -195,7 +227,6 @@ run_compress() {
     local _in _out _total_ms _r _t0 _t1 _avg
     _in=$(stat -c%s "$BENCH_FILE")
 
-    # warmup  tap stderr so the bar animates with "warmup NN%" during the pause
     local _w
     for (( _w=0; _w<WARMUP; _w++ )); do
         > "$GZL4_STDERR"
@@ -215,16 +246,13 @@ run_compress() {
         GZL4_SUB_PCT=""
     done
 
-    # timed runs  tap gzl4 stderr for live progress
     _total_ms=0
     GZL4_SUB_PCT="0"
     for (( _r=0; _r<RUNS; _r++ )); do
-        > "$GZL4_STDERR"   # clear tap file
+        > "$GZL4_STDERR"
         _t0=$(now_ms)
-        # Run without -q so gzl4 emits progress; capture stderr to tap file
         "$GZL4" "$@" -c "$BENCH_FILE" > "$COMPRESSED" 2>"$GZL4_STDERR" &
         CHILD_PID=$!
-        # Poll tap file while gzl4 runs; update GZL4_SUB_PCT each tick
         while kill -0 "$CHILD_PID" 2>/dev/null; do
             local _pct
             _pct=$(grep -oP '(?<![.\d])\d{1,3}(?=%)' "$GZL4_STDERR" 2>/dev/null \
@@ -248,23 +276,44 @@ run_compress() {
     return 0
 }
 
-# ── run_decompress: compress once, then time decompression ────────────────────
+# ── run_decompress ────────────────────────────────────────────────────────────
+# For sparse mode we decompress to a real temp file so the OS actually creates
+# the sparse file and we can measure it.  For normal mode we decompress to
+# /dev/null as before.
+DECOMP_OUT=""
 run_decompress() {
     RC_MBPS="0"
     local _in _total_ms _r _t0 _t1 _avg _w
     _in=$(stat -c%s "$BENCH_FILE")
 
-    "$GZL4" -q "$@" -c "$BENCH_FILE" > "$COMPRESSED" 2>/dev/null || \
-        return 1
+    "$GZL4" -q "$@" -c "$BENCH_FILE" > "$COMPRESSED" 2>/dev/null || return 1
+
+    # Determine output target.
+    # Non-sparse mode: decompress to /dev/null  we only care about throughput,
+    # not the output content, and canSparse is always false for /dev/null
+    # (lseek on /dev/null is harmless but pointless).
+    #
+    # Sparse mode: decompress to a real named file so that:
+    #   1. gzl4's lseek() probe on the fd succeeds (canSparse = true)
+    #   2. The OS actually creates sparse holes we can measure with du
+    # We use stdout redirect (-c > file) since the v3.27.1 canSparse fix
+    # correctly handles seekable stdout via lseek(STDOUT_FILENO, 0, SEEK_CUR).
+    if [[ $SPARSE -eq 1 ]]; then
+        DECOMP_OUT="$WORKDIR/decomp_out"
+    else
+        DECOMP_OUT="/dev/null"
+    fi
 
     for (( _w=0; _w<WARMUP; _w++ )); do
-        "$GZL4" -q -dc "$COMPRESSED" > /dev/null 2>/dev/null || true
+        [[ $SPARSE -eq 1 ]] && rm -f "$DECOMP_OUT"
+        "$GZL4" -q -dc "$COMPRESSED" > "$DECOMP_OUT" 2>/dev/null || true
     done
 
     _total_ms=0
     for (( _r=0; _r<RUNS; _r++ )); do
+        [[ $SPARSE -eq 1 ]] && rm -f "$DECOMP_OUT"
         _t0=$(now_ms)
-        "$GZL4" -q -dc "$COMPRESSED" > /dev/null 2>/dev/null &
+        "$GZL4" -q -dc "$COMPRESSED" > "$DECOMP_OUT" 2>/dev/null &
         CHILD_PID=$!
         wait "$CHILD_PID" || true
         CHILD_PID=""
@@ -278,6 +327,27 @@ run_decompress() {
     return 0
 }
 
+# ── Sparse verification helper ────────────────────────────────────────────────
+# Reports logical size vs physical disk usage for the last decomp output.
+# Only meaningful when DECOMP_OUT is a real file (not /dev/null).
+check_sparse_savings() {
+    [[ $SPARSE -eq 0 || "$DECOMP_OUT" == "/dev/null" || ! -f "$DECOMP_OUT" ]] && return
+    local logical physical savings_pct
+    logical=$(stat -c%s "$DECOMP_OUT" 2>/dev/null || echo 0)
+    # stat -c%b gives 512-byte blocks actually allocated on disk.
+    # Multiplying by 512 gives the true physical footprint.
+    # du -b would give apparent/logical size  useless for detecting holes.
+    physical=$(( $(stat -c%b "$DECOMP_OUT" 2>/dev/null || echo 0) * 512 ))
+    if [[ $logical -gt 0 ]]; then
+        savings_pct=$(awk "BEGIN{printf \"%.1f\", 100*(1 - $physical/$logical)}")
+        local phys_fmt logical_fmt
+        phys_fmt=$(numfmt --to=iec-i --suffix=B "$physical" 2>/dev/null || echo "${physical}B")
+        logical_fmt=$(numfmt --to=iec-i --suffix=B "$logical" 2>/dev/null || echo "${logical}B")
+        printf "  ${DIM}  sparse check: %s logical, %s physical  (${GRN}%.1f%% holes${R})\n" \
+            "$logical_fmt" "$phys_fmt" "$savings_pct"
+    fi
+}
+
 # ── Result tracking ───────────────────────────────────────────────────────────
 BEST_COMP_MBPS="0"
 BEST_COMP_LABEL=""
@@ -287,10 +357,9 @@ BEST_DECOMP_LABEL=""
 CONFIG_NUM=0
 JSON_RESULTS=()
 
-_gt() { awk "BEGIN{exit !($1+0 > $2+0)}"; }   # float greater-than
+_gt() { awk "BEGIN{exit !($1+0 > $2+0)}"; }
 
 # ── Core per-config runner ────────────────────────────────────────────────────
-# run_one PHASE LABEL BACKEND LEVEL THREADS BATCH STREAMS PHASE_BEST_VAR -- gzl4args...
 run_one() {
     local phase="$1" label="$2" backend="$3" level="$4" threads="$5" \
           batch="$6" streams="$7" pb_var="$8"
@@ -308,16 +377,13 @@ run_one() {
         local pb_val="${!pb_var}"
         print_row "$label" "$mbps" "$ratio" "$pb_val"
 
-        # update phase best
         _gt "$mbps" "$pb_val" && printf -v "$pb_var" '%s' "$mbps" || true
-        # update global best
         _gt "$mbps" "$BEST_COMP_MBPS" && {
             BEST_COMP_MBPS="$mbps"
             BEST_COMP_LABEL="$label"
             BEST_COMP_ARGS="$args_str"
         } || true
 
-        # append JSON entry
         local jargs jentry
         jargs=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$args_str")
         jentry="{\"phase\":\"$phase\",\"backend\":\"$backend\","
@@ -350,6 +416,10 @@ decomp_run() {
         else                         col="${DIM}"
         fi
         printf "  %-36s  %s%8.1f${R}  ${DIM}MB/s${R}\n" "${label:0:36}" "$col" "$mbps"
+
+        # In sparse mode, show the sparse savings for this backend
+        [[ $SPARSE -eq 1 ]] && check_sparse_savings
+
         _gt "$mbps" "$pb_val" && printf -v "$pb_var" '%s' "$mbps" || true
         _gt "$mbps" "$BEST_DECOMP_MBPS" && {
             BEST_DECOMP_MBPS="$mbps"
@@ -379,6 +449,7 @@ echo "${BOLD}${MGN}     backends · levels · threads · GPU tuning        ${R}"
 echo "${BOLD}${MGN}  ${R}"
 echo ""
 info "Press ${BOLD}Ctrl-C${R} at any time to abort"
+[[ $SPARSE -eq 1 ]] && info "${CYN}Sparse mode:${R} zero-heavy data  exercises sparse-write + zero-chunk routing"
 
 # =============================================================================
 # SYSTEM DETECTION
@@ -428,7 +499,52 @@ if [[ -n "$BENCH_FILE" ]]; then
     FILE_SIZE=$(stat -c%s "$BENCH_FILE")
     FILE_MB=$(awk "BEGIN{printf \"%.1f\", $FILE_SIZE/1048576}")
     ok "Using: ${BOLD}$BENCH_FILE${R}  (${FILE_MB} MB)"
+    if [[ $SPARSE -eq 1 ]]; then
+        warn "--sparse ignored when --file is specified (using provided file as-is)"
+        SPARSE=0
+    fi
+elif [[ $SPARSE -eq 1 ]]; then
+    # ── Sparse synthetic data ──────────────────────────────────────────────────
+    # Generate alternating 256 MB zero blocks and 256 MB random blocks.
+    # This exercises two v3.27.0 optimisations simultaneously:
+    #
+    #   Compression (hybrid):   zero chunks are routed to CPU workers,
+    #     bypassing the GPU PCIe round-trip.  Random chunks go to the GPU.
+    #     -v output will show GPU%/CPU% split; expect ~50/50.
+    #
+    #   Decompression (all backends):   zero blocks trigger lseek() instead
+    #     of write(), punching sparse holes in the output file.  The result
+    #     file has the correct logical size but ~50% physical disk usage.
+    #
+    # Block size: 256 MB is large enough to hold many gzl4 chunks and
+    # small enough that the generator finishes in a few seconds.
+    # SIZE_MB is rounded up to the nearest 512 MB for clean alternation.
+    SPARSE_BLOCK_MB=256
+    PAIRS=$(( (SIZE_MB + 511) / 512 ))   # ceiling division
+    ACTUAL_MB=$(( PAIRS * 512 ))
+    BENCH_FILE="$WORKDIR/bench_sparse.bin"
+    printf "  ${DIM}▸${R} Generating ${BOLD}${ACTUAL_MB} MB${R} of sparse synthetic data "
+    printf "(${PAIRS}x 256 MB zero + ${PAIRS}x 256 MB random) ... "
+    python3 - "$BENCH_FILE" "$PAIRS" "$SPARSE_BLOCK_MB" <<'PEOF'
+import sys, os
+path, pairs, block_mb = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+block = block_mb * 1024 * 1024
+with open(path, 'wb') as f:
+    for _ in range(pairs):
+        # Zero block: exercises lseek sparse-write on decompress,
+        # and zero-chunk GPU bypass on hybrid compress.
+        f.write(b'\x00' * block)
+        # Random block: incompressible, ensures the ratio stat is meaningful
+        # and that GPU compression actually gets exercised.
+        f.write(os.urandom(block))
+PEOF
+    FILE_SIZE=$(stat -c%s "$BENCH_FILE")
+    FILE_MB=$(awk "BEGIN{printf \"%.1f\", $FILE_SIZE/1048576}")
+    echo "${GRN}done${R}  (${FILE_MB} MB)"
+    info "  Zero regions:   ${BOLD}$(( ACTUAL_MB / 2 )) MB${R}  (~50%% of file)"
+    info "  Random regions: ${BOLD}$(( ACTUAL_MB / 2 )) MB${R}  (~50%% of file)"
 else
+    # ── Normal synthetic data (original generator) ─────────────────────────────
     BENCH_FILE="$WORKDIR/bench_data.bin"
     printf "  ${DIM}▸${R} Generating ${BOLD}${SIZE_MB} MB${R} of synthetic data ... "
     python3 - "$BENCH_FILE" "$SIZE_MB" <<'PEOF'
@@ -466,6 +582,31 @@ else
     die "Cannot compress test file. Is gzl4 working?"
 fi
 
+# ── Sparse smoke test ──────────────────────────────────────────────────────────
+# Verify that the sparse-write optimisation actually fires by decompressing
+# to a real file and checking that physical disk usage is less than logical size.
+# Skip when /dev/null is the decomp target (non-sparse mode) or on filesystems
+# that don't support sparse files (rare but possible in Docker/tmpfs setups).
+if [[ $SPARSE -eq 1 ]]; then
+    printf "  ${DIM}▸${R} Sparse-write smoke test ... "
+    SPARSE_SMOKE="$WORKDIR/sparse_smoke_out"
+    if "$GZL4" -q --cpu-only -dc "$COMPRESSED" > "$SPARSE_SMOKE" 2>/dev/null; then
+        LOGICAL=$(stat -c%s "$SPARSE_SMOKE" 2>/dev/null || echo 0)
+        PHYSICAL=$(( $(stat -c%b "$SPARSE_SMOKE" 2>/dev/null || echo 0) * 512 ))
+        if [[ $LOGICAL -gt 0 ]] && [[ $PHYSICAL -lt $LOGICAL ]]; then
+            HOLE_PCT=$(awk "BEGIN{printf \"%.0f\", 100*(1 - $PHYSICAL/$LOGICAL)}")
+            echo "${GRN}OK${R}  (${HOLE_PCT}% sparse on this filesystem)"
+        elif [[ $LOGICAL -eq $PHYSICAL ]]; then
+            echo "${YLW}filesystem may not support sparse files  holes will still be skipped but no disk savings${R}"
+        else
+            echo "${GRN}OK${R}"
+        fi
+        rm -f "$SPARSE_SMOKE"
+    else
+        echo "${YLW}skipped (decompress failed  sparse stats will still be shown in results)${R}"
+    fi
+fi
+
 # =============================================================================
 # SWEEP PLAN
 # =============================================================================
@@ -497,7 +638,6 @@ if [[ $GPU_WORKS -eq 1 ]]; then
     n_streams=${#STREAM_COUNTS[@]}
 fi
 n_decomp=1; [[ $GPU_WORKS -eq 1 ]] && n_decomp=3
-# Convergence phase: ~7 batch steps + ~4 stream steps + ~7 thread steps
 n_conv=0; [[ $GPU_WORKS -eq 1 ]] && n_conv=18
 TOTAL_CONFIGS=$(( n_cpu + n_hc + n_gpu + n_hyb + n_batch + n_streams + n_decomp + n_conv ))
 
@@ -507,12 +647,11 @@ info "CPU fast:      ${BOLD}$n_cpu${R} configs"
 info "Decompression: ${BOLD}$n_decomp${R} configs"
 [[ $GPU_WORKS -eq 1 ]] && info "Convergence:   ${BOLD}~$n_conv${R} configs (adaptive)"
 info "Total:         ${BOLD}~$TOTAL_CONFIGS${R}  (warmup=$WARMUP, timed runs=$RUNS)"
+[[ $SPARSE -eq 1 ]] && info "Sparse mode:   decompression results include hole-punch savings"
 
 # =============================================================================
 # PHASES
 # =============================================================================
-
-# Phase-best variables (named so run_one can use indirect reference)
 PB_CPU_FAST="0"
 PB_CPU_HC="0"
 PB_GPU="0"
@@ -565,6 +704,9 @@ fi
 # ── Phase 4: Hybrid ───────────────────────────────────────────────────────────
 if [[ $GPU_WORKS -eq 1 ]]; then
     section "Phase 4 · Hybrid  fast levels"
+    if [[ $SPARSE -eq 1 ]]; then
+        printf "  ${DIM}(zero chunks routed to CPU  expect higher CPU%% vs normal data)${R}\n"
+    fi
     table_header
     for lvl in "${LEVELS[@]}"; do
         for thr in "${THREAD_COUNTS[@]}"; do
@@ -619,7 +761,12 @@ fi
 
 # ── Phase 7: Decompression ────────────────────────────────────────────────────
 section "Phase 7 · Decompression"
-printf "  ${DIM}%-36s  %8s  %-4s${R}\n" "Configuration" "" "MB/s"
+if [[ $SPARSE -eq 1 ]]; then
+    printf "  ${DIM}(sparse mode: decompressing to real files; hole-punch savings shown per backend)${R}\n"
+    printf "  ${DIM}%-36s  %8s  %-4s  %s${R}\n" "Configuration" "" "MB/s" "Sparse savings"
+else
+    printf "  ${DIM}%-36s  %8s  %-4s${R}\n" "Configuration" "" "MB/s"
+fi
 printf "  ${DIM}%s${R}\n" "$(printf '─%.0s' {1..52})"
 
 decomp_run "cpu-only"     "cpu-only" PB_DECOMP  --cpu-only
@@ -631,13 +778,7 @@ echo "  ${DIM}Phase best: ${GRN}${BOLD}${PB_DECOMP} MB/s${R}"
 
 # =============================================================================
 # PHASE 8: Best Performance Convergence
-# Binary-searches the optimal --batch-size, --streams-per-gpu, and -T
-# using the phase 5/6/4 sweep results as starting brackets.
-# Works on whatever backend was fastest  GPU or CPU-only.
 # =============================================================================
-
-# ── Measure helper ────────────────────────────────────────────────────────────
-# cm VARNAME gzl4args...   sets VARNAME to MB/s (never empty  "0" on failure)
 CONV_RESULT="0"
 cm() {
     local _v="$1"; shift
@@ -645,18 +786,12 @@ cm() {
     printf -v "$_v" '%s' "$CONV_RESULT"
 }
 
-# ── Float greater-than with empty-safe defaults ───────────────────────────────
-# fgt A B → returns 0 (true) if A > B, else 1
 fgt() { awk "BEGIN{exit !(${1:-0}+0 > ${2:-0}+0)}"; }
 
-# ── Single binary-search pass ─────────────────────────────────────────────────
-# converge FLAG LO HI BASE_ARGS...
-# Prints each probe, sets CONV_BEST_VAL and CONV_BEST_MBPS when done.
 CONV_BEST_VAL=""
 CONV_BEST_MBPS="0"
 
 _probe() {
-    # _probe FLAG VAL BASE_ARGS...   measure, print, update best
     local _flag="$1" _val="$2"; shift 2
     local _m="0"
     (( CONFIG_NUM++ )) || true
@@ -664,15 +799,13 @@ _probe() {
     draw_bar "$CONFIG_NUM" "$TOTAL_CONFIGS" "$_current_label"
     cm _m "$@" "$_flag" "$_val"
     erase_bar
-    # color: green if best, yellow otherwise
     local _col="$DIM"
     fgt "$_m" "$CONV_BEST_MBPS" && {
         _col="${GRN}${BOLD}"
         CONV_BEST_MBPS="$_m"
         CONV_BEST_VAL="$_val"
     }
-    printf "  %-34s  %s%8.1f${R}  ${DIM}MB/s${R}\n"         "${_flag}=${_val}" "$_col" "$_m"
-    # return the measurement via global so callers can read it
+    printf "  %-34s  %s%8.1f${R}  ${DIM}MB/s${R}\n" "${_flag}=${_val}" "$_col" "$_m"
     CONV_RESULT="$_m"
 }
 
@@ -682,18 +815,15 @@ converge() {
     CONV_BEST_VAL="$lo"
     CONV_BEST_MBPS="0"
 
-    # measure both endpoints
     local m_lo m_hi
     _probe "$flag" "$lo" "${base[@]}"; m_lo="$CONV_RESULT"
     _probe "$flag" "$hi" "${base[@]}"; m_hi="$CONV_RESULT"
 
-    # binary search until gap <= 1
     while (( hi - lo > 1 )); do
         local mid=$(( (lo + hi) / 2 ))
         local m_mid
         _probe "$flag" "$mid" "${base[@]}"; m_mid="$CONV_RESULT"
 
-        # keep the half with higher average  compare sums directly
         if fgt "$(awk 'BEGIN{printf "%.3f", ('${m_lo:-0}'+'${m_mid:-0}')/2}')" \
                "$(awk 'BEGIN{printf "%.3f", ('${m_mid:-0}'+'${m_hi:-0}')/2}')"; then
             hi="$mid"; m_hi="$m_mid"
@@ -703,13 +833,9 @@ converge() {
     done
 }
 
-# ── Extract top-2 distinct values for a field from a given sweep phase ─────────
-# top2 PHASE FIELD → sets TOP2_LO and TOP2_HI (integers, lo < hi), returns 1 if
-# fewer than 2 distinct non-"auto" values found.
 TOP2_LO="" TOP2_HI=""
 top2() {
     local want_phase="$1" want_field="$2"
-    # Collect: "value mbps" pairs, sort by mbps desc, pick top-2 distinct values
     local pairs=""
     local entry
     for entry in "${JSON_RESULTS[@]}"; do
@@ -723,38 +849,29 @@ except: print('','',0)
 " "$entry" 2>/dev/null) || continue
         [[ "$p" != "$want_phase" ]] && continue
         [[ "$v" == "auto" || "$v" == "N/A" || -z "$v" ]] && continue
-        pairs+="$v $m"$'
-'
+        pairs+="$v $m"$'\n'
     done
     [[ -z "$pairs" ]] && { TOP2_LO=""; TOP2_HI=""; return 1; }
-
-    # sort by mbps descending, pick top-2 distinct integer values
     local top
     top=$(echo "$pairs" | sort -k2 -rn | awk '!seen[$1]++ && ++n<=2 {print $1}')
     local a b
     read -r a < <(echo "$top" | head -1)
     read -r b < <(echo "$top" | tail -1 | grep -v "^$a$" || true)
     [[ -z "$a" || -z "$b" || "$a" == "$b" ]] && { TOP2_LO=""; TOP2_HI=""; return 1; }
-    # ensure lo < hi
     if (( a < b )); then TOP2_LO="$a"; TOP2_HI="$b"
     else                 TOP2_LO="$b"; TOP2_HI="$a"; fi
     return 0
 }
 
-# ── Run Phase 8 ───────────────────────────────────────────────────────────────
 section "Phase 8 · Best Performance Convergence"
 echo "  ${DIM}Binary-searching optimal knobs using sweep results as brackets${R}"
 printf "  %s%-34s  %8s  %-4s%s\n" "$DIM" "Configuration" "" "MB/s" "$R"
 printf "  %s%s%s\n" "$DIM" "$(printf '─%.0s' {1..50})" "$R"
 
-# Each step runs based on whether that sweep phase produced data 
-# independent of which backend happened to win the overall sweep.
-
-# Convergence results per backend
-CONV_BATCH="auto"           # best --batch-size  (gpu-only)
-CONV_STREAMS="auto"         # best --streams-per-gpu  (gpu-only)
-CONV_THR_CPU="$CPU_CORES"   # best -T  (cpu-only)
-CONV_THR_HYB="$CPU_CORES"   # best -T  (hybrid)
+CONV_BATCH="auto"
+CONV_STREAMS="auto"
+CONV_THR_CPU="$CPU_CORES"
+CONV_THR_HYB="$CPU_CORES"
 CONV_GPU_MBPS="0"
 CONV_HYB_MBPS="0"
 CONV_CPU_MBPS="0"
@@ -762,7 +879,6 @@ CONV_GPU_ARGS="--gpu-only -1"
 CONV_HYB_ARGS="--hybrid -1"
 CONV_CPU_ARGS="--cpu-only -1"
 
-# ── Step 1: --batch-size  (gpu-only sweep data) ───────────────────────────────
 echo ""
 echo "  ${BOLD}${YLW}▸ Step 1:${R}  --batch-size  (gpu-only -1)"
 if [[ $GPU_WORKS -eq 1 ]]; then
@@ -774,13 +890,12 @@ if [[ $GPU_WORKS -eq 1 ]]; then
         CONV_GPU_ARGS="--gpu-only -1 --batch-size $CONV_BATCH"
         echo "  ${GRN}✓${R}  Best --batch-size: ${BOLD}${CONV_BATCH}${R}  @ ${GRN}${BOLD}${CONV_GPU_MBPS}${R} MB/s"
     else
-        echo "  ${YLW}  Not enough sweep data  run without --no-gpu and without --quick${R}"
+        echo "  ${YLW}  Not enough sweep data${R}"
     fi
 else
     echo "  ${DIM}  Skipped (no GPU available)${R}"
 fi
 
-# ── Step 2: --streams-per-gpu  (gpu-only sweep data, batch locked) ────────────
 echo ""
 echo "  ${BOLD}${YLW}▸ Step 2:${R}  --streams-per-gpu  (gpu-only -1)"
 if [[ $GPU_WORKS -eq 1 ]]; then
@@ -792,7 +907,8 @@ if [[ $GPU_WORKS -eq 1 ]]; then
         echo "  ${DIM}  --batch-size: ${WHT}${BOLD}${CONV_BATCH}${R}${DIM}  (locked from step 1)${R}"
     fi
     if top2 "gpu_streams" "streams_per_gpu"; then
-        converge "--streams-per-gpu" "$TOP2_LO" "$TOP2_HI"             --gpu-only -1 "${batch_lock[@]}"
+        converge "--streams-per-gpu" "$TOP2_LO" "$TOP2_HI" \
+            --gpu-only -1 "${batch_lock[@]}"
         CONV_STREAMS="$CONV_BEST_VAL"
         fgt "$CONV_BEST_MBPS" "$CONV_GPU_MBPS" && {
             CONV_GPU_MBPS="$CONV_BEST_MBPS"
@@ -800,13 +916,12 @@ if [[ $GPU_WORKS -eq 1 ]]; then
         }
         echo "  ${GRN}✓${R}  Best --streams-per-gpu: ${BOLD}${CONV_STREAMS}${R}  @ ${GRN}${BOLD}${CONV_BEST_MBPS}${R} MB/s"
     else
-        echo "  ${YLW}  Not enough sweep data  run without --no-gpu and without --quick${R}"
+        echo "  ${YLW}  Not enough sweep data${R}"
     fi
 else
     echo "  ${DIM}  Skipped (no GPU available)${R}"
 fi
 
-# ── Step 3a: -T  (cpu-only) ───────────────────────────────────────────────────
 echo ""
 echo "  ${BOLD}${YLW}▸ Step 3:${R}  -T thread count  (cpu-only -1)"
 if top2 "cpu_fast" "threads"; then
@@ -819,15 +934,15 @@ else
     echo "  ${YLW}  Not enough sweep data${R}"
 fi
 
-# ── Step 4: -T  (hybrid, with steps 1+2 knobs locked in) ────────────────────
 if [[ $GPU_WORKS -eq 1 ]]; then
     echo ""
     echo "  ${BOLD}${YLW}▸ Step 4:${R}  -T thread count  (hybrid -1, using best batch/streams from steps 1+2)"
-    # Build the fixed GPU knobs discovered in steps 1 and 2
     hyb_gpu_knobs=()
     [[ "$CONV_BATCH"   != "auto" ]] && hyb_gpu_knobs+=(--batch-size "$CONV_BATCH")
     [[ "$CONV_STREAMS" != "auto" ]] && hyb_gpu_knobs+=(--streams-per-gpu "$CONV_STREAMS")
-    [[ ${#hyb_gpu_knobs[@]} -gt 0 ]]         && echo "  ${DIM}  locking in: ${hyb_gpu_knobs[*]}${R}"         || echo "  ${DIM}  no GPU knobs to lock (steps 1+2 skipped or kept auto)${R}"
+    [[ ${#hyb_gpu_knobs[@]} -gt 0 ]] \
+        && echo "  ${DIM}  locking in: ${hyb_gpu_knobs[*]}${R}" \
+        || echo "  ${DIM}  no GPU knobs to lock${R}"
     if top2 "hybrid_fast" "threads"; then
         converge "-T" "$TOP2_LO" "$TOP2_HI" --hybrid -1 "${hyb_gpu_knobs[@]}"
         CONV_THR_HYB="$CONV_BEST_VAL"
@@ -839,25 +954,17 @@ if [[ $GPU_WORKS -eq 1 ]]; then
     fi
 fi
 
-# ── Convergence summary ───────────────────────────────────────────────────────
 echo ""
 echo "  ${BOLD}${MGN} Convergence Results ${R}"
 if [[ $GPU_WORKS -eq 1 ]]; then
-    printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${WHT}${BOLD}%-28s${R} ${BOLD}${MGN}${R}
-"         "--batch-size"       "$CONV_BATCH"
-    printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${WHT}${BOLD}%-28s${R} ${BOLD}${MGN}${R}
-"         "--streams-per-gpu"  "$CONV_STREAMS"
-    printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${GRN}${BOLD}%-28s${R} ${BOLD}${MGN}${R}
-"         "gpu-only peak"      "${CONV_GPU_MBPS} MB/s"
-    printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${WHT}${BOLD}%-28s${R} ${BOLD}${MGN}${R}
-"         "-T (hybrid)"        "$CONV_THR_HYB"
-    printf "  ${BOLD}${MGN}${R}  ${GRN}${BOLD}%-18s${R} ${GRN}${BOLD}%-28s${R} ${BOLD}${MGN}${R}
-"         "hybrid peak"        "${CONV_HYB_MBPS} MB/s"
+    printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${WHT}${BOLD}%-28s${R} ${BOLD}${MGN}${R}\n" "--batch-size"       "$CONV_BATCH"
+    printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${WHT}${BOLD}%-28s${R} ${BOLD}${MGN}${R}\n" "--streams-per-gpu"  "$CONV_STREAMS"
+    printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${GRN}${BOLD}%-28s${R} ${BOLD}${MGN}${R}\n" "gpu-only peak"      "${CONV_GPU_MBPS} MB/s"
+    printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${WHT}${BOLD}%-28s${R} ${BOLD}${MGN}${R}\n" "-T (hybrid)"        "$CONV_THR_HYB"
+    printf "  ${BOLD}${MGN}${R}  ${GRN}${BOLD}%-18s${R} ${GRN}${BOLD}%-28s${R} ${BOLD}${MGN}${R}\n" "hybrid peak"        "${CONV_HYB_MBPS} MB/s"
 fi
-printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${WHT}${BOLD}%-28s${R} ${BOLD}${MGN}${R}
-"     "-T (cpu-only)"      "$CONV_THR_CPU"
-printf "  ${BOLD}${MGN}${R}  ${GRN}${BOLD}%-18s${R} ${GRN}${BOLD}%-28s${R} ${BOLD}${MGN}${R}
-"     "cpu-only peak"      "${CONV_CPU_MBPS} MB/s"
+printf "  ${BOLD}${MGN}${R}  ${DIM}%-18s${R} ${WHT}${BOLD}%-28s${R} ${BOLD}${MGN}${R}\n" "-T (cpu-only)"      "$CONV_THR_CPU"
+printf "  ${BOLD}${MGN}${R}  ${GRN}${BOLD}%-18s${R} ${GRN}${BOLD}%-28s${R} ${BOLD}${MGN}${R}\n" "cpu-only peak"      "${CONV_CPU_MBPS} MB/s"
 echo "  ${BOLD}${MGN}${R}"
 echo ""
 if [[ $GPU_WORKS -eq 1 ]]; then
@@ -867,7 +974,6 @@ fi
 echo "  ${DIM}CPU:    gzl4 ${CONV_CPU_ARGS} <file>${R}"
 echo ""
 
-# Update global best with the best convergence result across all backends
 _conv_mbps_list=("$CONV_GPU_MBPS" "$CONV_HYB_MBPS" "$CONV_CPU_MBPS")
 _conv_args_list=("$CONV_GPU_ARGS" "$CONV_HYB_ARGS" "$CONV_CPU_ARGS")
 for _ci in 0 1 2; do
@@ -877,7 +983,6 @@ for _ci in 0 1 2; do
         BEST_COMP_ARGS="${_conv_args_list[$_ci]}"
     }
 done
-
 
 # =============================================================================
 # SUMMARY
@@ -894,6 +999,13 @@ echo ""
 echo "  ${BOLD}${GRN}Best decompression:${R}"
 echo "    ${WHT}${BOLD}${BEST_DECOMP_MBPS} MB/s${R}    ${CYN}${BEST_DECOMP_LABEL}${R}"
 echo ""
+if [[ $SPARSE -eq 1 ]]; then
+    echo "  ${BOLD}${CYN}Sparse mode notes:${R}"
+    echo "    ${DIM}Decompression ran to real files.  du vs ls -l on output shows${R}"
+    echo "    ${DIM}actual hole savings.  Expect ~50%% sparse with this dataset.${R}"
+    echo "    ${DIM}Hybrid compress: zero chunks routed to CPU, random to GPU.${R}"
+    echo ""
+fi
 echo "  ${DIM}Configs tested: ${CONFIG_NUM}  ·  Elapsed: ${ELAPSED_FMT}${R}"
 
 # =============================================================================
@@ -926,18 +1038,20 @@ python3 - \
     "$RUNS" "$WARMUP" "$ELAPSED" \
     "$BEST_COMP_MBPS" "$BEST_COMP_LABEL" "$BEST_COMP_ARGS" \
     "$BEST_DECOMP_MBPS" "$BEST_DECOMP_LABEL" \
+    "$SPARSE" \
     "[$RESULTS_JOINED]" <<'PEOF'
 import json, sys
 (out_path, ts, host, cpu, cores, mem,
  g4path, g4ver, gpucount, gpujson,
  bfile, fmb, runs, warmup, elapsed,
  bcmbps, bclabel, bcargs,
- bdmbps, bdlabel, rjson) = sys.argv[1:]
+ bdmbps, bdlabel, sparse_mode, rjson) = sys.argv[1:]
 doc = {
     "benchmark": {
         "timestamp": ts, "elapsed_seconds": int(elapsed),
         "runs_per_config": int(runs), "warmup_runs": int(warmup),
         "file": bfile, "file_mb": float(fmb),
+        "sparse_mode": sparse_mode == "1",
     },
     "system": {
         "hostname": host, "cpu_model": cpu,
