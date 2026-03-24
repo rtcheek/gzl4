@@ -46,6 +46,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>   // sysinfo() for available RAM query
+#include <sys/uio.h>       // writev(), struct iovec, IOV_MAX
 #include <fcntl.h>
 #include <getopt.h>
 #include <signal.h>
@@ -59,7 +60,7 @@
 #endif
 
 // Configuration constants
-constexpr const char* VERSION = "3.31.0";
+constexpr const char* VERSION = "3.32.3";
 
 // Compression backend modes
 enum class BackendMode {
@@ -1090,14 +1091,17 @@ public:
  */
 class AsyncWriter {
 private:
-    // 256 MB is large enough to hold ~65 chunks at 4 MB each.
+    // ── Write buffer ──────────────────────────────────────────────────────────
+    // Used only for the LZ4 frame header (written by the main thread before
+    // AsyncWriter starts) and the end-of-stream marker.  Per-chunk data is
+    // sent directly via writev() to avoid a full memcpy.
     static constexpr size_t WRITE_BUF_SIZE = 256ULL * 1024 * 1024;
 
     std::vector<uint8_t> writeBuf;
     size_t               writeBufUsed = 0;
-    bool                 isPipe = false;
-    size_t               flushSize = WRITE_BUF_SIZE;
-    bool                 syncOutput_ = false;  // controlled by --sync-output
+    bool                 isPipe       = false;
+    size_t               flushSize    = WRITE_BUF_SIZE;
+    bool                 syncOutput_  = false;
 
     void bufAppend(const void* data, size_t len) {
         const uint8_t* src = reinterpret_cast<const uint8_t*>(data);
@@ -1106,8 +1110,7 @@ private:
             size_t copy  = std::min(len, space);
             memcpy(writeBuf.data() + writeBufUsed, src, copy);
             writeBufUsed += copy;
-            src          += copy;
-            len          -= copy;
+            src += copy; len -= copy;
             if (writeBufUsed >= flushSize) bufFlush();
         }
     }
@@ -1119,20 +1122,96 @@ private:
 
     void bufFlush() {
         if (writeBufUsed == 0) return;
-        auto writeStart = std::chrono::high_resolution_clock::now();
+        auto t0 = std::chrono::high_resolution_clock::now();
         ssize_t written = ::write(outputFd, writeBuf.data(), writeBufUsed);
-        auto writeEnd   = std::chrono::high_resolution_clock::now();
+        totalWriteTime = totalWriteTime.load() +
+            std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - t0).count();
         if (written != (ssize_t)writeBufUsed)
             fprintf(stderr, "Write error: %s\n", strerror(errno));
         bytesWritten += writeBufUsed;
         if (!isPipe) {
             off_t pos = lseek(outputFd, 0, SEEK_CUR);
             if (pos >= (off_t)writeBufUsed)
-                posix_fadvise(outputFd, pos - writeBufUsed, writeBufUsed, POSIX_FADV_DONTNEED);
+                posix_fadvise(outputFd, pos - writeBufUsed, writeBufUsed,
+                              POSIX_FADV_DONTNEED);
+        }
+        writeBufUsed = 0;
+    }
+
+    // ── writev helpers ────────────────────────────────────────────────────────
+    // Write all iovecs, retrying on partial writes (can happen on pipes).
+    void writevAll(struct iovec* iov, int iovcnt, size_t totalBytes) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        // ── Diagnostic validation before writev ──────────────────────────────
+        size_t sumLen = 0;
+        for (int vi = 0; vi < iovcnt; vi++) {
+            sumLen += iov[vi].iov_len;
+            if (iov[vi].iov_base == nullptr && iov[vi].iov_len > 0) {
+                fprintf(stderr, "DIAG writevAll: iov[%d] null base, len=%zu, "
+                        "totalBytes=%zu iovcnt=%d\n",
+                        vi, iov[vi].iov_len, totalBytes, iovcnt);
+            }
+            // Sanity: iov_len should never be 0 (would be a header-only entry)
+            if (iov[vi].iov_len == 0) {
+                fprintf(stderr, "DIAG writevAll: iov[%d] zero len, base=%p, "
+                        "totalBytes=%zu iovcnt=%d\n",
+                        vi, iov[vi].iov_base, totalBytes, iovcnt);
+            }
+            // Sanity: individual entries should never exceed 1 GB
+            if (iov[vi].iov_len > (size_t)1 << 30) {
+                fprintf(stderr, "DIAG writevAll: iov[%d] suspiciously large len=%zu "
+                        "base=%p\n", vi, iov[vi].iov_len, iov[vi].iov_base);
+            }
+        }
+        if (sumLen != totalBytes) {
+            fprintf(stderr, "DIAG writevAll: sumLen=%zu != totalBytes=%zu iovcnt=%d\n",
+                    sumLen, totalBytes, iovcnt);
+        }
+
+        size_t remaining = totalBytes;
+        int origIovcnt = iovcnt;
+        while (iovcnt > 0 && remaining > 0) {
+            ssize_t n = ::writev(outputFd, iov, std::min(iovcnt, IOV_MAX));
+            if (n <= 0) {
+                fprintf(stderr, "Write error: %s  (errno=%d fd=%d iovcnt=%d/%d "
+                        "remaining=%zu totalBytes=%zu)\n",
+                        strerror(errno), errno, outputFd, iovcnt, origIovcnt,
+                        remaining, totalBytes);
+                int dump = std::min(iovcnt, 8);
+                for (int vi = 0; vi < dump; vi++)
+                    fprintf(stderr, "  iov[%d]: base=%p len=%zu\n",
+                            vi, iov[vi].iov_base, iov[vi].iov_len);
+                writeError_.store(true);
+                shouldStop.store(true);
+                queueCV.notify_all();
+                break;
+            }
+            bytesWritten += (size_t)n;
+            remaining    -= (size_t)n;
+            // Advance iov past written bytes
+            size_t skip = (size_t)n;
+            while (skip > 0 && iovcnt > 0) {
+                if (iov->iov_len <= skip) {
+                    skip -= iov->iov_len;
+                    iov++; iovcnt--;
+                } else {
+                    iov->iov_base = (char*)iov->iov_base + skip;
+                    iov->iov_len -= skip;
+                    skip = 0;
+                }
+            }
         }
         totalWriteTime = totalWriteTime.load() +
-            std::chrono::duration<double>(writeEnd - writeStart).count();
-        writeBufUsed = 0;
+            std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+        if (!isPipe) {
+            off_t pos = lseek(outputFd, 0, SEEK_CUR);
+            if (pos >= (off_t)totalBytes)
+                posix_fadvise(outputFd, pos - totalBytes, totalBytes,
+                              POSIX_FADV_DONTNEED);
+        }
     }
 
     // ── Per-chunk write task ──────────────────────────────────────────────────
@@ -1154,31 +1233,35 @@ private:
 
     void hashLoop() {
         HashWork work;
-        // Blocking pop: wakes immediately when work arrives or the queue is
-        // closed by writerLoop() after its final bufFlush().  No timeout needed.
-        while (hashQueue_.pop(work)) {
+        while (hashQueue_.pop(work))
             xxhState->update(work.data.data(), work.origSize);
-        }
     }
 
+    // ── Pending write queue ───────────────────────────────────────────────────
+    // unordered_map: O(1) insert/find vs std::map O(log n)
     std::thread writerThread;
-    std::map<size_t, WriteTask> pendingWrites;
+    std::unordered_map<size_t, WriteTask> pendingWrites;
     std::mutex queueMutex;
     std::condition_variable queueCV;
     std::atomic<bool>   shouldStop{false};
+    std::atomic<bool>   writeError_{false};  // set on writev failure
     std::atomic<size_t> bytesWritten{0};
     std::atomic<double> totalWriteTime{0.0};
     std::atomic<size_t> nextChunkToWrite{0};
     std::atomic<bool>   writerDone{false};
     std::atomic<size_t> totalExpectedChunks{SIZE_MAX};
 
-    int         outputFd   = -1;
+    int         outputFd  = -1;
     std::string outputFile;
-    XXH::State* xxhState   = nullptr;
+    XXH::State* xxhState  = nullptr;
 
     void writerLoop() {
         VLOG(DEBUG, "Writer thread started\n");
         auto threadStart = std::chrono::high_resolution_clock::now();
+
+        // Per-batch metadata and iovec storage  rebuilt each iteration.
+        std::vector<uint32_t>     headers;
+        std::vector<struct iovec> iovecs;
 
         while (true) {
             WriteTask task;
@@ -1186,6 +1269,8 @@ private:
 
             {
                 std::unique_lock<std::mutex> lock(queueMutex);
+                // Wake on: next chunk ready, stop requested, OR workerAbort
+                // (missing chunk due to error  avoids infinite wait).
                 queueCV.wait(lock, [this] {
                     return pendingWrites.count(nextChunkToWrite.load()) > 0
                            || shouldStop.load();
@@ -1197,107 +1282,138 @@ private:
                     task    = std::move(it->second);
                     pendingWrites.erase(it);
                     hasTask = true;
+                } else if (shouldStop.load()) {
+                    // shouldStop set but next chunk not present  worker aborted,
+                    // drain what we have and exit rather than waiting forever.
+                    break;
                 }
-            }
+            }  // ← lock released before any I/O
 
             while (hasTask) {
-                writeTask(task);
-                nextChunkToWrite += task.chunkIndices.size();
+                // ── Write one task per writev call ───────────────────────
+                // Process one task per iteration: build iovecs for all chunks
+                // in this task and issue one writev() call.  No cross-task
+                // coalescing  a single GPU batch at level 9 is already 128
+                // chunks × ~4MB = ~512MB per writev, which is plenty.
+                // Using a stable header array (sized before any &headers[i]
+                // is taken) prevents the reallocation-invalidates-pointer bug.
+                size_t nChunks = task.originalChunks.size();
+                headers.resize(nChunks);
+                iovecs.clear();
+                iovecs.reserve(nChunks * 2);
+                size_t totalBytes = 0;
 
-                std::unique_lock<std::mutex> lock(queueMutex);
-                auto it = pendingWrites.find(nextChunkToWrite.load());
-                if (it != pendingWrites.end()) {
-                    task = std::move(it->second);
-                    pendingWrites.erase(it);
-                } else {
-                    hasTask = false;
-                    lock.unlock();
-                    queueCV.notify_all();
+                for (size_t i = 0; i < nChunks; i++) {
+                    size_t origSize = task.originalSizes[i];
+                    bool hasComp = i < task.compressedChunks.size()
+                                   && !task.compressedChunks[i].empty()
+                                   && task.compressedChunks[i].size() < origSize;
+                    if (hasComp) {
+                        headers[i] = (uint32_t)task.compressedChunks[i].size();
+                        iovecs.push_back({(void*)&headers[i], 4});
+                        iovecs.push_back({task.compressedChunks[i].data(),
+                                          task.compressedChunks[i].size()});
+                        totalBytes += 4 + task.compressedChunks[i].size();
+                    } else {
+                        headers[i] = (uint32_t)origSize | 0x80000000u;
+                        iovecs.push_back({(void*)&headers[i], 4});
+                        iovecs.push_back({task.originalChunks[i].data(), origSize});
+                        totalBytes += 4 + origSize;
+                    }
+                }
+
+                if (!iovecs.empty())
+                    writevAll(iovecs.data(), (int)iovecs.size(), totalBytes);
+
+                // Hash after writev  move data out of task (no copy needed)
+                if (xxhState) {
+                    for (size_t i = 0; i < nChunks; i++) {
+                        HashWork w;
+                        w.origSize = task.originalSizes[i];
+                        w.data     = std::move(task.originalChunks[i]);
+                        hashQueue_.push(std::move(w));
+                    }
+                }
+
+                // Advance and check for next task
+                nextChunkToWrite += task.chunkIndices.size();
+                {
+                    std::unique_lock<std::mutex> lock(queueMutex);
+                    auto it = pendingWrites.find(nextChunkToWrite.load());
+                    if (it != pendingWrites.end()) {
+                        task    = std::move(it->second);
+                        pendingWrites.erase(it);
+                        hasTask = true;
+                    } else {
+                        hasTask = false;
+                        lock.unlock();
+                        queueCV.notify_all();
+                    }
                 }
             }
         }
 
-        bufFlush();
+        bufFlush();  // flush any trailing header bytes
 
         if (xxhState) hashQueue_.close();
-
         writerDone.store(true);
 
         auto threadEnd = std::chrono::high_resolution_clock::now();
-        double total   = std::chrono::duration<double>(threadEnd - threadStart).count();
-        VLOG(VERBOSE, "Writer thread finished: wrote %zu bytes in %.2fs (%.2fs actual I/O, %.2fs waiting)\n",
+        double total = std::chrono::duration<double>(threadEnd - threadStart).count();
+        VLOG(VERBOSE, "Writer thread finished: wrote %zu bytes in %.2fs "
+             "(%.2fs actual I/O, %.2fs waiting)\n",
              bytesWritten.load(), total, totalWriteTime.load(),
              total - totalWriteTime.load());
     }
 
-    void writeTask(WriteTask& task) {
-        for (size_t i = 0; i < task.originalChunks.size(); i++) {
-            size_t origSize = task.originalSizes[i];
-
-            bool hasCompressed = i < task.compressedChunks.size()
-                                 && !task.compressedChunks[i].empty();
-            if (hasCompressed && task.compressedChunks[i].size() < origSize) {
-                uint32_t compSz = (uint32_t)task.compressedChunks[i].size();
-                bufFlushU32(compSz);
-                bufAppend(task.compressedChunks[i].data(), compSz);
-            } else {
-                uint32_t blockHdr = (uint32_t)origSize | 0x80000000u;
-                bufFlushU32(blockHdr);
-                bufAppend(task.originalChunks[i].data(), origSize);
-            }
-
-            if (xxhState) {
-                HashWork w;
-                w.data     = std::move(task.originalChunks[i]);
-                w.origSize = origSize;
-                hashQueue_.push(std::move(w));
-            }
-        }
-    }
-    
 public:
     AsyncWriter() = default;
-    
-    ~AsyncWriter() {
-        stop();
-    }
-    
+    ~AsyncWriter() { stop(); }
+
     bool start(const std::string& filename, XXH::State* xxh, bool syncOutput = false) {
         outputFile  = filename;
         xxhState    = xxh;
-        syncOutput_ = syncOutput;  // store for use in stop()
+        syncOutput_ = syncOutput;
 
         writeBuf.resize(WRITE_BUF_SIZE);
         writeBufUsed = 0;
 
         if (filename == "-") {
             outputFd = STDOUT_FILENO;
-            isPipe    = true;
+            isPipe   = true;
             flushSize = 4ULL * 1024 * 1024;
-            VLOG(VERBOSE, "AsyncWriter: writing chunks to stdout (pipe mode, 4 MB flush)\n");
+            // Increase pipe buffer to reduce blocking frequency
+#ifdef F_SETPIPE_SZ
+            fcntl(outputFd, F_SETPIPE_SZ, 1 << 20);  // request 1 MB pipe buffer
+#endif
+            VLOG(VERBOSE, "AsyncWriter: writing to stdout (pipe mode)\n");
         } else {
-            // Open file with O_APPEND since header was already written by main thread
             outputFd = open(filename.c_str(), O_WRONLY | O_APPEND, 0644);
             if (outputFd < 0) {
-                fprintf(stderr, "Error opening output file %s: %s\n", 
+                fprintf(stderr, "Error opening output file %s: %s\n",
                         filename.c_str(), strerror(errno));
                 return false;
             }
             posix_fadvise(outputFd, 0, 0, POSIX_FADV_SEQUENTIAL);
             isPipe    = (lseek(outputFd, 0, SEEK_CUR) < 0);
             flushSize = isPipe ? 4ULL * 1024 * 1024 : WRITE_BUF_SIZE;
+            if (isPipe) {
+#ifdef F_SETPIPE_SZ
+                fcntl(outputFd, F_SETPIPE_SZ, 1 << 20);
+#endif
+            }
             VLOG(VERBOSE, "AsyncWriter: opened %s for appending chunks%s\n",
                  filename.c_str(), isPipe ? " (pipe/fifo)" : "");
         }
-        
+
         shouldStop.store(false);
         writerThread = std::thread(&AsyncWriter::writerLoop, this);
         if (xxhState)
             hashThread_ = std::thread(&AsyncWriter::hashLoop, this);
-        
+
         return true;
     }
-    
+
     void enqueue(size_t chunkIndex,
                  std::vector<std::vector<uint8_t>> compressedChunks,
                  std::vector<std::vector<uint8_t>> originalChunks,
@@ -1316,16 +1432,36 @@ public:
         queueCV.notify_one();
     }
 
-    // Batch-insert all per-chunk tasks from one GPU batch under a single lock
     void enqueueBatch(std::vector<std::vector<uint8_t>>& compressedChunks,
                       std::vector<std::vector<uint8_t>>& originalChunks,
                       const std::vector<size_t>&         chunkIndices,
                       const std::vector<size_t>&         originalSizes) {
+        // ── Diagnostic validation ─────────────────────────────────────────────
+        for (size_t i = 0; i < chunkIndices.size(); i++) {
+            bool hasComp = i < compressedChunks.size() && !compressedChunks[i].empty();
+            size_t origSz = i < originalSizes.size() ? originalSizes[i] : 0;
+            if (hasComp && compressedChunks[i].data() == nullptr) {
+                fprintf(stderr, "DIAG enqueueBatch: chunk %zu compressedChunks[%zu] "
+                        "non-empty but null ptr, size=%zu\n",
+                        chunkIndices[i], i, compressedChunks[i].size());
+            }
+            if (!hasComp) {
+                if (i >= originalChunks.size() || originalChunks[i].empty()) {
+                    fprintf(stderr, "DIAG enqueueBatch: chunk %zu NO comp AND "
+                            "originalChunks[%zu] empty! origSz=%zu\n",
+                            chunkIndices[i], i, origSz);
+                } else if (originalChunks[i].size() != origSz && origSz > 0) {
+                    fprintf(stderr, "DIAG enqueueBatch: chunk %zu size mismatch "
+                            "orig.size=%zu origSizes[%zu]=%zu\n",
+                            chunkIndices[i], originalChunks[i].size(), i, origSz);
+                }
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(queueMutex);
             for (size_t i = 0; i < chunkIndices.size(); i++) {
                 WriteTask task;
-                task.chunkIndex = chunkIndices[i];
+                task.chunkIndex    = chunkIndices[i];
                 task.chunkIndices  = { chunkIndices[i] };
                 task.originalSizes = { originalSizes[i] };
                 task.compressedChunks.push_back(std::move(compressedChunks[i]));
@@ -1335,42 +1471,25 @@ public:
         }
         queueCV.notify_all();
     }
-    
+
     void stop() {
         shouldStop.store(true);
         queueCV.notify_one();
-        
-        if (writerThread.joinable()) {
-            writerThread.join();
-        }
-        // writerLoop closes hashQueue_ before setting writerDone; hash thread
-        // drains any remaining items and then exits naturally.
-        if (hashThread_.joinable()) {
-            hashThread_.join();
-        }
-        
+        if (writerThread.joinable()) writerThread.join();
+        if (hashThread_.joinable())  hashThread_.join();
         if (outputFd >= 0 && outputFd != STDOUT_FILENO) {
-            // Default (false): skip fsync to avoid 4-20x timing variance caused
-            // by consumer NVMe SLC write-cache flushes on consecutive runs.
-            // The .tmp + rename pattern ensures the output is always either
-            // complete or absent regardless of whether fsync is called.
             if (syncOutput_) fsync(outputFd);
             close(outputFd);
             outputFd = -1;
         }
     }
 
-    size_t getBytesWritten() const {
-        return bytesWritten.load();
-    }
-    
-    double getWriteTime() const {
-        return totalWriteTime.load();
-    }
-    
+    size_t getBytesWritten()     const { return bytesWritten.load(); }
+    double getWriteTime()        const { return totalWriteTime.load(); }
     size_t getNextChunkToWrite() const { return nextChunkToWrite.load(); }
-    bool   isDone()             const { return writerDone.load(); }
-    void   setTotalChunks(size_t n)  { totalExpectedChunks.store(n); }
+    bool   isDone()              const { return writerDone.load(); }
+    bool   hasWriteError()       const { return writeError_.load(); }
+    void   setTotalChunks(size_t n)    { totalExpectedChunks.store(n); }
 
     size_t getQueueDepth() const {
         std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(queueMutex));
@@ -1970,9 +2089,21 @@ public:
             return false;
         }
 
-        // Auto-tune slotCapacity
-        if (slotCapacity == 8)
-            slotCapacity = gpus.size() == 1 ? 64 : (gpus.size() <= 4 ? 16 : 4);
+        // Auto-tune slotCapacity from VRAM with latency cap.
+        if (slotCapacity == 8) {
+            const size_t memPerChunk = chunkSize * 5;
+            size_t minBatch = SIZE_MAX;
+            for (auto& gpu : gpus) {
+                size_t perSlot = static_cast<size_t>(gpu.availableMemory * 0.85) / 3;
+                size_t vramBatch = perSlot / std::max(memPerChunk, size_t(1));
+                vramBatch = std::max(size_t(4), std::min(size_t(8192), vramBatch));
+                minBatch = std::min(minBatch, vramBatch);
+            }
+            if (minBatch == SIZE_MAX) minBatch = 128;
+            const size_t latencyCap = std::max(size_t(4),
+                size_t(512ULL * 1024 * 1024) / chunkSize);
+            slotCapacity = std::min(minBatch, latencyCap);
+        }
 
         double ms = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t0).count() * 1000.0;
@@ -2110,7 +2241,10 @@ public:
 
         // ── Phase 4: auto-tune pipeline depth and slot capacity ──────────────
         if (pipelineDepth <= 0 && !gpus.empty()) {
-            int autoDepth = gpus.size() == 1 ? 4 : 3;
+            // H100/A100 have 3 copy engines (H2D, D2H, P2P); 34 streams
+            // lets H2D copy, kernel, and D2H overlap fully.  GPU count has
+            // no bearing on per-GPU stream depth.
+            int autoDepth = 3;
             for (auto& gpu : gpus) {
                 for (auto& s : gpu.streams) cudaStreamDestroy(s);
                 gpu.pipelineDepth = autoDepth;
@@ -2122,9 +2256,28 @@ public:
         }
 
         if (slotCapacity == 8 && !gpus.empty()) {
-            slotCapacity = gpus.size() == 1 ? 64 : (gpus.size() <= 4 ? 16 : 4);
-            VLOG(DEBUG, "Auto-tuned batch size to %zu for %zu GPU(s)\n",
-                 slotCapacity, gpus.size());
+            // VRAM ceiling: don't over-allocate device memory.
+            const size_t memPerChunk = chunkSize * 5;
+            size_t minBatch = SIZE_MAX;
+            for (auto& gpu : gpus) {
+                size_t usable = static_cast<size_t>(gpu.availableMemory * 0.85);
+                size_t perSlot = usable / std::max(1, gpu.pipelineDepth);
+                size_t vramBatch = perSlot / memPerChunk;
+                vramBatch = std::max(size_t(4), std::min(size_t(8192), vramBatch));
+                minBatch = std::min(minBatch, vramBatch);
+            }
+            if (minBatch == SIZE_MAX) minBatch = 128;
+
+            // Latency cap: ~512 MB input per batch keeps GPU startup fast.
+            // At 4MB chunks = 128, at 256KB chunks = 2048.
+            const size_t latencyCap = std::max(size_t(4),
+                size_t(512ULL * 1024 * 1024) / chunkSize);
+            slotCapacity = std::min(minBatch, latencyCap);
+
+            VLOG(DEBUG, "Auto-tuned batch size to %zu "
+                 "(VRAM ceil %zu, latency cap %zu, %.1f MB chunks, %zu GPU(s))\n",
+                 slotCapacity, minBatch, latencyCap,
+                 chunkSize / (1024.0*1024.0), gpus.size());
         }
 
         if (gpus.empty()) {
@@ -2173,13 +2326,36 @@ public:
     /*
      * Calculate optimal batch size based on GPU memory
      */
-    size_t calculateBatchSize(size_t gpuMemory) {
-        size_t memPerChunk = chunkSize * 5;
-        size_t usable      = static_cast<size_t>(gpuMemory * 0.90);
-        size_t batchSize   = usable / memPerChunk;
+    size_t calculateBatchSize(size_t gpuMemory, size_t numChunks = 0) {
+        // VRAM-driven ceiling: each chunk needs ~5× chunkSize device memory.
+        const size_t memPerChunk = chunkSize * 5;
+        const size_t usable      = static_cast<size_t>(gpuMemory * 0.90);
+        size_t batchSize         = usable / memPerChunk;
+
+        // Latency cap: limit how much data must be H2D-transferred before
+        // the first kernel fires.  Targeting ~512 MB input per batch keeps
+        // GPU startup fast regardless of chunk size.  At 4MB chunks = 128,
+        // at 256KB chunks = 2048  scales naturally with compression level.
+        const size_t targetInputBytes = size_t(512) * 1024 * 1024;  // 512 MB
+        size_t latencyCap = std::max(size_t(4), targetInputBytes / chunkSize);
+        if (latencyCap < batchSize)
+            batchSize = latencyCap;
+
+        // File-size cap: no point allocating slots for more work than exists.
+        if (numChunks > 0 && !gpus.empty()) {
+            size_t totalSlots = gpus.size() * std::max(1, gpus[0].pipelineDepth);
+            size_t targetBatch = (numChunks + totalSlots * 8 - 1) / (totalSlots * 8);
+            if (targetBatch < batchSize)
+                batchSize = std::max(targetBatch, size_t(4));
+        }
+
         batchSize = std::max(size_t(4), std::min(size_t(8192), batchSize));
-        VLOG(DEBUG, "Init-time batch estimate: %zu chunks/slot (%.1f GB/slot)\n",
-             batchSize, (batchSize * memPerChunk) / (1024.0*1024.0*1024.0));
+        VLOG(DEBUG, "Init-time batch estimate: %zu chunks/slot "
+             "(%.1f GB/slot, %.1f MB chunks%s)\n",
+             batchSize,
+             (batchSize * memPerChunk) / (1024.0*1024.0*1024.0),
+             chunkSize / (1024.0*1024.0),
+             numChunks > 0 ? ", file-size capped" : "");
         return batchSize;
     }
 
@@ -2202,14 +2378,15 @@ public:
         }
 
         size_t vramBatch = perSlotMem / memPerChunk;
-        size_t smFloor = gpu.smCount * 4;
-        size_t batch = std::max(smFloor, std::min(vramBatch, size_t(8192)));
+        // Clamp to sensible range  no SM floor since chunk size already
+        // determines minimum useful parallelism better than smCount heuristic.
+        size_t batch = std::max(size_t(4), std::min(vramBatch, size_t(8192)));
         gpu.optimalBatch = batch;
 
         VLOG(DEBUG, "GPU%d: %.1f GB free / %d slots -> %zu chunks/slot "
-             "(VRAM ceiling %zu, SM floor %zu, %zu SMs)\n",
+             "(VRAM ceiling %zu, %.1f MB chunks)\n",
              gpu.deviceId, freeMem/(1024.0*1024.0*1024.0),
-             slots, batch, vramBatch, smFloor, gpu.smCount);
+             slots, batch, vramBatch, chunkSize/(1024.0*1024.0));
 
         return batch;
     }
@@ -3123,8 +3300,9 @@ public:
 
         size_t totalSlots = 0;
         for (auto& gSlots : gpuSlots) totalSlots += gSlots.size();
-        VLOG(VERBOSE, "GPU pipeline ready: %zu GPUs x %d slots = %zu total  cap=%zu chunks/slot\n",
-             gpus.size(), gpus[0].pipelineDepth, totalSlots, SLOT_CAPACITY);
+        VLOG(VERBOSE, "GPU pipeline ready: %zu GPUs × %d streams/GPU × %zu chunks/slot  =  %.1f GB VRAM/slot\n",
+             gpus.size(), gpus[0].pipelineDepth, SLOT_CAPACITY,
+             (SLOT_CAPACITY * chunkSize * 5) / (1024.0*1024.0*1024.0));
 
         std::atomic<bool>   workerAbort{false};
 
@@ -3400,10 +3578,11 @@ public:
         VLOG(VERBOSE, "Throughput: %.2f MB/s\n", throughputMBps);
         VLOG(VERBOSE, "  Read: %.2f s  |  Write: %.2f s\n",
              asyncReadTime, asyncWriteTime);
-        VLOG(VERBOSE, "  %zu GPU%s / %zu slot%s / %zu chunks/slot\n",
+        VLOG(VERBOSE, "  %zu GPU%s × %d streams/GPU × %zu chunks/slot  =  %.1f GB VRAM/slot\n",
              gpus.size(), gpus.size() == 1 ? "" : "s",
-             finalSlots, finalSlots == 1 ? "" : "s",
-             SLOT_CAPACITY);
+             gpus.empty() ? 0 : gpus[0].pipelineDepth,
+             SLOT_CAPACITY,
+             (SLOT_CAPACITY * chunkSize * 5) / (1024.0*1024.0*1024.0));
 
         if (!keepOriginal && !stdoutMode) {
             if (unlink(inputFile.c_str()) != 0) {
@@ -3856,6 +4035,13 @@ public:
             allWorkers.emplace_back(gpuWorker, g);
 
         while (stdinMode ? !dispatcherDone.load() : (chunksSubmitted.load() < numChunks)) {
+            // Abort if writer hit an unrecoverable error
+            if (asyncWriter.hasWriteError()) {
+                workerAbort.store(true);
+                gpuWorkQueue.close();
+                cpuWorkQueue.close();
+                break;
+            }
             if (g_verbosity != QUIET && (stdinMode || numChunks > 10)) {
                 size_t done = asyncWriter.getNextChunkToWrite();
                 std::string gpuStr = formatBytes(gpuChunkCount.load() * chunkSize);
@@ -4146,9 +4332,11 @@ public:
         std::atomic<size_t> cksumConsumed{0};
 
         int outputFd = -1;
+        bool outIsPipe = false;
         if (!testMode) {
             if (stdoutMode) {
                 outputFd = STDOUT_FILENO;
+                outIsPipe = true;
             } else {
                 outputFd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
                 if (outputFd < 0) {
@@ -4157,7 +4345,11 @@ public:
                     return false;
                 }
                 posix_fadvise(outputFd, 0, 0, POSIX_FADV_SEQUENTIAL);
+                outIsPipe = (lseek(outputFd, 0, SEEK_CUR) < 0);
             }
+#ifdef F_SETPIPE_SZ
+            if (outIsPipe) fcntl(outputFd, F_SETPIPE_SZ, 1 << 20);
+#endif
         }
 
         struct DecompBlock {
@@ -4225,9 +4417,10 @@ public:
                  perStreamPin  / (1024.0*1024.0),
                  autoByVRAM, autoByPin, N_STREAMS);
         }
-        VLOG(VERBOSE, "GPU decompressor: %zu streams per GPU%s, batch-size %zu\n",
+        VLOG(VERBOSE, "GPU decompressor: %zu streams/GPU%s  ×  %zu chunks/slot  =  %.1f GB VRAM/slot\n",
              N_STREAMS, pipelineDepth > 0 ? " (user-specified)" : " (auto)",
-             slotCapacity);
+             slotCapacity,
+             (slotCapacity * (chunkSize + (chunkSize/255+16) + chunkSize)) / (1024.0*1024.0*1024.0));
 
         struct DecompSlot {
             cudaStream_t    stream         = nullptr;
@@ -4463,7 +4656,73 @@ public:
         size_t  drainBlocks= 0;
         size_t  maxPending = 0;
 
-        // showProgress: always prints the current state  no time gate.
+        // ── writev coalescing helpers ─────────────────────────────────────────
+        // Accumulate non-sparse blocks and flush in one writev() call.
+        // Sparse (all-zero) blocks force a flush then punch a hole.
+        std::vector<struct iovec> wiovecs;
+        size_t wiovecBytes = 0;
+        wiovecs.reserve(64);
+
+        auto flushWriteVec = [&]() -> bool {
+            if (wiovecs.empty()) return true;
+            auto t0 = std::chrono::steady_clock::now();
+            size_t remaining = wiovecBytes;
+            struct iovec* iov = wiovecs.data();
+            int cnt = (int)wiovecs.size();
+            while (cnt > 0 && remaining > 0) {
+                ssize_t n = ::writev(outputFd, iov, std::min(cnt, IOV_MAX));
+                if (n <= 0) {
+                    fprintf(stderr, "Error: writev failed: %s\n", strerror(errno));
+                    wiovecs.clear(); wiovecBytes = 0;
+                    return false;
+                }
+                remaining -= (size_t)n;
+                size_t skip = (size_t)n;
+                while (skip > 0 && cnt > 0) {
+                    if (iov->iov_len <= skip) { skip -= iov->iov_len; iov++; cnt--; }
+                    else { iov->iov_base = (char*)iov->iov_base + skip;
+                           iov->iov_len -= skip; skip = 0; }
+                }
+            }
+            writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (!outIsPipe) {
+                off_t pos = lseek(outputFd, 0, SEEK_CUR);
+                if (pos >= (off_t)wiovecBytes)
+                    posix_fadvise(outputFd, pos - wiovecBytes, wiovecBytes,
+                                  POSIX_FADV_DONTNEED);
+            }
+            wiovecs.clear(); wiovecBytes = 0;
+            return true;
+        };
+
+        // writeBlock: queue a block for coalesced writev (flushes if sparse).
+        // Returns false on write error.
+        auto writeBlock = [&](DecompBlock& blk, bool& err) {
+            if (outputFd < 0) return;
+            if (canSparse && isAllZeros(blk.data.data(), blk.data.size())) {
+                if (!flushWriteVec()) { err = true; return; }
+                auto t0 = std::chrono::steady_clock::now();
+                if (lseek(outputFd, (off_t)blk.data.size(), SEEK_CUR) < 0) {
+                    fprintf(stderr, "Warning: lseek for sparse hole failed: %s"
+                            "  falling back to write\n", strerror(errno));
+                    struct iovec iov{blk.data.data(), blk.data.size()};
+                    if (::writev(outputFd, &iov, 1) != (ssize_t)blk.data.size())
+                        err = true;
+                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                } else {
+                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    sparseBytes += blk.data.size();
+                }
+            } else {
+                // Queue for coalesced write; flush if we'd exceed IOV_MAX
+                if ((int)wiovecs.size() >= IOV_MAX) flushWriteVec();
+                wiovecs.push_back({blk.data.data(), blk.data.size()});
+                wiovecBytes += blk.data.size();
+            }
+        };
         // Called exclusively by the dedicated progress thread below at a
         // fixed 150ms interval, so the bar is visible regardless of how
         // fast the writer loop runs.
@@ -4684,39 +4943,28 @@ public:
                 while (cksumConsumed.load(std::memory_order_acquire)
                        <= nextBlockToWrite && !decompError)
                     std::this_thread::yield();
-                if (outputFd >= 0) {
-                    auto wt0 = std::chrono::steady_clock::now();
-                    if (canSparse && isAllZeros(blk.data.data(), blk.data.size())) {
-                        // All-zero block: punch a sparse hole by seeking past
-                        // it.  ftruncate() at the end will extend the file to
-                        // the correct total size if this is the last block.
-                        if (lseek(outputFd, (off_t)blk.data.size(), SEEK_CUR) < 0) {
-                            // lseek failed (shouldn't happen on a regular file,
-                            // but fall back to a normal write to be safe).
-                            fprintf(stderr, "Warning: lseek for sparse hole failed: %s"
-                                    "  falling back to write\n", strerror(errno));
-                            if (::write(outputFd, blk.data.data(), blk.data.size())
-                                    != (ssize_t)blk.data.size())
-                                decompError = true;
-                        } else {
-                            sparseBytes += blk.data.size();
-                        }
-                    } else {
-                        if (::write(outputFd, blk.data.data(), blk.data.size())
-                                != (ssize_t)blk.data.size()) {
-                            fprintf(stderr, "Error: write failed at chunk %zu\n", nextBlockToWrite);
-                            decompError = true;
-                        }
-                    }
-                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - wt0).count();
-                }
+                bool err = false;
+                writeBlock(blk, err);
+                if (err) decompError = true;
                 totalBytesWritten += blk.data.size();
-                blk.data.clear(); blk.data.shrink_to_fit();
                 nextBlockToWrite++;
                 flushedAny = true;
+                // Flush every 64 blocks (~256MB at 4MB chunks) to avoid
+                // accumulating a giant writev call that stalls the writer
+                if (wiovecs.size() >= 128) {  // 2 iovecs per block, so 64 blocks
+                    if (!flushWriteVec()) { decompError = true; break; }
+                    for (size_t i = drainBlocks; i < nextBlockToWrite; i++) {
+                        results[i].data.clear(); results[i].data.shrink_to_fit();
+                    }
+                    drainBlocks = nextBlockToWrite;
+                }
             }
+            // Flush coalesced blocks, THEN clear (iovecs point into blk.data)
             if (flushedAny) {
+                if (!flushWriteVec()) decompError = true;
+                for (size_t i = drainBlocks; i < nextBlockToWrite; i++) {
+                    results[i].data.clear(); results[i].data.shrink_to_fit();
+                }
                 drainCalls++;
                 size_t pending = blocksDone.load() - nextBlockToWrite;
                 if (pending > maxPending) maxPending = pending;
@@ -4749,6 +4997,7 @@ public:
         blockQueueCV.notify_all();
         for (auto& t : workerThreads) t.join();
 
+        // Final drain after all workers done
         while (!decompError &&
                nextBlockToWrite < estimatedBlocks &&
                ready[nextBlockToWrite].load(std::memory_order_acquire)) {
@@ -4756,26 +5005,16 @@ public:
             while (cksumConsumed.load(std::memory_order_acquire)
                    <= nextBlockToWrite && !decompError)
                 std::this_thread::yield();
-            if (outputFd >= 0) {
-                if (canSparse && isAllZeros(blk.data.data(), blk.data.size())) {
-                    if (lseek(outputFd, (off_t)blk.data.size(), SEEK_CUR) < 0) {
-                        fprintf(stderr, "Warning: lseek for sparse hole failed: %s"
-                                "  falling back to write\n", strerror(errno));
-                        if (::write(outputFd, blk.data.data(), blk.data.size())
-                                != (ssize_t)blk.data.size())
-                            fprintf(stderr, "Warning: write error in final flush\n");
-                    } else {
-                        sparseBytes += blk.data.size();
-                    }
-                } else {
-                    if (::write(outputFd, blk.data.data(), blk.data.size())
-                            != (ssize_t)blk.data.size())
-                        fprintf(stderr, "Warning: write error in final flush\n");
-                }
-            }
+            bool err = false;
+            writeBlock(blk, err);
+            if (err) decompError = true;
             totalBytesWritten += blk.data.size();
-            blk.data.clear(); blk.data.shrink_to_fit();
             nextBlockToWrite++;
+        }
+        if (!flushWriteVec()) decompError = true;
+        // Clear after flush  iovecs pointed into this data
+        for (size_t i = drainBlocks; i < nextBlockToWrite; i++) {
+            if (i < results.size()) { results[i].data.clear(); results[i].data.shrink_to_fit(); }
         }
 
 
@@ -4992,18 +5231,24 @@ public:
              originalFileSize / (1024.0*1024.0), chunkSize/1024, estimatedBlocks);
 
         int outputFd = -1;
+        bool outIsPipe = false;
         if (!testMode) {
             if (stdoutMode) {
                 outputFd = STDOUT_FILENO;
+                outIsPipe = true;
             } else {
                 outputFd = open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
                 if (outputFd < 0) {
                     fprintf(stderr, "Error: Cannot create output file: %s\n", getActualOutputPath());
                     { if (inputFd != STDIN_FILENO) close(inputFd); return false; }
                 }
+                posix_fadvise(outputFd, 0, 0, POSIX_FADV_SEQUENTIAL);
+                outIsPipe = (lseek(outputFd, 0, SEEK_CUR) < 0);
             }
+#ifdef F_SETPIPE_SZ
+            if (outIsPipe) fcntl(outputFd, F_SETPIPE_SZ, 1 << 20);
+#endif
         }
-
         XXH::State xxhState(XXH32_SEED);
         std::atomic<size_t> cksumConsumed{0};
         std::thread cksumThread;
@@ -5064,9 +5309,12 @@ public:
             if (autoStreams > 32) autoStreams = 32;
             N_STREAMS_H = autoStreams;
         }
-        VLOG(VERBOSE, "Hybrid decompressor: %zu streams/GPU%s, batch-size %zu, %zu CPU thread%s\n",
+        VLOG(VERBOSE, "Hybrid decompressor: %zu streams/GPU%s  ×  %zu chunks/slot  =  %.1f GB VRAM/slot"
+             "  (%zu CPU threads)\n",
              N_STREAMS_H, pipelineDepth > 0 ? " (user-specified)" : " (auto)",
-             SC_h, effectiveThreads, effectiveThreads == 1 ? "" : "s");
+             SC_h,
+             (SC_h * (maxComp_h + chunkSize + chunkSize)) / (1024.0*1024.0*1024.0),
+             effectiveThreads);
         // Do one immediate NVML poll so we have load scores before dispatching.
         // The background thread will keep them updated every 2s thereafter.
         if (g_verbosity >= VERBOSE) loadMonitor.logCurrentLoad();
@@ -5550,6 +5798,70 @@ public:
         bool   canSparse         = (outputFd >= 0 && !testMode &&
                   (outputFd != STDOUT_FILENO || lseek(outputFd, 0, SEEK_CUR) >= 0));
 
+        // ── writev coalescing helpers ─────────────────────────────────────────
+        std::vector<struct iovec> wiovecs;
+        size_t wiovecBytes = 0;
+        int64_t writeUs = 0;
+        wiovecs.reserve(64);
+
+        auto flushWriteVec = [&]() -> bool {
+            if (wiovecs.empty()) return true;
+            auto t0 = std::chrono::steady_clock::now();
+            size_t remaining = wiovecBytes;
+            struct iovec* iov = wiovecs.data();
+            int cnt = (int)wiovecs.size();
+            while (cnt > 0 && remaining > 0) {
+                ssize_t n = ::writev(outputFd, iov, std::min(cnt, IOV_MAX));
+                if (n <= 0) {
+                    fprintf(stderr, "Error: writev failed: %s\n", strerror(errno));
+                    wiovecs.clear(); wiovecBytes = 0;
+                    return false;
+                }
+                remaining -= (size_t)n;
+                size_t skip = (size_t)n;
+                while (skip > 0 && cnt > 0) {
+                    if (iov->iov_len <= skip) { skip -= iov->iov_len; iov++; cnt--; }
+                    else { iov->iov_base = (char*)iov->iov_base + skip;
+                           iov->iov_len -= skip; skip = 0; }
+                }
+            }
+            writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (!outIsPipe) {
+                off_t pos = lseek(outputFd, 0, SEEK_CUR);
+                if (pos >= (off_t)wiovecBytes)
+                    posix_fadvise(outputFd, pos - wiovecBytes, wiovecBytes,
+                                  POSIX_FADV_DONTNEED);
+            }
+            wiovecs.clear(); wiovecBytes = 0;
+            return true;
+        };
+
+        auto writeBlock = [&](DecompBlock& blk, bool& err) {
+            if (outputFd < 0) return;
+            if (canSparse && isAllZeros(blk.data.data(), blk.data.size())) {
+                if (!flushWriteVec()) { err = true; return; }
+                auto t0 = std::chrono::steady_clock::now();
+                if (lseek(outputFd, (off_t)blk.data.size(), SEEK_CUR) < 0) {
+                    fprintf(stderr, "Warning: lseek for sparse hole failed: %s"
+                            "  falling back to write\n", strerror(errno));
+                    struct iovec iov{blk.data.data(), blk.data.size()};
+                    if (::writev(outputFd, &iov, 1) != (ssize_t)blk.data.size())
+                        err = true;
+                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                } else {
+                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    sparseBytes += blk.data.size();
+                }
+            } else {
+                if ((int)wiovecs.size() >= IOV_MAX) flushWriteVec();
+                wiovecs.push_back({blk.data.data(), blk.data.size()});
+                wiovecBytes += blk.data.size();
+            }
+        };
+
         auto showProgress = [&]() {
             if (g_verbosity == QUIET || estimatedBlocks <= 10) return;
             size_t rb    = readBytesRead.load(std::memory_order_relaxed);
@@ -5667,6 +5979,12 @@ public:
             }
         });
 
+        size_t drainBlocks = 0;  // tracks start of current drain burst for clear-after-flush
+        // Flush threshold: max blocks to accumulate before issuing writev.
+        // 64 blocks × 4MB = 256MB per writev  large enough to amortize
+        // syscall overhead, small enough to keep writes flowing steadily.
+        static constexpr size_t FLUSH_EVERY = 64;
+
         while (true) {
             bool flushedAny = false;
             while (!decompError && nextBlockToWrite < estimatedBlocks &&
@@ -5675,30 +5993,27 @@ public:
                 while (cksumConsumed.load(std::memory_order_acquire)
                        <= nextBlockToWrite && !decompError)
                     std::this_thread::yield();
-                if (outputFd >= 0) {
-                    if (canSparse && isAllZeros(blk.data.data(), blk.data.size())) {
-                        if (lseek(outputFd, (off_t)blk.data.size(), SEEK_CUR) < 0) {
-                            fprintf(stderr, "Warning: lseek for sparse hole failed: %s"
-                                    "  falling back to write\n", strerror(errno));
-                            if (::write(outputFd, blk.data.data(), blk.data.size())
-                                    != (ssize_t)blk.data.size()) {
-                                fprintf(stderr, "Warning: write error at chunk %zu\n", nextBlockToWrite);
-                                decompError = true;
-                            }
-                        } else {
-                            sparseBytes += blk.data.size();
-                        }
-                    } else if (::write(outputFd, blk.data.data(), blk.data.size())
-                            != (ssize_t)blk.data.size()) {
-                        fprintf(stderr, "Warning: write error at chunk %zu\n", nextBlockToWrite);
-                        decompError = true;
-                    }
-                }
+                bool err = false;
+                writeBlock(blk, err);
+                if (err) decompError = true;
                 totalBytesWritten += blk.data.size();
-                blk.data.clear(); blk.data.shrink_to_fit();
                 nextBlockToWrite++; flushedAny = true;
+
+                // Flush periodically to avoid accumulating a giant writev call
+                if (wiovecs.size() >= FLUSH_EVERY * 2) {  // *2 because 2 iovecs/block
+                    if (!flushWriteVec()) { decompError = true; break; }
+                    for (size_t i = drainBlocks; i < nextBlockToWrite; i++) {
+                        results[i].data.clear(); results[i].data.shrink_to_fit();
+                    }
+                    drainBlocks = nextBlockToWrite;
+                }
             }
             if (flushedAny) {
+                if (!flushWriteVec()) decompError = true;
+                for (size_t i = drainBlocks; i < nextBlockToWrite; i++) {
+                    results[i].data.clear(); results[i].data.shrink_to_fit();
+                }
+                drainBlocks = nextBlockToWrite;
                 size_t pending = blocksDone.load() - nextBlockToWrite;
                 if (pending > maxPending) maxPending = pending;
             }
@@ -5727,27 +6042,16 @@ public:
             while (cksumConsumed.load(std::memory_order_acquire)
                <= nextBlockToWrite && !decompError)
                 std::this_thread::yield();
-            if (outputFd >= 0) {
-                if (canSparse && isAllZeros(blk.data.data(), blk.data.size())) {
-                    if (lseek(outputFd, (off_t)blk.data.size(), SEEK_CUR) < 0) {
-                        fprintf(stderr, "Warning: lseek for sparse hole failed: %s"
-                                "  falling back to write\n", strerror(errno));
-                        if (::write(outputFd, blk.data.data(), blk.data.size())
-                                != (ssize_t)blk.data.size())
-                            fprintf(stderr, "Warning: write error in final flush chunk %zu\n",
-                                    nextBlockToWrite);
-                    } else {
-                        sparseBytes += blk.data.size();
-                    }
-                } else if (::write(outputFd, blk.data.data(), blk.data.size())
-                        != (ssize_t)blk.data.size()) {
-                    fprintf(stderr, "Warning: write error in final flush chunk %zu\n",
-                            nextBlockToWrite);
-                }
-            }
+            bool err = false;
+            writeBlock(blk, err);
+            if (err) decompError = true;
             totalBytesWritten += blk.data.size();
-            blk.data.clear(); blk.data.shrink_to_fit();
             nextBlockToWrite++;
+        }
+        if (!flushWriteVec()) decompError = true;
+        // Clear after flush  iovecs pointed into this data
+        for (size_t i = drainBlocks; i < nextBlockToWrite; i++) {
+            if (i < results.size()) { results[i].data.clear(); results[i].data.shrink_to_fit(); }
         }
 
         stopDecompProgress.store(true);
@@ -5882,13 +6186,20 @@ public:
         VLOG(VERBOSE, "CPU decompression: %zu worker threads\n", numWorkers);
 
         int outputFd = -1;
+        bool outIsPipe = false;
         if (!testMode) {
             if (stdoutMode) {
                 outputFd = STDOUT_FILENO;
+                outIsPipe = true;
             } else {
                 outputFd = ::open(getActualOutputPath(), O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, 0644);
                 if (outputFd < 0) { fprintf(stderr, "Error opening output '%s': %s\n", getActualOutputPath(), strerror(errno)); { if (inputFd != STDIN_FILENO) close(inputFd); return false; } }
+                posix_fadvise(outputFd, 0, 0, POSIX_FADV_SEQUENTIAL);
+                outIsPipe = (lseek(outputFd, 0, SEEK_CUR) < 0);
             }
+#ifdef F_SETPIPE_SZ
+            if (outIsPipe) fcntl(outputFd, F_SETPIPE_SZ, 1 << 20);
+#endif
         }
 
         struct RawBlock { size_t blockIdx; bool isUncompressed; std::vector<uint8_t> data; };
@@ -5917,15 +6228,76 @@ public:
         std::atomic<size_t> cksumConsumed2{0};
         std::atomic<size_t>     totalBytesWritten{0};
         int64_t writeUs = 0, waitUs = 0;
-        size_t drainCalls = 0, maxPending = 0;
+        size_t drainCalls = 0, maxPending = 0, drainStart = 0;
         // Sparse-file optimisation  same design as GPU/hybrid decompressors.
         // See isAllZeros() for full explanation.
         size_t sparseBytes = 0;
         bool   canSparse   = (outputFd >= 0 && !testMode &&
                   (outputFd != STDOUT_FILENO || lseek(outputFd, 0, SEEK_CUR) >= 0));
-        // lseek probe: stdout redirected to a file is seekable and supports
-        // sparse holes; a pipe or terminal returns -1 and is correctly excluded.
         auto startTime = std::chrono::high_resolution_clock::now();
+
+        // ── writev coalescing helpers ─────────────────────────────────────────
+        std::vector<struct iovec> wiovecs;
+        size_t wiovecBytes = 0;
+        wiovecs.reserve(64);
+
+        auto flushWriteVec = [&]() -> bool {
+            if (wiovecs.empty()) return true;
+            auto t0 = std::chrono::steady_clock::now();
+            size_t remaining = wiovecBytes;
+            struct iovec* iov = wiovecs.data();
+            int cnt = (int)wiovecs.size();
+            while (cnt > 0 && remaining > 0) {
+                ssize_t n = ::writev(outputFd, iov, std::min(cnt, IOV_MAX));
+                if (n <= 0) {
+                    fprintf(stderr, "Error: writev failed: %s\n", strerror(errno));
+                    wiovecs.clear(); wiovecBytes = 0;
+                    return false;
+                }
+                remaining -= (size_t)n;
+                size_t skip = (size_t)n;
+                while (skip > 0 && cnt > 0) {
+                    if (iov->iov_len <= skip) { skip -= iov->iov_len; iov++; cnt--; }
+                    else { iov->iov_base = (char*)iov->iov_base + skip;
+                           iov->iov_len -= skip; skip = 0; }
+                }
+            }
+            writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (!outIsPipe) {
+                off_t pos = lseek(outputFd, 0, SEEK_CUR);
+                if (pos >= (off_t)wiovecBytes)
+                    posix_fadvise(outputFd, pos - wiovecBytes, wiovecBytes,
+                                  POSIX_FADV_DONTNEED);
+            }
+            wiovecs.clear(); wiovecBytes = 0;
+            return true;
+        };
+
+        auto writeBlock = [&](std::vector<uint8_t>& data, bool& err) {
+            if (outputFd < 0) return;
+            if (canSparse && isAllZeros(data.data(), data.size())) {
+                if (!flushWriteVec()) { err = true; return; }
+                auto t0 = std::chrono::steady_clock::now();
+                if (lseek(outputFd, (off_t)data.size(), SEEK_CUR) < 0) {
+                    fprintf(stderr, "Warning: lseek for sparse hole failed: %s"
+                            "  falling back to write\n", strerror(errno));
+                    struct iovec iov{data.data(), data.size()};
+                    if (::writev(outputFd, &iov, 1) != (ssize_t)data.size())
+                        err = true;
+                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                } else {
+                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    sparseBytes += data.size();
+                }
+            } else {
+                if ((int)wiovecs.size() >= IOV_MAX) flushWriteVec();
+                wiovecs.push_back({data.data(), data.size()});
+                wiovecBytes += data.size();
+            }
+        };
 
         std::thread readerThread([&]() {
             size_t blockIdx = 0;
@@ -6070,35 +6442,29 @@ public:
                 while (cksumConsumed2.load(std::memory_order_acquire)
                        <= nextBlockToWrite)
                     std::this_thread::yield();
-                if (outputFd >= 0) {
-                    auto wt0 = std::chrono::steady_clock::now();
-                    if (canSparse && isAllZeros(res.data.data(), res.data.size())) {
-                        if (lseek(outputFd, (off_t)res.data.size(), SEEK_CUR) < 0) {
-                            fprintf(stderr, "Warning: lseek for sparse hole failed: %s"
-                                    "  falling back to write\n", strerror(errno));
-                            ssize_t written = ::write(outputFd, res.data.data(), res.data.size());
-                            if (written != (ssize_t)res.data.size()) {
-                                fprintf(stderr, "Error writing decompressed data\n");
-                                writeError.store(true); ok = false; break;
-                            }
-                        } else {
-                            sparseBytes += res.data.size();
-                        }
-                    } else {
-                        ssize_t written = ::write(outputFd, res.data.data(), res.data.size());
-                        if (written != (ssize_t)res.data.size()) {
-                            fprintf(stderr, "Error writing decompressed data\n");
-                            writeError.store(true); ok = false; break;
-                        }
-                    }
-                    writeUs += std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - wt0).count();
-                }
+                bool err = false;
+                writeBlock(res.data, err);
+                if (err) { writeError.store(true); ok = false; break; }
                 totalBytesWritten += res.data.size();
-                res.data.clear(); res.data.shrink_to_fit();
                 nextBlockToWrite++; flushedAny = true; showProgress();
+                // Flush every 64 blocks to avoid giant writev stalls
+                if (wiovecs.size() >= 128) {
+                    if (!flushWriteVec()) { writeError.store(true); ok = false; break; }
+                    for (size_t i = drainStart; i < nextBlockToWrite; i++) {
+                        resultVec[i % resultCapacity].data.clear();
+                        resultVec[i % resultCapacity].data.shrink_to_fit();
+                    }
+                    drainStart = nextBlockToWrite;
+                }
             }
             if (flushedAny) {
+                if (!flushWriteVec()) { writeError.store(true); ok = false; }
+                // Clear after flush  iovecs pointed into this data
+                for (size_t i = drainStart; i < nextBlockToWrite; i++) {
+                    resultVec[i % resultCapacity].data.clear();
+                    resultVec[i % resultCapacity].data.shrink_to_fit();
+                }
+                drainStart = nextBlockToWrite;
                 drainCalls++;
                 size_t submitted = blocksSubmitted.load();
                 size_t pending   = submitted > nextBlockToWrite ? submitted - nextBlockToWrite : 0;
@@ -6119,6 +6485,7 @@ public:
                 showProgress();
             }
         }
+        if (!flushWriteVec()) { writeError.store(true); ok = false; }
 
         rawCV.notify_all(); resultCV.notify_all();
         readerThread.join();
@@ -6851,6 +7218,43 @@ EXAMPLES
     void printChangelog() {
         std::cout << "gzl4 " << VERSION << " - Changelog\n\n"
 R"CL(Changelog:
+  v3.32.2  writev periodic flush to fix decompressor stalls.
+           All three decompressors now flush every 64 blocks (~256 MB at
+           level 9) inside the inner drain loop rather than accumulating
+           all consecutive ready blocks into one giant writev call.
+           Prevents multi-second writer stalls when a full GPU batch
+           completes simultaneously.
+
+  v3.32.1  writev use-after-free fixes in compression writer.
+           Root cause: task = std::move(it->second) destroyed the previous
+           task's chunk vectors while metas/iovecs still held pointers into
+           them.  Fix: single-task-per-writev (no cross-task coalescing),
+           stable headers[] via resize() before any &headers[i] is taken,
+           hash work pushed after writev with data kept alive in task.
+           Also fixed decompressor clear-before-flush ordering bug.
+
+  v3.32.0  AsyncWriter overhaul + batch size auto-tuning improvements.
+
+           AsyncWriter (compression path):
+             writev() coalescing: iovecs point directly at chunk data,
+               eliminating the intermediate 256 MB writeBuf memcpy.
+               Consecutive ready chunks coalesced into one writev() call.
+             unordered_map: O(1) pendingWrites insert/find vs O(log n).
+             Lock released before all I/O  no mutex held during writev().
+             F_SETPIPE_SZ: pipe buffer enlarged to 1 MB on stdout/pipe.
+             Orphaned copy of old AsyncWriter removed (271 lines dead code).
+
+           Batch size auto-tuning:
+             Removed GPU-count heuristic (1 GPU→64, ≤4→16, 5+→4).
+             VRAM-driven formula: 85% freeVRAM / pipelineDepth / 5×chunk.
+             Latency cap: max(4, 512MB / chunkSize)  keeps GPU startup
+               fast regardless of level.  Level 9 (4MB) → 128, level 1
+               (256KB) → 2048.  Matches empirical optimum automatically.
+             File-size cap: no point allocating beyond total work needed.
+             pipelineDepth always 3 (matches H100 copy engine count);
+               removed spurious 1-GPU→4 special case.
+             SM floor removed from refreshGPUMemoryAndBatchSize.
+
   v3.31.0  CPU compression during GPU slot init + larger input pool.
 
            Hybrid compressor CPU Phase 1:
@@ -7347,9 +7751,20 @@ R"CL(Changelog:
             }
 
             if (!decompress && backendMode != BackendMode::CPU_ONLY && !gpus.empty()) {
-                batchSize = calculateBatchSize(gpus[0].availableMemory);
-                VLOG(VERBOSE, "Initial batch estimate: %zu chunks/slot (%.1f GB/slot at 5x chunk overhead)\n",
-                     batchSize, (batchSize * chunkSize * 5) / (1024.0*1024.0*1024.0));
+                // Estimate numChunks from file size if known (stdin → 0 = unknown)
+                size_t estChunks = 0;
+                if (inputFile != "-") {
+                    struct stat fst;
+                    if (stat(inputFile.c_str(), &fst) == 0 && fst.st_size > 0)
+                        estChunks = ((size_t)fst.st_size + chunkSize - 1) / chunkSize;
+                }
+                batchSize = calculateBatchSize(gpus[0].availableMemory, estChunks);
+                VLOG(VERBOSE, "Batch/stream config: %d streams/GPU × %zu chunks/slot = "
+                     "%.1f GB VRAM/slot  (%.1f MB chunks, %zu GPUs)\n",
+                     gpus[0].pipelineDepth, batchSize,
+                     (batchSize * chunkSize * 5) / (1024.0*1024.0*1024.0),
+                     chunkSize / (1024.0*1024.0),
+                     gpus.size());
             }
         }
 
